@@ -2,7 +2,7 @@
 
 **cellm** is a ground-up LLM serving engine for iOS and Android, written in Rust. It brings serving-engine concepts — paged KV cache management, continuous decode scheduling, and multi-session concurrency — to phones running under 512MB RAM. 
 
-Not a wrapper around `llama.cpp`. Not a port of `vLLM`. A new runtime designed for mobile constraints from scratch.
+It includes a high-performance **CLI toolchain** for 4-bit model conversion, automated benchmarking, and local inference validation. Not a wrapper around `llama.cpp`. Not a port of `vLLM`. A new runtime designed for mobile constraints from scratch.
 
 That’s it. Everything else — the six crates, the benchmarks, the Metal shaders — is how you prove those three sentences are true.
 
@@ -206,6 +206,8 @@ CPU vs Metal request benchmark (same prompts/settings, local run on March 29, 20
 | `vlm-infer` (`fp16`, `rococo.jpg`, `--max-new-tokens 16`) | `--backend metal` | `Backend: metal (smoke ok)` | `[64, 576]` in `1.85s` | N/A | `16` tokens in `2.56s` |
 
 Note: in restricted/sandboxed shells, Metal device discovery can fail and trigger CPU fallback. On host macOS runs, Metal smoke succeeds.
+
+For a dedicated benchmark page (commands + tables), see `docs/benchmarks/README.md`.
 
 Metal troubleshooting:
 ```bash

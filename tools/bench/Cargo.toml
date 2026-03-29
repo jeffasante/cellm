@@ -1,0 +1,20 @@
+[package]
+name = "cellm-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Benchmark harness and report generator for cellm."
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[dependencies]
+cellm-cache = { path = "../../crates/cellm-cache" }
+cellm-model = { path = "../../crates/cellm-model" }
+cellm-core = { path = "../../crates/cellm-core" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+tokenizers = "0.15"
+serde_json = { workspace = true }

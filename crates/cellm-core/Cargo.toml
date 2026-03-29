@@ -1,0 +1,14 @@
+[package]
+name = "cellm-core"
+version = "0.1.0"
+edition = "2021"
+description = "Tensor abstraction, memory arena, and op dispatch for cellm."
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+smallvec = { workspace = true }
+bytemuck = { workspace = true }
+half = { workspace = true }
+log = { workspace = true }
+rayon = { workspace = true }

@@ -1,0 +1,5 @@
+module CellmFFI {
+  header "cellm.h"
+  export *
+}
+

@@ -1,0 +1,9 @@
+[package]
+name = "cellm-cache"
+version = "0.1.0"
+edition = "2021"
+description = "KV block allocator, page table, and eviction policy for cellm."
+
+[dependencies]
+cellm-core = { path = "../cellm-core" }
+half = { workspace = true }

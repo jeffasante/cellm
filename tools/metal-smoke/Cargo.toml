@@ -1,0 +1,14 @@
+[package]
+name = "cellm-metal-smoke"
+version = "0.1.0"
+edition = "2021"
+description = "Metal smoke test for cellm (macOS)."
+
+[[bin]]
+name = "metal-smoke"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+cellm-kernels = { path = "../../crates/cellm-kernels" }
+

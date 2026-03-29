@@ -1,0 +1,34 @@
+name: CellmDemo
+options:
+  minimumXcodeGenVersion: 2.38.0
+packages:
+  CellmSDK:
+    path: ../swift
+targets:
+  CellmDemo:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - CellmDemo
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cellm.demo
+        PRODUCT_NAME: CellmDemo
+        SWIFT_VERSION: 5.9
+        CURRENT_PROJECT_VERSION: 1
+        MARKETING_VERSION: 0.1.0
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        CODE_SIGN_STYLE: Automatic
+        EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+    dependencies:
+      - package: CellmSDK
+        product: CellmSDK
+schemes:
+  CellmDemo:
+    build:
+      targets:
+        CellmDemo: all
+    run:
+      config: Debug

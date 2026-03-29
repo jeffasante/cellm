@@ -1,0 +1,23 @@
+[package]
+name = "cellm-infer"
+version = "0.1.0"
+edition = "2021"
+description = "Smoke inference runner for .cellm models (CPU, unoptimized)."
+
+[[bin]]
+name = "infer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+serde_json = { workspace = true }
+cellm-model = { path = "../../crates/cellm-model" }
+cellm-cache = { path = "../../crates/cellm-cache" }
+cellm-core = { path = "../../crates/cellm-core" }
+cellm-kernels = { path = "../../crates/cellm-kernels" }
+half = { workspace = true }
+bytemuck = { workspace = true }
+tokenizers = "0.15"

@@ -1,0 +1,12 @@
+[package]
+name = "cellm-kernels"
+version = "0.1.0"
+edition = "2021"
+description = "CPU SIMD, Metal compute shaders, and Vulkan for cellm."
+
+[dependencies]
+cellm-core = { path = "../cellm-core" }
+anyhow = { workspace = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+metal = "0.27"

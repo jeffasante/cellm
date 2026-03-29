@@ -1,0 +1,18 @@
+[package]
+name = "cellm-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "Public API, C FFI, and Swift/Kotlin glue for cellm."
+
+[dependencies]
+cellm-core = { path = "../cellm-core" }
+cellm-cache = { path = "../cellm-cache" }
+cellm-model = { path = "../cellm-model" }
+cellm-scheduler = { path = "../cellm-scheduler" }
+cellm-kernels = { path = "../cellm-kernels" }
+anyhow = { workspace = true }
+tokenizers = "0.19"
+serde_json = { workspace = true }
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]

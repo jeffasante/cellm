@@ -1,0 +1,10 @@
+[package]
+name = "cellm-scheduler"
+version = "0.1.0"
+edition = "2021"
+description = "Session state machine, queues, and thermal policy for cellm."
+
+[dependencies]
+cellm-core = { path = "../cellm-core" }
+cellm-model = { path = "../cellm-model" }
+cellm-cache = { path = "../cellm-cache" }

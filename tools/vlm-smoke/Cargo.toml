@@ -1,0 +1,10 @@
+[package]
+name = "vlm-smoke"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+cellm-sdk = { path = "../../crates/cellm-sdk" }
+

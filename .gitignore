@@ -1,0 +1,48 @@
+# Rust build outputs
+target/
+Cargo.lock
+
+# macOS / editor noise
+.DS_Store
+*.swp
+*.swo
+
+# Python envs used for tooling
+.venv/
+.venv-*/
+
+# Xcode / SwiftPM build artifacts
+DerivedData/
+.build/
+.swiftpm/
+bindings/swift/.build/
+bindings/swift/.swiftpm/
+
+# iOS app local build products
+bindings/ios/*.xcodeproj/xcuserdata/
+bindings/ios/*.xcodeproj/project.xcworkspace/xcuserdata/
+bindings/ios/*.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+
+# Local notes / scratch docs
+1.md
+m.md
+cellm.md
+
+# Large local model artifacts (keep out of git history)
+models/**/*.cellm
+!models/smollm2-135m-int8.cellm
+!models/smolvlm-256m-int8.cellm
+models/**/*.safetensors
+models/**/*.safetensors.index.json
+models/**/*.bin
+models/**/*.pt
+models/**/*.onnx
+models/**/*.tflite
+models/**/*.ckpt
+models/**/*.h5
+models/hf/**
+
+# Keep lightweight examples/docs under models
+!models/README.md
+!models/test_images/
+!models/test_images/*.jpg

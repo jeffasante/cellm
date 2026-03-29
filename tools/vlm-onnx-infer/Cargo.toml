@@ -1,0 +1,27 @@
+[package]
+name = "cellm-vlm-onnx-infer"
+version = "0.1.0"
+edition = "2021"
+description = "Rust-only VLM inference runner for SmolVLM ONNX exports (for local validation)."
+
+[[bin]]
+name = "vlm-infer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+cellm-core = { path = "../../crates/cellm-core" }
+cellm-cache = { path = "../../crates/cellm-cache" }
+cellm-model = { path = "../../crates/cellm-model" }
+cellm-kernels = { path = "../../crates/cellm-kernels" }
+serde_json = { workspace = true }
+bytemuck = { workspace = true }
+tokenizers = "0.21"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+rand = "0.8"
+ndarray = "0.17"
+ort = { version = "2.0.0-rc.10", features = ["download-binaries", "ndarray", "half"] }
+half = { workspace = true }

@@ -17,28 +17,22 @@ Note: requesting `Metal` currently verifies Metal availability and selects the M
 
 ## How to run it in Xcode
 
-1) Build the XCFramework so the Swift package can link:
+1) Build the XCFramework used by the app target:
    ```bash
    cd /Users/jeff/Desktop/cellm
-   ./scripts/build_xcframework.sh
+   zsh scripts/build_xcframework.sh
    ```
 
-2) Create a new iOS app in Xcode:
-   - Template: **App**
-   - Interface: **SwiftUI**
-   - Language: **Swift**
+2) Open the generated project:
+   - `/Users/jeff/Desktop/cellm/bindings/ios/CellmDemo.xcodeproj`
 
-3) Add the cellm Swift package:
-   - File → Add Package Dependencies…
-   - “Add Local…” and choose: `/Users/jeff/Desktop/cellm/bindings/swift`
-
-4) Add the Swift files from this folder into your app target:
+3) Add the Swift files from this folder into your app target:
    - `CellmFFI.swift`
    - `LLMView.swift`
    - `VLMView.swift`
    - `CellmDemoApp.swift` (optional; or copy the view code into your app’s existing `App` entry)
 
-5) Build + Run on a real iPhone (recommended). You can either:
+4) Build + Run on a real iPhone (recommended). You can either:
    - tap the in-app sample download buttons, or
    - use the document picker manually.
 

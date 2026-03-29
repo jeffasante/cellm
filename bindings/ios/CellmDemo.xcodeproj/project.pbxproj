@@ -3,27 +3,42 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 77;
+	objectVersion = 63;
 	objects = {
 
 /* Begin PBXBuildFile section */
 		1FE390EF93C06279DF216350 /* VLMView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C41C6ACC67DB89688E2DD75C /* VLMView.swift */; };
-		4B9C948E8660A5DEE7C53ABE /* CellmSDK in Frameworks */ = {isa = PBXBuildFile; productRef = 9F1696B6E873B645A2AC7152 /* CellmSDK */; };
 		5822954A4AE68BD3B99C4153 /* CellmDemoApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C06F9AA20D6B94DC93953B0 /* CellmDemoApp.swift */; };
+		7AEA529617090703D7E290F3 /* CellmFFI.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9B903FB69C7D80C5F0591819 /* CellmFFI.xcframework */; };
 		9FE1EA23FE6475D0D610BBD4 /* CellmFFI.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3F2F7738B8978FD418C1ADB /* CellmFFI.swift */; };
 		A10009244AD41A2F9570318C /* RemoteAssets.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCEC5DC5BFAE13E76FCCD771 /* RemoteAssets.swift */; };
+		C32B68BF58642517FF7FBDF5 /* CellmFFI.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 9B903FB69C7D80C5F0591819 /* CellmFFI.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		D5D7EDF0C68AB9D40EB605C2 /* README.md in Resources */ = {isa = PBXBuildFile; fileRef = C36BB1B851CF5C450D6A4B32 /* README.md */; };
 		EEAB85D7DABC30E77A8DEC27 /* LLMView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B7D734A1A2006E827AB2D78 /* LLMView.swift */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXCopyFilesBuildPhase section */
+		6E5CC52B851FE4035B8846A7 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				C32B68BF58642517FF7FBDF5 /* CellmFFI.xcframework in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
-		2ACCC6A3F50B75CBA1584E38 /* CellmDemo.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = CellmDemo.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		2ACCC6A3F50B75CBA1584E38 /* CellmDemo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CellmDemo.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		6C06F9AA20D6B94DC93953B0 /* CellmDemoApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CellmDemoApp.swift; sourceTree = "<group>"; };
 		8B7D734A1A2006E827AB2D78 /* LLMView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LLMView.swift; sourceTree = "<group>"; };
+		9B903FB69C7D80C5F0591819 /* CellmFFI.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = CellmFFI.xcframework; path = ../swift/CellmFFI.xcframework; sourceTree = "<group>"; };
 		B3F2F7738B8978FD418C1ADB /* CellmFFI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CellmFFI.swift; sourceTree = "<group>"; };
 		C36BB1B851CF5C450D6A4B32 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 		C41C6ACC67DB89688E2DD75C /* VLMView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VLMView.swift; sourceTree = "<group>"; };
-		C5EEE1E82328B76110EAE018 /* swift */ = {isa = PBXFileReference; lastKnownFileType = folder; name = swift; path = ../swift; sourceTree = SOURCE_ROOT; };
 		DCEC5DC5BFAE13E76FCCD771 /* RemoteAssets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteAssets.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -32,26 +47,18 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				4B9C948E8660A5DEE7C53ABE /* CellmSDK in Frameworks */,
+				7AEA529617090703D7E290F3 /* CellmFFI.xcframework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		0A199559B397A89B11D85A10 /* Packages */ = {
-			isa = PBXGroup;
-			children = (
-				C5EEE1E82328B76110EAE018 /* swift */,
-			);
-			name = Packages;
-			sourceTree = "<group>";
-		};
 		0EB92905FFC461A459D3F5FA = {
 			isa = PBXGroup;
 			children = (
 				18D3E0B4A7E555626F0FD6D9 /* CellmDemo */,
-				0A199559B397A89B11D85A10 /* Packages */,
+				950F96228B71D48BB8399A97 /* Frameworks */,
 				C27597F6AABC083F176E70B5 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -67,6 +74,14 @@
 				C41C6ACC67DB89688E2DD75C /* VLMView.swift */,
 			);
 			path = CellmDemo;
+			sourceTree = "<group>";
+		};
+		950F96228B71D48BB8399A97 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				9B903FB69C7D80C5F0591819 /* CellmFFI.xcframework */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 		C27597F6AABC083F176E70B5 /* Products */ = {
@@ -87,6 +102,7 @@
 				5323FAA6B18E23018336E5AD /* Sources */,
 				14EBBDDB16FA583EC5F62DE5 /* Resources */,
 				F32A4FC4966793EFBEADE88C /* Frameworks */,
+				6E5CC52B851FE4035B8846A7 /* Embed Frameworks */,
 			);
 			buildRules = (
 			);
@@ -94,7 +110,6 @@
 			);
 			name = CellmDemo;
 			packageProductDependencies = (
-				9F1696B6E873B645A2AC7152 /* CellmSDK */,
 			);
 			productName = CellmDemo;
 			productReference = 2ACCC6A3F50B75CBA1584E38 /* CellmDemo.app */;
@@ -124,10 +139,6 @@
 			);
 			mainGroup = 0EB92905FFC461A459D3F5FA;
 			minimizedProjectReferenceProxies = 1;
-			packageReferences = (
-				4BD5C8543D825633CE16E4D0 /* XCLocalSwiftPackageReference "../swift" */,
-			);
-			preferredProjectObjectVersion = 77;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -225,7 +236,12 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 27CP8SWWRP;
 				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"../swift\"",
+				);
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
@@ -249,7 +265,12 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 27CP8SWWRP;
 				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"../swift\"",
+				);
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
@@ -350,20 +371,6 @@
 			defaultConfigurationName = Debug;
 		};
 /* End XCConfigurationList section */
-
-/* Begin XCLocalSwiftPackageReference section */
-		4BD5C8543D825633CE16E4D0 /* XCLocalSwiftPackageReference "../swift" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = ../swift;
-		};
-/* End XCLocalSwiftPackageReference section */
-
-/* Begin XCSwiftPackageProductDependency section */
-		9F1696B6E873B645A2AC7152 /* CellmSDK */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = CellmSDK;
-		};
-/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 4ACD0F6A9F593F42CAF6A72C /* Project object */;
 }

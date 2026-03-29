@@ -1,5 +1,5 @@
 import Foundation
-import CellmSDK
+import CellmFFI
 
 enum CellmBackend: UInt32, CaseIterable, Identifiable {
     case cpu = 0

@@ -11,6 +11,7 @@
 		4B9C948E8660A5DEE7C53ABE /* CellmSDK in Frameworks */ = {isa = PBXBuildFile; productRef = 9F1696B6E873B645A2AC7152 /* CellmSDK */; };
 		5822954A4AE68BD3B99C4153 /* CellmDemoApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C06F9AA20D6B94DC93953B0 /* CellmDemoApp.swift */; };
 		9FE1EA23FE6475D0D610BBD4 /* CellmFFI.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3F2F7738B8978FD418C1ADB /* CellmFFI.swift */; };
+		A10009244AD41A2F9570318C /* RemoteAssets.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCEC5DC5BFAE13E76FCCD771 /* RemoteAssets.swift */; };
 		D5D7EDF0C68AB9D40EB605C2 /* README.md in Resources */ = {isa = PBXBuildFile; fileRef = C36BB1B851CF5C450D6A4B32 /* README.md */; };
 		EEAB85D7DABC30E77A8DEC27 /* LLMView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B7D734A1A2006E827AB2D78 /* LLMView.swift */; };
 /* End PBXBuildFile section */
@@ -23,6 +24,7 @@
 		C36BB1B851CF5C450D6A4B32 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 		C41C6ACC67DB89688E2DD75C /* VLMView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VLMView.swift; sourceTree = "<group>"; };
 		C5EEE1E82328B76110EAE018 /* swift */ = {isa = PBXFileReference; lastKnownFileType = folder; name = swift; path = ../swift; sourceTree = SOURCE_ROOT; };
+		DCEC5DC5BFAE13E76FCCD771 /* RemoteAssets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteAssets.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -61,6 +63,7 @@
 				B3F2F7738B8978FD418C1ADB /* CellmFFI.swift */,
 				8B7D734A1A2006E827AB2D78 /* LLMView.swift */,
 				C36BB1B851CF5C450D6A4B32 /* README.md */,
+				DCEC5DC5BFAE13E76FCCD771 /* RemoteAssets.swift */,
 				C41C6ACC67DB89688E2DD75C /* VLMView.swift */,
 			);
 			path = CellmDemo;
@@ -152,6 +155,7 @@
 				5822954A4AE68BD3B99C4153 /* CellmDemoApp.swift in Sources */,
 				9FE1EA23FE6475D0D610BBD4 /* CellmFFI.swift in Sources */,
 				EEAB85D7DABC30E77A8DEC27 /* LLMView.swift in Sources */,
+				A10009244AD41A2F9570318C /* RemoteAssets.swift in Sources */,
 				1FE390EF93C06279DF216350 /* VLMView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

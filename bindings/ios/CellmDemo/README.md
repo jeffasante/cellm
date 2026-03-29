@@ -7,6 +7,7 @@ This folder contains SwiftUI source files for a small iOS app that can load a `.
 - LLM text generation (tokenize prompt → prefill → decode tokens)
 - Backend request from iOS UI (`CPU` / `Metal`) through FFI (`cellm_engine_create_v3`)
 - Active backend reporting (`cellm_engine_backend_name`) so app confirms what was selected
+- One-tap sample asset download in-app (GitHub-hosted `.cellm` + sample image)
 
 Note: requesting `Metal` currently verifies Metal availability and selects the Metal backend label, but full LLM/VLM forward math kernels are still CPU in this phase.
 
@@ -37,10 +38,22 @@ Note: requesting `Metal` currently verifies Metal availability and selects the M
    - `VLMView.swift`
    - `CellmDemoApp.swift` (optional; or copy the view code into your app’s existing `App` entry)
 
-5) Build + Run on a real iPhone (recommended). The app uses a document picker so you can select:
+5) Build + Run on a real iPhone (recommended). You can either:
+   - tap the in-app sample download buttons, or
+   - use the document picker manually.
+
+   Manual picker flow:
    - the model file (example: `qwen3.5-0.8b.cellm`)
    - the tokenizer file (example: `tokenizer.json`)
    - backend (`Metal` recommended on iPhone/iPad with Apple GPU)
+
+## Sample hosted assets used by the app
+
+- `https://github.com/jeffasante/cellm/blob/main/models/smollm2-135m-int8.cellm`
+- `https://github.com/jeffasante/cellm/blob/main/models/smolvlm-256m-int8.cellm`
+- `https://github.com/jeffasante/cellm/blob/main/models/test_images/rococo_1.jpg`
+
+The app normalizes GitHub `blob` URLs to raw-download URLs before fetching.
 
 ## Notes
 

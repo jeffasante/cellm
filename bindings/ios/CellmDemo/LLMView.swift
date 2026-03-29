@@ -10,6 +10,8 @@ struct LLMView: View {
     @State private var errorText: String?
     @State private var selectedBackend: CellmBackend = .metal
     @State private var activeBackend: String = ""
+    @State private var downloadStatus: String = ""
+    @State private var isDownloading: Bool = false
 
     @State private var showModelPicker = false
     @State private var showTokenizerPicker = false
@@ -23,6 +25,15 @@ struct LLMView: View {
                     }
                     Button(tokenizerURL == nil ? "Pick tokenizer.json" : "Tokenizer: \(tokenizerURL!.lastPathComponent)") {
                         showTokenizerPicker = true
+                    }
+                    Button(isDownloading ? "Downloading…" : "Download sample model + tokenizer") {
+                        downloadSampleAssets()
+                    }
+                    .disabled(isDownloading || isRunning)
+                    if !downloadStatus.isEmpty {
+                        Text(downloadStatus)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
                 }
 
@@ -100,6 +111,38 @@ struct LLMView: View {
                 await MainActor.run {
                     self.errorText = String(describing: error)
                     self.isRunning = false
+                }
+            }
+        }
+    }
+
+    private func downloadSampleAssets() {
+        errorText = nil
+        downloadStatus = "Downloading sample files..."
+        isDownloading = true
+
+        Task {
+            do {
+                async let model = RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.smollm2Int8,
+                    fileName: "smollm2-135m-int8.cellm"
+                )
+                async let tok = RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.smollm2Tokenizer,
+                    fileName: "tokenizer-smollm2-135m.json"
+                )
+                let (modelPath, tokPath) = try await (model, tok)
+                await MainActor.run {
+                    self.modelURL = modelPath
+                    self.tokenizerURL = tokPath
+                    self.downloadStatus = "Saved: \(modelPath.lastPathComponent), \(tokPath.lastPathComponent)"
+                    self.isDownloading = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorText = String(describing: error)
+                    self.downloadStatus = ""
+                    self.isDownloading = false
                 }
             }
         }

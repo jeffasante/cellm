@@ -13,6 +13,8 @@ struct VLMView: View {
     @State private var errorText: String?
     @State private var selectedBackend: CellmBackend = .metal
     @State private var activeBackend: String = ""
+    @State private var downloadStatus: String = ""
+    @State private var isDownloading: Bool = false
 
     @State private var showModelPicker = false
 
@@ -22,6 +24,15 @@ struct VLMView: View {
                 Section("Files") {
                     Button(modelURL == nil ? "Pick .cellm model" : "Model: \(modelURL!.lastPathComponent)") {
                         showModelPicker = true
+                    }
+                    Button(isDownloading ? "Downloading…" : "Download sample VLM model + image") {
+                        downloadSampleAssets()
+                    }
+                    .disabled(isDownloading || isRunning)
+                    if !downloadStatus.isEmpty {
+                        Text(downloadStatus)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
                     PhotosPicker(selection: $selectedItem, matching: .images) {
                         Text(imageBytes == nil ? "Pick image" : "Image picked")
@@ -118,6 +129,40 @@ struct VLMView: View {
                 await MainActor.run {
                     self.errorText = String(describing: error)
                     self.isRunning = false
+                }
+            }
+        }
+    }
+
+    private func downloadSampleAssets() {
+        errorText = nil
+        downloadStatus = "Downloading sample VLM assets..."
+        isDownloading = true
+
+        Task {
+            do {
+                async let model = RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.smolvlmInt8,
+                    fileName: "smolvlm-256m-int8.cellm"
+                )
+                async let imageData = RemoteAssets.fetchData(from: DemoAssetLinks.rococoImage)
+                let (modelPath, bytes) = try await (model, imageData)
+                guard let ui = UIImage(data: bytes) else {
+                    throw CellmError.message("Downloaded image could not be decoded")
+                }
+
+                await MainActor.run {
+                    self.modelURL = modelPath
+                    self.imageBytes = bytes
+                    self.image = Image(uiImage: ui)
+                    self.downloadStatus = "Saved model and loaded sample image"
+                    self.isDownloading = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorText = String(describing: error)
+                    self.downloadStatus = ""
+                    self.isDownloading = false
                 }
             }
         }

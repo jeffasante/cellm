@@ -1,8 +1,8 @@
 # cellm — Mobile-Native LLM Serving Engine
 
-**cellm** is a ground-up LLM serving engine for iOS and Android, written in Rust. It brings serving-engine concepts — paged KV cache management, continuous decode scheduling, and multi-session concurrency — to phones running under 512MB RAM. 
+**cellm** is a ground-up LLM serving engine for iOS and Android, written in Rust. It brings serving-engine concepts — paged KV cache management, continuous decode scheduling, multi-session concurrency, and a high-performance CLI — to phones running under 512MB RAM. 
 
-It includes a high-performance **CLI toolchain** for 4-bit model conversion, automated benchmarking, and local inference validation. Not a wrapper around `llama.cpp`. Not a port of `vLLM`. A new runtime designed for mobile constraints from scratch.
+Not a wrapper around `llama.cpp`. Not a port of `vLLM`. A new runtime designed for mobile constraints from scratch.
 
 That’s it. Everything else — the six crates, the benchmarks, the Metal shaders — is how you prove those three sentences are true.
 
@@ -14,6 +14,7 @@ That’s it. Everything else — the six crates, the benchmarks, the Metal shade
 - [x] **4-bit Affine Dequantization**: Native support for high-precision 4-bit packed weights from MLX/HF.
 - [x] **Multimodal Vision**: Native ViT/SigLIP vision encoder and linear projector integration.
 - [x] **Accelerated Math**: Metal (macOS/iOS) compute kernels and SIMD-optimized CPU fallbacks.
+- [x] **High-Performance CLI**: Suite of tools for `.cellm` conversion, latency benchmarking, and debug inference.
 - [ ] **Vulkan Support**: Cross-platform compute kernels (Active Research).
 - [ ] **Android Integration**: Native Kotlin/JNI bindings and performance tuning (Coming Soon).
 

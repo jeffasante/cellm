@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::process::Command;
 use std::path::{Path, PathBuf};
 
@@ -109,6 +109,7 @@ struct QuantizationConfig {
 struct CellmHeader {
     model_type: String,
     source_model_type: Option<String>,
+    source_safetensors_format: Option<String>,
     text_tensor_prefix: Option<String>,
     vision_tensor_prefix: Option<String>,
     projector_tensor_prefix: Option<String>,
@@ -205,6 +206,7 @@ fn main() -> Result<()> {
     if safetensors_paths.is_empty() {
         anyhow::bail!("no supported model tensor files found in {:?}", args.input);
     }
+    let source_safetensors_format = ensure_supported_safetensors_metadata(&safetensors_paths)?;
 
     log::info!("Input:  {:?}", args.input);
     log::info!("Output: {:?}", args.output);
@@ -252,6 +254,7 @@ fn main() -> Result<()> {
     let mut header = CellmHeader {
         model_type: selected.model_type,
         source_model_type: hf_cfg.model_type.clone(),
+        source_safetensors_format,
         text_tensor_prefix,
         vision_tensor_prefix,
         projector_tensor_prefix,
@@ -508,7 +511,11 @@ import torch
 from safetensors.torch import save_file
 
 inp, out = sys.argv[1], sys.argv[2]
-obj = torch.load(inp, map_location='cpu')
+try:
+    obj = torch.load(inp, map_location='cpu', weights_only=False)
+except TypeError:
+    # Older torch versions without weights_only kwarg.
+    obj = torch.load(inp, map_location='cpu')
 if hasattr(obj, 'state_dict'):
     obj = obj.state_dict()
 elif isinstance(obj, dict) and 'state_dict' in obj and isinstance(obj['state_dict'], dict):
@@ -519,7 +526,15 @@ if not isinstance(obj, dict):
 clean = {}
 for k, v in obj.items():
     if torch.is_tensor(v):
-        clean[str(k)] = v.detach().cpu().contiguous()
+        t = v
+        # Handle torchao quantized tensor wrappers that don't expose a valid storage ptr
+        # until dequantized/materialized.
+        if hasattr(t, "dequantize"):
+            try:
+                t = t.dequantize()
+            except Exception:
+                pass
+        clean[str(k)] = t.detach().cpu().contiguous()
 
 if not clean:
     raise RuntimeError('no tensors found in state_dict')
@@ -527,13 +542,14 @@ save_file(clean, out)
 print(len(clean))
 "#;
 
-    let outp = Command::new("python3")
+    let python_bin = std::env::var("CELLM_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let outp = Command::new(&python_bin)
         .arg("-c")
         .arg(script)
         .arg(input_file)
         .arg(&out)
         .output()
-        .with_context(|| "failed to run python3 for .bin/.pt -> .safetensors conversion")?;
+        .with_context(|| format!("failed to run {python_bin} for .bin/.pt -> .safetensors conversion"))?;
     if !outp.status.success() {
         let stderr = String::from_utf8_lossy(&outp.stderr);
         anyhow::bail!(
@@ -557,6 +573,45 @@ fn chrono_like_millis() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn ensure_supported_safetensors_metadata(paths: &[PathBuf]) -> Result<Option<String>> {
+    let mut detected_format: Option<String> = None;
+    for path in paths {
+        let format = read_safetensors_metadata_format(path)?;
+        if let Some(fmt) = format.as_deref() {
+            if detected_format.is_none() {
+                detected_format = Some(fmt.to_string());
+            }
+        }
+        if matches!(format.as_deref(), Some("mlx")) {
+            anyhow::bail!(
+                "unsupported source safetensors format=\"mlx\" in {:?}. \
+This checkpoint was exported for MLX and is not layout-compatible with cellm conversion yet. \
+Use the original non-MLX Hugging Face checkpoint (for example, Qwen/Qwen3.5-0.8B) and re-run convert.",
+                path
+            );
+        }
+    }
+    Ok(detected_format)
+}
+
+fn read_safetensors_metadata_format(path: &Path) -> Result<Option<String>> {
+    let mut f = File::open(path).with_context(|| format!("open {:?}", path))?;
+    let mut len_buf = [0u8; 8];
+    f.read_exact(&mut len_buf)
+        .with_context(|| format!("read safetensors header length from {:?}", path))?;
+    let header_len = u64::from_le_bytes(len_buf) as usize;
+    let mut header = vec![0u8; header_len];
+    f.read_exact(&mut header)
+        .with_context(|| format!("read safetensors header from {:?}", path))?;
+    let header_json: Value =
+        serde_json::from_slice(&header).with_context(|| format!("parse safetensors header {:?}", path))?;
+    Ok(header_json
+        .get("__metadata__")
+        .and_then(|m| m.get("format"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string()))
 }
 
 fn mmap_all(paths: &[PathBuf]) -> Result<Vec<Mmap>> {

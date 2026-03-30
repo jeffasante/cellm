@@ -45,12 +45,23 @@ impl QwenRunner {
             rope_theta: h.rope_theta,
         };
 
-        file.tensor_index("language_model.model.embed_tokens.weight").ok_or_else(|| {
-            CoreError::Backend("missing tensor: language_model.model.embed_tokens.weight".into())
-        })?;
-        file.tensor_index("language_model.model.norm.weight").ok_or_else(|| {
-            CoreError::Backend("missing tensor: language_model.model.norm.weight".into())
-        })?;
+        if file
+            .tensor_index("language_model.model.embed_tokens.weight")
+            .is_none()
+            && file.tensor_index("model.embed_tokens.weight").is_none()
+        {
+            return Err(CoreError::Backend(
+                "missing tensor: language_model.model.embed_tokens.weight or model.embed_tokens.weight"
+                    .into(),
+            ));
+        }
+        if file.tensor_index("language_model.model.norm.weight").is_none()
+            && file.tensor_index("model.norm.weight").is_none()
+        {
+            return Err(CoreError::Backend(
+                "missing tensor: language_model.model.norm.weight or model.norm.weight".into(),
+            ));
+        }
 
         let (layer_kinds, linear_spec) = infer_qwen_layer_kinds_and_linear_spec(&file)?;
 
@@ -208,7 +219,16 @@ impl QwenRunner {
                 let n_heads = attn_in / head_dim;
 
                 // Projections.
-                q_raw.resize(attn_in * 2, 0.0);
+                let q_shape = self.tensor_shape(&format!(
+                    "language_model.model.layers.{layer}.self_attn.q_proj.weight"
+                ))?;
+                if q_shape.len() != 2 || q_shape[1] != hidden {
+                    return Err(CoreError::Backend(format!(
+                        "qwen: unexpected q_proj.weight shape {:?} at layer {layer}",
+                        q_shape
+                    )));
+                }
+                q_raw.resize(q_shape[0], 0.0);
                 self.linear_f16_out_in(
                     &x_norm,
                     &format!("language_model.model.layers.{layer}.self_attn.q_proj.weight"),
@@ -455,8 +475,13 @@ impl QwenRunner {
         let mut x_final = vec![0.0f32; hidden];
         rms_norm_f32(&x, &norm_w, cfg.rms_norm_eps, &mut x_final);
 
-        // Logits via tied embeddings.
+        // Logits via lm_head when present, otherwise tied embeddings.
         let embed = self.tensor_f16("language_model.model.embed_tokens.weight")?;
+        let lm_head = if self.file.tensor_index("lm_head.weight").is_some() {
+            Some(self.tensor_f16("lm_head.weight")?)
+        } else {
+            None
+        };
         let vocab = cfg.vocab_size;
         let k = top_k.max(1).min(vocab);
         let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
@@ -464,7 +489,11 @@ impl QwenRunner {
         let mut min_val = f32::INFINITY;
 
         for vid in 0..vocab {
-            let row = &embed[(vid * hidden)..(vid + 1) * hidden];
+            let row = if let Some(lm) = lm_head {
+                &lm[(vid * hidden)..(vid + 1) * hidden]
+            } else {
+                &embed[(vid * hidden)..(vid + 1) * hidden]
+            };
             let mut dot = 0.0f32;
             for i in 0..hidden {
                 dot += x_final[i] * f16::from_bits(row[i]).to_f32();
@@ -494,24 +523,48 @@ impl QwenRunner {
     }
 
     fn tensor_f16(&self, name: &str) -> Result<&[u16], CoreError> {
-        let bytes = self.file.tensor_bytes(name)?;
+        let resolved = self.resolve_tensor_name(name);
+        let bytes = self.file.tensor_bytes(&resolved)?;
         if bytes.len() % 2 != 0 {
-            return Err(CoreError::Backend(format!("tensor {name} nbytes not even")));
+            return Err(CoreError::Backend(format!(
+                "tensor {name} (resolved={resolved}) nbytes not even"
+            )));
         }
         Ok(cast_slice(bytes))
     }
 
     fn tensor_i8(&self, name: &str) -> Result<&[i8], CoreError> {
-        let bytes = self.file.tensor_bytes(name)?;
+        let resolved = self.resolve_tensor_name(name);
+        let bytes = self.file.tensor_bytes(&resolved)?;
         Ok(cast_slice(bytes))
     }
 
     fn tensor_shape(&self, name: &str) -> Result<Vec<usize>, CoreError> {
+        let resolved = self.resolve_tensor_name(name);
         let t = self
             .file
-            .tensor_index(name)
-            .ok_or_else(|| CoreError::Backend(format!("unknown tensor {name}")))?;
+            .tensor_index(&resolved)
+            .ok_or_else(|| CoreError::Backend(format!("unknown tensor {name} (resolved={resolved})")))?;
         Ok(t.shape.clone())
+    }
+
+    fn resolve_tensor_name(&self, name: &str) -> String {
+        if self.file.tensor_index(name).is_some() {
+            return name.to_string();
+        }
+        if let Some(rest) = name.strip_prefix("language_model.model.") {
+            let alt = format!("model.{rest}");
+            if self.file.tensor_index(&alt).is_some() {
+                return alt;
+            }
+        }
+        if let Some(rest) = name.strip_prefix("model.") {
+            let alt = format!("language_model.model.{rest}");
+            if self.file.tensor_index(&alt).is_some() {
+                return alt;
+            }
+        }
+        name.to_string()
     }
 
     fn embed_token(&self, token: u32, out: &mut [f32]) -> Result<(), CoreError> {
@@ -558,9 +611,10 @@ impl QwenRunner {
         }
 
         let shape = self.tensor_shape(weight_name)?;
+        let resolved = self.resolve_tensor_name(weight_name);
         let meta = self
             .file
-            .tensor_index(weight_name)
+            .tensor_index(&resolved)
             .ok_or_else(|| CoreError::Backend(format!("unknown tensor {weight_name}")))?;
         if shape.len() != 2 {
             return Err(CoreError::Backend(format!(

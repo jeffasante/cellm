@@ -7,7 +7,7 @@ use cellm_cache::{KVCache, PageTable};
 use cellm_core::KvCacheLayout;
 use cellm_model::{llama::LlamaRunner, qwen::QwenRunner, CellmFile};
 use serde_json::Value;
-use tokenizers::Tokenizer;
+use tokenizers::{AddedToken, Tokenizer};
 
 #[derive(clap::ValueEnum, Copy, Clone, Debug, Eq, PartialEq)]
 enum ChatFormat {
@@ -117,6 +117,12 @@ fn main() -> Result<()> {
 
     let file = CellmFile::load(&args.model)?;
     let header = file.header.clone();
+    if matches!(header.source_safetensors_format.as_deref(), Some("mlx")) {
+        anyhow::bail!(
+            "this .cellm was converted from safetensors format=\"mlx\", which is not supported for accurate text generation in cellm yet. \
+Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen3.5-0.8B)."
+        );
+    }
 
     enum Runner {
         Llama(LlamaRunner),
@@ -332,12 +338,37 @@ fn main() -> Result<()> {
         } else {
             tok.decode(&all_ids, true).unwrap_or_default()
         };
+        let text = strip_think_blocks(&text);
         println!();
         println!("---");
         println!("{text}");
     }
 
     Ok(())
+}
+
+fn strip_think_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut in_think = false;
+    while !rest.is_empty() {
+        if !in_think {
+            if let Some(idx) = rest.find("<think>") {
+                out.push_str(&rest[..idx]);
+                rest = &rest[idx + "<think>".len()..];
+                in_think = true;
+            } else {
+                out.push_str(rest);
+                break;
+            }
+        } else if let Some(end) = rest.find("</think>") {
+            rest = &rest[end + "</think>".len()..];
+            in_think = false;
+        } else {
+            break;
+        }
+    }
+    out.replace("<think>", "").replace("</think>", "")
 }
 
 fn select_backend(backend: BackendKind) -> Result<()> {
@@ -436,19 +467,92 @@ fn tokenizer_config_chatml(tokenizer_json_path: &std::path::Path) -> bool {
 
 fn load_tokenizer(path: &std::path::Path) -> Result<Tokenizer> {
     match Tokenizer::from_file(path) {
-        Ok(t) => Ok(t),
+        Ok(t) => augment_tokenizer_special_tokens(t, path),
         Err(e) => {
             // Some tokenizers (notably MLX exports) store BPE merges as `[["a","b"], ...]`
             // instead of `["a b", ...]`, which the `tokenizers` crate rejects.
             let normalized = try_normalize_tokenizer_json(path)?;
             if let Some(p) = normalized {
-                return Tokenizer::from_file(&p).map_err(|e| {
+                let tok = Tokenizer::from_file(&p).map_err(|e| {
                     anyhow::anyhow!("failed to load tokenizer {:?} (normalized {:?}): {e}", path, p)
-                });
+                })?;
+                return augment_tokenizer_special_tokens(tok, path);
             }
             Err(anyhow::anyhow!("failed to load tokenizer {:?}: {e}", path))
         }
     }
+}
+
+fn augment_tokenizer_special_tokens(
+    mut tokenizer: Tokenizer,
+    tokenizer_json_path: &std::path::Path,
+) -> Result<Tokenizer> {
+    let Some(dir) = tokenizer_json_path.parent() else {
+        return Ok(tokenizer);
+    };
+    let cfg_path = dir.join("tokenizer_config.json");
+    let Ok(bytes) = std::fs::read(&cfg_path) else {
+        return Ok(tokenizer);
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(tokenizer);
+    };
+
+    let mut specials: Vec<String> = Vec::new();
+    let mut push_token = |s: &str| {
+        if !s.is_empty() && !specials.iter().any(|x| x == s) {
+            specials.push(s.to_string());
+        }
+    };
+
+    let mut extract_token = |x: &serde_json::Value| {
+        if let Some(s) = x.as_str() {
+            push_token(s);
+            return;
+        }
+        if let Some(obj) = x.as_object() {
+            if let Some(s) = obj.get("content").and_then(|c| c.as_str()) {
+                push_token(s);
+            }
+        }
+    };
+
+    for k in ["bos_token", "eos_token", "pad_token", "unk_token"] {
+        if let Some(x) = v.get(k) {
+            extract_token(x);
+        }
+    }
+
+    if let Some(arr) = v
+        .get("additional_special_tokens")
+        .and_then(|x| x.as_array())
+    {
+        for x in arr {
+            extract_token(x);
+        }
+    }
+
+    if let Some(obj) = v.get("added_tokens_decoder").and_then(|x| x.as_object()) {
+        for tok in obj.values() {
+            let is_special = tok
+                .get("special")
+                .and_then(|s| s.as_bool())
+                .unwrap_or(false);
+            if is_special {
+                extract_token(tok);
+            }
+        }
+    }
+
+    if !specials.is_empty() {
+        let added: Vec<AddedToken> = specials
+            .into_iter()
+            .map(|s| AddedToken::from(s, true))
+            .collect();
+        tokenizer.add_special_tokens(&added);
+    }
+
+    Ok(tokenizer)
 }
 
 fn try_normalize_tokenizer_json(path: &std::path::Path) -> Result<Option<std::path::PathBuf>> {

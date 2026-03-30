@@ -20,6 +20,7 @@ pub struct CellmTensorIndex {
 pub struct CellmHeader {
     pub model_type: String,
     pub source_model_type: Option<String>,
+    pub source_safetensors_format: Option<String>,
     pub text_tensor_prefix: Option<String>,
     pub vision_tensor_prefix: Option<String>,
     pub projector_tensor_prefix: Option<String>,

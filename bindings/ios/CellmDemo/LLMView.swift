@@ -2,6 +2,54 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct LLMView: View {
+    private enum GenerationPreset: String, CaseIterable, Identifiable {
+        case chat = "Chat"
+        case balanced = "Balanced"
+        case strict = "Strict"
+
+        var id: String { rawValue }
+
+        var temperature: Float {
+            switch self {
+            case .chat: return 0.2
+            case .balanced: return 0.5
+            case .strict: return 0.0
+            }
+        }
+
+        var topK: UInt32 {
+            switch self {
+            case .chat: return 40
+            case .balanced: return 60
+            case .strict: return 1
+            }
+        }
+
+        var repeatPenalty: Float {
+            switch self {
+            case .chat: return 1.08
+            case .balanced: return 1.04
+            case .strict: return 1.0
+            }
+        }
+
+        var repeatWindow: UInt32 {
+            switch self {
+            case .chat: return 96
+            case .balanced: return 64
+            case .strict: return 0
+            }
+        }
+
+        var maxTokens: Int {
+            switch self {
+            case .chat: return 64
+            case .balanced: return 96
+            case .strict: return 64
+            }
+        }
+    }
+
     @State private var modelURL: URL?
     @State private var tokenizerURL: URL?
     @State private var prompt: String = "Hello, how are you?"
@@ -13,6 +61,7 @@ struct LLMView: View {
     @State private var downloadStatus: String = ""
     @State private var isDownloading: Bool = false
     @State private var backendWarning: String?
+    @State private var selectedPreset: GenerationPreset = .chat
 
     @State private var showModelPicker = false
     @State private var showTokenizerPicker = false
@@ -24,6 +73,7 @@ struct LLMView: View {
                 filesCard
                 storageCard
                 promptCard
+                presetCard
                 backendCard
                 generateButton
                 if let errorText { errorCard(errorText) }
@@ -130,6 +180,20 @@ struct LLMView: View {
         }
     }
 
+    private var presetCard: some View {
+        card("Generation") {
+            Picker("Preset", selection: $selectedPreset) {
+                ForEach(GenerationPreset.allCases) { preset in
+                    Text(preset.rawValue).tag(preset)
+                }
+            }
+            .pickerStyle(.segmented)
+            Text("Preset controls temperature/repetition to improve quality.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     private var generateButton: some View {
         Button(isRunning ? "Generating…" : "Generate") { run() }
             .buttonStyle(.borderedProminent)
@@ -198,13 +262,23 @@ struct LLMView: View {
         guard let modelURL, let tokenizerURL else { return }
         let promptText = prompt
         let backend = selectedBackend
+        let preset = selectedPreset
 
         isRunning = true
         Task.detached(priority: .userInitiated) {
             do {
                 let tok = try CellmTokenizer(tokenizerURL: tokenizerURL)
-                let eng = try CellmEngine(modelURL: modelURL, tokenizer: tok, backend: backend)
-                let text = try eng.generate(prompt: promptText, maxNewTokens: 64)
+                let eng = try CellmEngine(
+                    modelURL: modelURL,
+                    tokenizer: tok,
+                    topK: preset.topK,
+                    temperature: preset.temperature,
+                    repeatPenalty: preset.repeatPenalty,
+                    repeatWindow: preset.repeatWindow,
+                    seed: 1,
+                    backend: backend
+                )
+                let text = try eng.generate(prompt: promptText, maxNewTokens: preset.maxTokens)
                 await MainActor.run {
                     self.output = prettyOutput(text)
                     self.activeBackend = eng.activeBackend

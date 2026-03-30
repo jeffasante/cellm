@@ -32,6 +32,8 @@ cellm.md
 models/**/*.cellm
 !models/smollm2-135m-int8.cellm
 !models/smolvlm-256m-int8.cellm
+!models/qwen3.5-0.8b-int4-textonly.cellm
+
 models/**/*.safetensors
 models/**/*.safetensors.index.json
 models/**/*.bin

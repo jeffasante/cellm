@@ -15,6 +15,7 @@ Not a wrapper around `llama.cpp`. Not a port of `vLLM`. A new runtime designed f
 - [x] **High-Performance CLI**: Suite of tools for `.cellm` conversion, latency benchmarking, and debug inference.
 - [ ] **Vulkan Support**: Cross-platform compute kernels (Active Research).
 - [ ] **Android Integration**: Native Kotlin/JNI bindings and performance tuning (Coming Soon).
+- [ ] **Qwen iOS Porting**: Integrate and optimize Qwen inference path for native iOS deployment.
 
 ---
 
@@ -71,6 +72,63 @@ Qwen3.5 notes:
 - Qwen3.5 4-bit MLX tokenizers sometimes store BPE merges as `[[a,b], ...]` instead of `["a b", ...]`. `infer` auto-normalizes this on load.
 - Qwen3.5 mixes `full_attention` layers and `linear_attention` (DeltaNet / gated delta rule) layers. `infer` includes a CPU reference implementation for both.
 - DeltaNet is stateful per session (separate from the paged KV cache). See `docs/qwen3_5-deltanet.md`.
+
+Qwen3.5 quantization findings (March 30, 2026):
+- Baseline text+vision `.cellm`: `models/qwen3.5-0.8b.cellm` = `1746.9 MB`
+- Int8 weight-only: `models/qwen3.5-0.8b-int8.cellm` = `1706.0 MB`
+- Int4 weight-only (all stacks): `models/qwen3.5-0.8b-int4.cellm` = `620.4 MB`
+- Int4 weight-only + text-only tensors: `models/qwen3.5-0.8b-int4-textonly.cellm` = `378.3 MB` (< 500MB)
+
+Create Qwen3.5 int4:
+```bash
+./target/release/convert \
+  --input models/hf/qwen3.5-0.8b \
+  --output models/qwen3.5-0.8b-int4.cellm \
+  --quantize-int4-symmetric
+```
+
+Create Qwen3.5 int4 text-only:
+```bash
+./target/release/convert \
+  --input models/hf/qwen3.5-0.8b \
+  --output models/qwen3.5-0.8b-int4-textonly.cellm \
+  --quantize-int4-symmetric \
+  --text-only
+```
+
+Run prompt test on `qwen3.5-0.8b-int4.cellm`:
+```bash
+./target/release/infer \
+  --model models/qwen3.5-0.8b-int4.cellm \
+  --tokenizer models/hf/qwen3.5-0.8b/tokenizer.json \
+  --prompt "Write one short sentence about Rust programming." \
+  --chat \
+  --chat-format chatml \
+  --gen 24 \
+  --temperature 0
+```
+
+Sample output:
+```text
+Rust programming serves as a concise and concise language that simplifies the creation of programs, making it easier to understand the
+```
+
+Run prompt test on `qwen3.5-0.8b-int4-textonly.cellm`:
+```bash
+./target/release/infer \
+  --model models/qwen3.5-0.8b-int4-textonly.cellm \
+  --tokenizer models/hf/qwen3.5-0.8b/tokenizer.json \
+  --prompt "Write one short sentence about Rust programming." \
+  --chat \
+  --chat-format chatml \
+  --gen 24 \
+  --temperature 0
+```
+
+Sample output:
+```text
+Rust programming serves as a concise and concise language that simplifies the creation of programs, making it easier to understand the
+```
 
 ### Run VLM (SmolVLM-256M via ONNX, Rust validation)
 SmolVLM-256M-Instruct ships official ONNX exports (`vision_encoder`, `embed_tokens`, `decoder_model_merged`). For quick local validation on macOS, use:

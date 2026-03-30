@@ -7,7 +7,7 @@ use cellm_cache::{KVCache, PageTable};
 use cellm_core::KvCacheLayout;
 use cellm_model::{llama::LlamaRunner, qwen::QwenRunner, CellmFile};
 use serde_json::Value;
-use tokenizers::{AddedToken, Tokenizer};
+use tokenizers::Tokenizer;
 
 #[derive(clap::ValueEnum, Copy, Clone, Debug, Eq, PartialEq)]
 enum ChatFormat {
@@ -202,17 +202,22 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
 
     let prompt_tokens = if let Some(prompt) = args.prompt.as_deref() {
         let tok = tokenizer.as_ref().expect("tokenizer set when prompt set");
+        let tok_path = args
+            .tokenizer
+            .as_ref()
+            .expect("tokenizer path set when prompt set");
+        let include_think_prefill = args.chat
+            && effective_chat_format == ChatFormat::Chatml
+            && tokenizer_config_contains_think_prefill(tok_path);
         let prompt_text = build_prompt_text(
             tok,
             prompt,
             args.chat,
             args.system.as_deref(),
             effective_chat_format,
+            include_think_prefill,
         );
-        let enc = tok
-            .encode(prompt_text, true)
-            .map_err(|e| anyhow::anyhow!("tokenize failed: {e}"))?;
-        enc.get_ids().to_vec()
+        encode_with_explicit_added_tokens(tok, tok_path, &prompt_text)?
     } else if let Some(s) = args.tokens.as_deref() {
         parse_tokens(s)?
     } else {
@@ -259,11 +264,24 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
     let t0 = Instant::now();
     let mut next = 0u32;
     let mut all_ids: Vec<u32> = Vec::new();
+    let debug_logits = std::env::var("CELLM_DEBUG_LOGITS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     for (i, &tok) in prompt_tokens.iter().enumerate() {
         let cand = match &mut runner {
             Runner::Llama(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
             Runner::Qwen(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
         };
+        if debug_logits && i + 1 == prompt_tokens.len() {
+            println!("Prefill top candidates:");
+            for (rank, (id, score)) in cand.iter().take(10).enumerate() {
+                let text = tokenizer
+                    .as_ref()
+                    .map(|t| t.decode(&[*id], true).unwrap_or_default())
+                    .unwrap_or_default();
+                println!("  {:2}: id={} score={:.6} text={:?}", rank, id, score, text);
+            }
+        }
         all_ids.push(tok);
         next = select_next(
             &cand,
@@ -290,6 +308,16 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
             Runner::Llama(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
             Runner::Qwen(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
         };
+        if debug_logits && step == 0 {
+            println!("Decode step0 top candidates:");
+            for (rank, (id, score)) in cand.iter().take(10).enumerate() {
+                let text = tokenizer
+                    .as_ref()
+                    .map(|t| t.decode(&[*id], true).unwrap_or_default())
+                    .unwrap_or_default();
+                println!("  {:2}: id={} score={:.6} text={:?}", rank, id, score, text);
+            }
+        }
 
         all_ids.push(cur);
         if let Some(tok) = tokenizer.as_ref() {
@@ -418,6 +446,7 @@ fn build_prompt_text(
     chat: bool,
     system: Option<&str>,
     chat_format: ChatFormat,
+    include_think_prefill: bool,
 ) -> String {
     if !chat {
         return prompt.to_string();
@@ -437,6 +466,9 @@ fn build_prompt_text(
             s.push_str(prompt);
             s.push_str("<|im_end|>\n");
             s.push_str("<|im_start|>assistant\n");
+            if include_think_prefill {
+                s.push_str("<think>\n\n</think>\n\n");
+            }
             s
         }
         ChatFormat::Auto | ChatFormat::Plain => match system {
@@ -465,9 +497,26 @@ fn tokenizer_config_chatml(tokenizer_json_path: &std::path::Path) -> bool {
     tpl.contains("<|im_start|>") && tpl.contains("<|im_end|>")
 }
 
+fn tokenizer_config_contains_think_prefill(tokenizer_json_path: &std::path::Path) -> bool {
+    let Some(dir) = tokenizer_json_path.parent() else {
+        return false;
+    };
+    let cfg_path = dir.join("tokenizer_config.json");
+    let Ok(bytes) = std::fs::read(&cfg_path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let Some(tpl) = v.get("chat_template").and_then(|x| x.as_str()) else {
+        return false;
+    };
+    tpl.contains("<think>") && tpl.contains("</think>")
+}
+
 fn load_tokenizer(path: &std::path::Path) -> Result<Tokenizer> {
     match Tokenizer::from_file(path) {
-        Ok(t) => augment_tokenizer_special_tokens(t, path),
+        Ok(t) => Ok(t),
         Err(e) => {
             // Some tokenizers (notably MLX exports) store BPE merges as `[["a","b"], ...]`
             // instead of `["a b", ...]`, which the `tokenizers` crate rejects.
@@ -476,83 +525,11 @@ fn load_tokenizer(path: &std::path::Path) -> Result<Tokenizer> {
                 let tok = Tokenizer::from_file(&p).map_err(|e| {
                     anyhow::anyhow!("failed to load tokenizer {:?} (normalized {:?}): {e}", path, p)
                 })?;
-                return augment_tokenizer_special_tokens(tok, path);
+                return Ok(tok);
             }
             Err(anyhow::anyhow!("failed to load tokenizer {:?}: {e}", path))
         }
     }
-}
-
-fn augment_tokenizer_special_tokens(
-    mut tokenizer: Tokenizer,
-    tokenizer_json_path: &std::path::Path,
-) -> Result<Tokenizer> {
-    let Some(dir) = tokenizer_json_path.parent() else {
-        return Ok(tokenizer);
-    };
-    let cfg_path = dir.join("tokenizer_config.json");
-    let Ok(bytes) = std::fs::read(&cfg_path) else {
-        return Ok(tokenizer);
-    };
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return Ok(tokenizer);
-    };
-
-    let mut specials: Vec<String> = Vec::new();
-    let mut push_token = |s: &str| {
-        if !s.is_empty() && !specials.iter().any(|x| x == s) {
-            specials.push(s.to_string());
-        }
-    };
-
-    let mut extract_token = |x: &serde_json::Value| {
-        if let Some(s) = x.as_str() {
-            push_token(s);
-            return;
-        }
-        if let Some(obj) = x.as_object() {
-            if let Some(s) = obj.get("content").and_then(|c| c.as_str()) {
-                push_token(s);
-            }
-        }
-    };
-
-    for k in ["bos_token", "eos_token", "pad_token", "unk_token"] {
-        if let Some(x) = v.get(k) {
-            extract_token(x);
-        }
-    }
-
-    if let Some(arr) = v
-        .get("additional_special_tokens")
-        .and_then(|x| x.as_array())
-    {
-        for x in arr {
-            extract_token(x);
-        }
-    }
-
-    if let Some(obj) = v.get("added_tokens_decoder").and_then(|x| x.as_object()) {
-        for tok in obj.values() {
-            let is_special = tok
-                .get("special")
-                .and_then(|s| s.as_bool())
-                .unwrap_or(false);
-            if is_special {
-                extract_token(tok);
-            }
-        }
-    }
-
-    if !specials.is_empty() {
-        let added: Vec<AddedToken> = specials
-            .into_iter()
-            .map(|s| AddedToken::from(s, true))
-            .collect();
-        tokenizer.add_special_tokens(&added);
-    }
-
-    Ok(tokenizer)
 }
 
 fn try_normalize_tokenizer_json(path: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
@@ -604,6 +581,89 @@ fn try_normalize_tokenizer_json(path: &std::path::Path) -> Result<Option<std::pa
     std::fs::write(&tmp, serde_json::to_vec(&v)?)
         .map_err(|e| anyhow::anyhow!("write normalized tokenizer {:?} failed: {e}", tmp))?;
     Ok(Some(tmp))
+}
+
+fn encode_with_explicit_added_tokens(
+    tok: &Tokenizer,
+    tokenizer_json_path: &std::path::Path,
+    text: &str,
+) -> Result<Vec<u32>> {
+    let added = load_added_token_ids(tokenizer_json_path)?;
+    if added.is_empty() {
+        let enc = tok
+            .encode(text, false)
+            .map_err(|e| anyhow::anyhow!("tokenize failed: {e}"))?;
+        return Ok(enc.get_ids().to_vec());
+    }
+
+    let mut specials: Vec<(&str, u32)> = added.iter().map(|(k, &v)| (k.as_str(), v)).collect();
+    specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+    let mut out: Vec<u32> = Vec::new();
+    let mut i = 0usize;
+    let mut chunk_start = 0usize;
+    let bytes = text.as_bytes();
+
+    while i < bytes.len() {
+        let rest = &text[i..];
+        let mut matched: Option<(&str, u32)> = None;
+        for &(token, id) in &specials {
+            if rest.starts_with(token) {
+                matched = Some((token, id));
+                break;
+            }
+        }
+
+        if let Some((token, id)) = matched {
+            if chunk_start < i {
+                let chunk = &text[chunk_start..i];
+                let enc = tok
+                    .encode(chunk, false)
+                    .map_err(|e| anyhow::anyhow!("tokenize failed: {e}"))?;
+                out.extend_from_slice(enc.get_ids());
+            }
+            out.push(id);
+            i += token.len();
+            chunk_start = i;
+        } else {
+            let ch = rest
+                .chars()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("tokenize failed: invalid utf-8 boundary"))?;
+            i += ch.len_utf8();
+        }
+    }
+
+    if chunk_start < text.len() {
+        let chunk = &text[chunk_start..];
+        let enc = tok
+            .encode(chunk, false)
+            .map_err(|e| anyhow::anyhow!("tokenize failed: {e}"))?;
+        out.extend_from_slice(enc.get_ids());
+    }
+
+    Ok(out)
+}
+
+fn load_added_token_ids(tokenizer_json_path: &std::path::Path) -> Result<std::collections::HashMap<String, u32>> {
+    let bytes = std::fs::read(tokenizer_json_path)
+        .map_err(|e| anyhow::anyhow!("read tokenizer {:?} failed: {e}", tokenizer_json_path))?;
+    let v: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("parse tokenizer {:?} failed: {e}", tokenizer_json_path))?;
+
+    let mut out = std::collections::HashMap::new();
+    if let Some(arr) = v.get("added_tokens").and_then(|x| x.as_array()) {
+        for item in arr {
+            let Some(content) = item.get("content").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            let Some(id) = item.get("id").and_then(|x| x.as_u64()) else {
+                continue;
+            };
+            out.insert(content.to_string(), id as u32);
+        }
+    }
+    Ok(out)
 }
 
 fn select_next(

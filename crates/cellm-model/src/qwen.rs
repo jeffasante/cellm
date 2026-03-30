@@ -4,7 +4,7 @@ use std::path::Path;
 use bytemuck::cast_slice;
 use cellm_cache::{KVCache, PageTable};
 use cellm_core::CoreError;
-use cellm_kernels::cpu_kernels::{attention_single_token_f32_gqa, rms_norm_f32, rope_inplace_f32};
+use cellm_kernels::cpu_kernels::{attention_single_token_f32_gqa, rms_norm_f32};
 use half::f16;
 use serde_json::Value;
 
@@ -26,7 +26,13 @@ pub struct QwenRunner {
     eos_token_id: Option<u32>,
     layer_kinds: Vec<LayerKind>,
     linear_spec: Option<LinearAttnSpec>,
+    partial_rotary_factor: f32,
+    rmsnorm_weight_is_offset: bool,
     sessions: HashMap<u64, QwenSessionState>,
+    disable_linear_attention: bool,
+    disable_full_attention: bool,
+    disable_full_attn_gate: bool,
+    debug_pos: Option<usize>,
 }
 
 impl QwenRunner {
@@ -45,25 +51,24 @@ impl QwenRunner {
             rope_theta: h.rope_theta,
         };
 
-        if file
-            .tensor_index("language_model.model.embed_tokens.weight")
-            .is_none()
-            && file.tensor_index("model.embed_tokens.weight").is_none()
+        if !has_tensor_file(&file, "language_model.model.embed_tokens.weight")
+            && !has_tensor_file(&file, "model.embed_tokens.weight")
         {
             return Err(CoreError::Backend(
                 "missing tensor: language_model.model.embed_tokens.weight or model.embed_tokens.weight"
                     .into(),
             ));
         }
-        if file.tensor_index("language_model.model.norm.weight").is_none()
-            && file.tensor_index("model.norm.weight").is_none()
+        if !has_tensor_file(&file, "language_model.model.norm.weight")
+            && !has_tensor_file(&file, "model.norm.weight")
         {
             return Err(CoreError::Backend(
                 "missing tensor: language_model.model.norm.weight or model.norm.weight".into(),
             ));
         }
 
-        let (layer_kinds, linear_spec) = infer_qwen_layer_kinds_and_linear_spec(&file)?;
+        let (layer_kinds, linear_spec, partial_rotary_factor) =
+            infer_qwen_layer_kinds_and_linear_spec(&file)?;
 
         Ok(Self {
             file,
@@ -72,7 +77,21 @@ impl QwenRunner {
             eos_token_id: h.eos_token_id,
             layer_kinds,
             linear_spec,
+            partial_rotary_factor,
+            rmsnorm_weight_is_offset: qwen_rmsnorm_is_offset(&h),
             sessions: HashMap::new(),
+            disable_linear_attention: std::env::var("CELLM_QWEN_DISABLE_LINEAR")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            disable_full_attention: std::env::var("CELLM_QWEN_DISABLE_FULL")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            disable_full_attn_gate: std::env::var("CELLM_QWEN_DISABLE_FULL_GATE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            debug_pos: std::env::var("CELLM_QWEN_DEBUG_POS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok()),
         })
     }
 
@@ -182,15 +201,22 @@ impl QwenRunner {
         let mut v_tok: Vec<f32> = Vec::new();
 
         for layer in 0..self.max_layers {
+            let layer_in_norm = l2norm_value(&x);
             // Norm before attention / linear-attn.
             self.rmsnorm_weight(
                 &format!("language_model.model.layers.{layer}.input_layernorm.weight"),
                 &mut in_norm_w,
             )?;
+            if self.rmsnorm_weight_is_offset {
+                add_one_inplace(&mut in_norm_w);
+            }
             rms_norm_f32(&x, &in_norm_w, cfg.rms_norm_eps, &mut x_norm);
 
             match self.layer_kinds.get(layer).copied().unwrap_or(LayerKind::FullAttention) {
                 LayerKind::FullAttention => {
+                if self.disable_full_attention {
+                    continue;
+                }
                 // Read shapes to infer head geometry.
                 let k_shape = self.tensor_shape(&format!(
                     "language_model.model.layers.{layer}.self_attn.k_proj.weight"
@@ -258,9 +284,16 @@ impl QwenRunner {
                 let q_main_dim = n_heads * head_dim;
                 if q_raw.len() == q_main_dim * 2 {
                     q.resize(q_main_dim, 0.0);
-                    q.copy_from_slice(&q_raw[..q_main_dim]);
                     q_gate.resize(q_main_dim, 0.0);
-                    q_gate.copy_from_slice(&q_raw[q_main_dim..]);
+                    // Qwen3.5 full-attn uses per-head packed q_proj output:
+                    // [head0_q, head0_gate, head1_q, head1_gate, ...].
+                    for h in 0..n_heads {
+                        let src = h * (2 * head_dim);
+                        let dst = h * head_dim;
+                        q[dst..dst + head_dim].copy_from_slice(&q_raw[src..src + head_dim]);
+                        q_gate[dst..dst + head_dim]
+                            .copy_from_slice(&q_raw[src + head_dim..src + 2 * head_dim]);
+                    }
                 } else if q_raw.len() == q_main_dim {
                     q.clear();
                     q.extend_from_slice(&q_raw);
@@ -284,6 +317,10 @@ impl QwenRunner {
                     &format!("language_model.model.layers.{layer}.self_attn.k_norm.weight"),
                     &mut k_head_norm_w,
                 )?;
+                if self.rmsnorm_weight_is_offset {
+                    add_one_inplace(&mut q_head_norm_w);
+                    add_one_inplace(&mut k_head_norm_w);
+                }
                 for h in 0..n_heads {
                     rms_norm_inplace_f32(
                         &mut q[h * head_dim..(h + 1) * head_dim],
@@ -299,8 +336,22 @@ impl QwenRunner {
                     );
                 }
 
-                rope_inplace_f32(&mut q, n_heads, head_dim, pos, cfg.rope_theta);
-                rope_inplace_f32(&mut k, n_kv_heads, head_dim, pos, cfg.rope_theta);
+                let mut rotary_dim = ((head_dim as f32) * self.partial_rotary_factor) as usize;
+                rotary_dim = rotary_dim.min(head_dim);
+                if rotary_dim % 2 != 0 {
+                    rotary_dim -= 1;
+                }
+                if rotary_dim > 0 {
+                    rope_inplace_f32_partial(&mut q, n_heads, head_dim, rotary_dim, pos, cfg.rope_theta);
+                    rope_inplace_f32_partial(
+                        &mut k,
+                        n_kv_heads,
+                        head_dim,
+                        rotary_dim,
+                        pos,
+                        cfg.rope_theta,
+                    );
+                }
 
                 // Write new token K/V into paged cache.
                 {
@@ -340,7 +391,7 @@ impl QwenRunner {
                 );
 
                 // Optional output gate.
-                if !q_gate.is_empty() {
+                if !q_gate.is_empty() && !self.disable_full_attn_gate {
                     for i in 0..attn_out.len() {
                         let g = 1.0 / (1.0 + (-q_gate[i]).exp());
                         attn_out[i] *= g;
@@ -361,6 +412,9 @@ impl QwenRunner {
                 }
                 }
                 LayerKind::LinearAttention => {
+                    if self.disable_linear_attention {
+                        continue;
+                    }
                     let Some(spec) = &self.linear_spec else {
                         return Err(CoreError::Backend(
                             "qwen: layer marked linear_attention but no linear_spec".into(),
@@ -424,12 +478,16 @@ impl QwenRunner {
                     }
                 }
             }
+            let layer_post_mixer_norm = l2norm_value(&x);
 
             // Post-attn norm (run regardless; even if attention was skipped).
             self.rmsnorm_weight(
                 &format!("language_model.model.layers.{layer}.post_attention_layernorm.weight"),
                 &mut post_norm_w,
             )?;
+            if self.rmsnorm_weight_is_offset {
+                add_one_inplace(&mut post_norm_w);
+            }
             rms_norm_f32(&x, &post_norm_w, cfg.rms_norm_eps, &mut mlp_in);
 
             // MLP: gate_proj + up_proj -> silu(gate)*up -> down_proj
@@ -467,18 +525,36 @@ impl QwenRunner {
             for i in 0..hidden {
                 x[i] += down[i];
             }
+            let layer_out_norm = l2norm_value(&x);
+            if self.debug_pos == Some(pos) {
+                let kind = self.layer_kinds.get(layer).copied().unwrap_or(LayerKind::FullAttention);
+                eprintln!(
+                    "[qwen-debug] pos={pos} layer={layer} kind={kind:?} in={:.6} post_mixer={:.6} out={:.6}",
+                    layer_in_norm, layer_post_mixer_norm, layer_out_norm
+                );
+            }
         }
 
         // Final norm.
         let mut norm_w = vec![0.0f32; hidden];
         self.rmsnorm_weight("language_model.model.norm.weight", &mut norm_w)?;
+        if self.rmsnorm_weight_is_offset {
+            add_one_inplace(&mut norm_w);
+        }
         let mut x_final = vec![0.0f32; hidden];
         rms_norm_f32(&x, &norm_w, cfg.rms_norm_eps, &mut x_final);
+        if self.debug_pos == Some(pos) {
+            eprintln!(
+                "[qwen-debug] pos={pos} final pre_norm={:.6} final={:.6}",
+                l2norm_value(&x),
+                l2norm_value(&x_final)
+            );
+        }
 
         // Logits via lm_head when present, otherwise tied embeddings.
-        let embed = self.tensor_f16("language_model.model.embed_tokens.weight")?;
-        let lm_head = if self.file.tensor_index("lm_head.weight").is_some() {
-            Some(self.tensor_f16("lm_head.weight")?)
+        let embed_name = self.resolve_tensor_name("language_model.model.embed_tokens.weight");
+        let lm_head_name = if self.file.tensor_index("lm_head.weight").is_some() {
+            Some(self.resolve_tensor_name("lm_head.weight"))
         } else {
             None
         };
@@ -489,15 +565,12 @@ impl QwenRunner {
         let mut min_val = f32::INFINITY;
 
         for vid in 0..vocab {
-            let row = if let Some(lm) = lm_head {
-                &lm[(vid * hidden)..(vid + 1) * hidden]
+            let weight_name = if let Some(name) = lm_head_name.as_deref() {
+                name
             } else {
-                &embed[(vid * hidden)..(vid + 1) * hidden]
+                embed_name.as_str()
             };
-            let mut dot = 0.0f32;
-            for i in 0..hidden {
-                dot += x_final[i] * f16::from_bits(row[i]).to_f32();
-            }
+            let dot = self.dot_row(weight_name, vid, hidden, &x_final)?;
 
             if top.len() < k {
                 top.push((vid as u32, dot));
@@ -539,6 +612,11 @@ impl QwenRunner {
         Ok(cast_slice(bytes))
     }
 
+    fn tensor_u8(&self, name: &str) -> Result<&[u8], CoreError> {
+        let resolved = self.resolve_tensor_name(name);
+        self.file.tensor_bytes(&resolved)
+    }
+
     fn tensor_shape(&self, name: &str) -> Result<Vec<usize>, CoreError> {
         let resolved = self.resolve_tensor_name(name);
         let t = self
@@ -549,34 +627,124 @@ impl QwenRunner {
     }
 
     fn resolve_tensor_name(&self, name: &str) -> String {
-        if self.file.tensor_index(name).is_some() {
-            return name.to_string();
-        }
-        if let Some(rest) = name.strip_prefix("language_model.model.") {
-            let alt = format!("model.{rest}");
-            if self.file.tensor_index(&alt).is_some() {
-                return alt;
-            }
-        }
-        if let Some(rest) = name.strip_prefix("model.") {
-            let alt = format!("language_model.model.{rest}");
-            if self.file.tensor_index(&alt).is_some() {
-                return alt;
-            }
-        }
-        name.to_string()
+        resolve_tensor_name_file(&self.file, name)
     }
 
     fn embed_token(&self, token: u32, out: &mut [f32]) -> Result<(), CoreError> {
         let hidden = out.len();
-        let embed = self.tensor_f16("language_model.model.embed_tokens.weight")?;
+        let weight_name = "language_model.model.embed_tokens.weight";
+        let shape = self.tensor_shape(weight_name)?;
+        if shape.len() != 2 || shape[1] != hidden {
+            return Err(CoreError::Backend(format!(
+                "embed weight shape mismatch: {:?}, expected [vocab,{hidden}]",
+                shape
+            )));
+        }
+        let resolved = self.resolve_tensor_name(weight_name);
+        let meta = self
+            .file
+            .tensor_index(&resolved)
+            .ok_or_else(|| CoreError::Backend(format!("unknown tensor {weight_name}")))?;
         let vocab = self.cfg.vocab_size;
         let t = (token as usize) % vocab;
-        let row = &embed[t * hidden..(t + 1) * hidden];
-        for i in 0..hidden {
-            out[i] = f16::from_bits(row[i]).to_f32();
+        match meta.dtype.as_str() {
+            "f16" => {
+                let embed = self.tensor_f16(weight_name)?;
+                let row = &embed[t * hidden..(t + 1) * hidden];
+                for i in 0..hidden {
+                    out[i] = f16::from_bits(row[i]).to_f32();
+                }
+            }
+            "i8" => {
+                let embed = self.tensor_i8(weight_name)?;
+                let scales = self.tensor_f16(&format!("{weight_name}.qscale"))?;
+                let scale = f16::from_bits(scales[t]).to_f32();
+                let row = &embed[t * hidden..(t + 1) * hidden];
+                for i in 0..hidden {
+                    out[i] = (row[i] as f32) * scale;
+                }
+            }
+            "i4" => {
+                let embed = self.tensor_u8(weight_name)?;
+                let scales = self.tensor_f16(&format!("{weight_name}.qscale"))?;
+                let scale = f16::from_bits(scales[t]).to_f32();
+                let row_stride = hidden.div_ceil(2);
+                let row = &embed[t * row_stride..(t + 1) * row_stride];
+                for i in 0..hidden {
+                    out[i] = unpack_i4(row, i) * scale;
+                }
+            }
+            other => {
+                return Err(CoreError::Backend(format!(
+                    "unsupported embed dtype for {weight_name}: {other}"
+                )));
+            }
         }
         Ok(())
+    }
+
+    fn dot_row(
+        &self,
+        weight_name: &str,
+        row_idx: usize,
+        in_dim: usize,
+        x: &[f32],
+    ) -> Result<f32, CoreError> {
+        let shape = self.tensor_shape(weight_name)?;
+        if shape.len() != 2 || shape[1] != in_dim {
+            return Err(CoreError::Backend(format!(
+                "weight {weight_name} shape mismatch: {:?} expected [*,{in_dim}]",
+                shape
+            )));
+        }
+        if row_idx >= shape[0] {
+            return Err(CoreError::Backend(format!(
+                "weight {weight_name} row index out of range: {row_idx} >= {}",
+                shape[0]
+            )));
+        }
+        let resolved = self.resolve_tensor_name(weight_name);
+        let meta = self
+            .file
+            .tensor_index(&resolved)
+            .ok_or_else(|| CoreError::Backend(format!("unknown tensor {weight_name}")))?;
+        match meta.dtype.as_str() {
+            "f16" => {
+                let w = self.tensor_f16(weight_name)?;
+                let row = &w[row_idx * in_dim..(row_idx + 1) * in_dim];
+                let mut acc = 0.0f32;
+                for i in 0..in_dim {
+                    acc += x[i] * f16::from_bits(row[i]).to_f32();
+                }
+                Ok(acc)
+            }
+            "i8" => {
+                let w = self.tensor_i8(weight_name)?;
+                let scales = self.tensor_f16(&format!("{weight_name}.qscale"))?;
+                let scale = f16::from_bits(scales[row_idx]).to_f32();
+                let row = &w[row_idx * in_dim..(row_idx + 1) * in_dim];
+                let mut acc = 0.0f32;
+                for i in 0..in_dim {
+                    acc += x[i] * (row[i] as f32) * scale;
+                }
+                Ok(acc)
+            }
+            "i4" => {
+                let w = self.tensor_u8(weight_name)?;
+                let scales = self.tensor_f16(&format!("{weight_name}.qscale"))?;
+                let scale = f16::from_bits(scales[row_idx]).to_f32();
+                let row_stride = in_dim.div_ceil(2);
+                let row = &w[row_idx * row_stride..(row_idx + 1) * row_stride];
+                let mut acc = 0.0f32;
+                for i in 0..in_dim {
+                    acc += x[i] * unpack_i4(row, i) * scale;
+                }
+                Ok(acc)
+            }
+            other => Err(CoreError::Backend(format!(
+                "unsupported weight dtype for {weight_name}: {other}"
+            ))),
+        }
     }
 
     fn rmsnorm_weight(&self, name: &str, out: &mut [f32]) -> Result<(), CoreError> {
@@ -672,6 +840,35 @@ impl QwenRunner {
                     let mut acc = 0.0f32;
                     for i in 0..in_dim {
                         acc += x[i] * (row[i] as f32) * scale;
+                    }
+                    out[j] = acc;
+                }
+            }
+            "i4" => {
+                let w = self.tensor_u8(weight_name)?;
+                let row_stride = in_dim.div_ceil(2);
+                if w.len() != out_dim * row_stride {
+                    return Err(CoreError::Backend(format!(
+                        "weight {weight_name} len mismatch: {} expected {}",
+                        w.len(),
+                        out_dim * row_stride
+                    )));
+                }
+                let scales_name = format!("{weight_name}.qscale");
+                let scales = self.tensor_f16(&scales_name)?;
+                if scales.len() != out_dim {
+                    return Err(CoreError::Backend(format!(
+                        "weight {weight_name} qscale len mismatch: {} expected {}",
+                        scales.len(),
+                        out_dim
+                    )));
+                }
+                for j in 0..out_dim {
+                    let row = &w[j * row_stride..(j + 1) * row_stride];
+                    let scale = f16::from_bits(scales[j]).to_f32();
+                    let mut acc = 0.0f32;
+                    for i in 0..in_dim {
+                        acc += x[i] * unpack_i4(row, i) * scale;
                     }
                     out[j] = acc;
                 }
@@ -778,39 +975,16 @@ fn linear_attn_step(
 
     // 2) Mixed QKV for the causal conv.
     //
-    // The reference implementation projects into a per-`k_head` packed tensor:
-    //   [num_k_heads, (q: head_k_dim) | (k: head_k_dim) | (v: ratio*head_v_dim) | (z: ratio*head_v_dim)]
-    // and then concatenates query/key/value to:
-    //   [q_all, k_all, v_all]  (sizes: key_dim, key_dim, value_dim).
-    //
-    // For checkpoints that expose `in_proj_qkv`, we interpret its output as that per-head packing
-    // without the `z` portion, and perform the same re-ordering here.
-    let per_k = 2 * spec.head_k_dim + ratio * spec.head_v_dim;
-    if qkv.len() != spec.num_k_heads * per_k {
+    // HF Qwen3.5 uses plain packed layout:
+    //   [q_all, k_all, v_all] with sizes [key_dim, key_dim, value_dim].
+    if qkv.len() != conv_dim {
         return Err(CoreError::Backend(format!(
             "qwen linear_attn: in_proj_qkv out_dim {} unexpected (expected {})",
             qkv.len(),
-            spec.num_k_heads * per_k
+            conv_dim
         )));
     }
-    mixed_qkv.fill(0.0);
-    let (q_part, rest) = mixed_qkv.split_at_mut(key_dim);
-    let (k_part, v_part) = rest.split_at_mut(key_dim);
-    for kh in 0..spec.num_k_heads {
-        let base = kh * per_k;
-        q_part[kh * spec.head_k_dim..(kh + 1) * spec.head_k_dim]
-            .copy_from_slice(&qkv[base..base + spec.head_k_dim]);
-        k_part[kh * spec.head_k_dim..(kh + 1) * spec.head_k_dim].copy_from_slice(
-            &qkv[base + spec.head_k_dim..base + 2 * spec.head_k_dim],
-        );
-        let v_src = &qkv[base + 2 * spec.head_k_dim..base + per_k];
-        for r in 0..ratio {
-            let vh = kh * ratio + r;
-            v_part[vh * spec.head_v_dim..(vh + 1) * spec.head_v_dim].copy_from_slice(
-                &v_src[r * spec.head_v_dim..(r + 1) * spec.head_v_dim],
-            );
-        }
-    }
+    mixed_qkv.copy_from_slice(qkv);
 
     // 3) Causal depthwise conv1d update + SiLU.
     let conv_w = tensor_f16_file(
@@ -875,7 +1049,6 @@ fn linear_attn_step(
     for v in q_rep.iter_mut() {
         *v *= scale;
     }
-
     // 6) Compute g + beta for recurrent delta rule.
     let a_log = tensor_f16_file(
         file,
@@ -1057,13 +1230,20 @@ impl QwenSessionState {
 
 fn infer_qwen_layer_kinds_and_linear_spec(
     file: &CellmFile,
-) -> Result<(Vec<LayerKind>, Option<LinearAttnSpec>), CoreError> {
+) -> Result<(Vec<LayerKind>, Option<LinearAttnSpec>, f32), CoreError> {
     let n_layers = file.header.num_layers;
     let mut kinds: Vec<LayerKind> = Vec::with_capacity(n_layers);
+    let mut partial_rotary_factor = 1.0f32;
 
     // Prefer config-derived layer_types if present.
     let mut spec: Option<LinearAttnSpec> = None;
     if let Some(Value::Object(obj)) = &file.header.source_text_config {
+        if let Some(Value::Object(rope_params)) = obj.get("rope_parameters") {
+            if let Some(v) = rope_params.get("partial_rotary_factor").and_then(|v| v.as_f64()) {
+                partial_rotary_factor = (v as f32).clamp(0.0, 1.0);
+            }
+        }
+
         if let Some(Value::Array(layer_types)) = obj.get("layer_types") {
             for (i, v) in layer_types.iter().enumerate() {
                 let s = v
@@ -1105,16 +1285,14 @@ fn infer_qwen_layer_kinds_and_linear_spec(
     if kinds.len() != n_layers {
         kinds.clear();
         for layer in 0..n_layers {
-            let has_self = file
-                .tensor_index(&format!(
-                    "language_model.model.layers.{layer}.self_attn.q_proj.weight"
-                ))
-                .is_some();
-            let has_linear = file
-                .tensor_index(&format!(
-                    "language_model.model.layers.{layer}.linear_attn.in_proj_qkv.weight"
-                ))
-                .is_some();
+            let has_self = has_tensor_file(
+                file,
+                &format!("language_model.model.layers.{layer}.self_attn.q_proj.weight"),
+            );
+            let has_linear = has_tensor_file(
+                file,
+                &format!("language_model.model.layers.{layer}.linear_attn.in_proj_qkv.weight"),
+            );
             kinds.push(match (has_self, has_linear) {
                 (true, _) => LayerKind::FullAttention,
                 (false, true) => LayerKind::LinearAttention,
@@ -1133,30 +1311,30 @@ fn infer_qwen_layer_kinds_and_linear_spec(
             }
         }
         let layer = layer0.ok_or_else(|| CoreError::Backend("qwen: no linear layers".into()))?;
-        let qkv = file
-            .tensor_index(&format!(
-                "language_model.model.layers.{layer}.linear_attn.in_proj_qkv.weight"
-            ))
+        let qkv = tensor_index_file(
+            file,
+            &format!("language_model.model.layers.{layer}.linear_attn.in_proj_qkv.weight"),
+        )
             .ok_or_else(|| CoreError::Backend("qwen: missing linear in_proj_qkv".into()))?;
-        let z = file
-            .tensor_index(&format!(
-                "language_model.model.layers.{layer}.linear_attn.in_proj_z.weight"
-            ))
+        let z = tensor_index_file(
+            file,
+            &format!("language_model.model.layers.{layer}.linear_attn.in_proj_z.weight"),
+        )
             .ok_or_else(|| CoreError::Backend("qwen: missing linear in_proj_z".into()))?;
-        let a = file
-            .tensor_index(&format!(
-                "language_model.model.layers.{layer}.linear_attn.in_proj_a.weight"
-            ))
+        let a = tensor_index_file(
+            file,
+            &format!("language_model.model.layers.{layer}.linear_attn.in_proj_a.weight"),
+        )
             .ok_or_else(|| CoreError::Backend("qwen: missing linear in_proj_a".into()))?;
-        let norm = file
-            .tensor_index(&format!(
-                "language_model.model.layers.{layer}.linear_attn.norm.weight"
-            ))
+        let norm = tensor_index_file(
+            file,
+            &format!("language_model.model.layers.{layer}.linear_attn.norm.weight"),
+        )
             .ok_or_else(|| CoreError::Backend("qwen: missing linear norm.weight".into()))?;
-        let conv = file
-            .tensor_index(&format!(
-                "language_model.model.layers.{layer}.linear_attn.conv1d.weight"
-            ))
+        let conv = tensor_index_file(
+            file,
+            &format!("language_model.model.layers.{layer}.linear_attn.conv1d.weight"),
+        )
             .ok_or_else(|| CoreError::Backend("qwen: missing linear conv1d.weight".into()))?;
 
         let conv_dim = qkv.shape[0];
@@ -1187,7 +1365,36 @@ fn infer_qwen_layer_kinds_and_linear_spec(
         });
     }
 
-    Ok((kinds, spec))
+    Ok((kinds, spec, partial_rotary_factor))
+}
+
+fn qwen_rmsnorm_is_offset(header: &crate::cellm_file::CellmHeader) -> bool {
+    if header.model_type.starts_with("qwen3_5") {
+        return true;
+    }
+    if header
+        .source_model_type
+        .as_deref()
+        .is_some_and(|m| m.starts_with("qwen3_5"))
+    {
+        return true;
+    }
+    if let Some(Value::Object(obj)) = &header.source_text_config {
+        if obj
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| m.starts_with("qwen3_5"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn add_one_inplace(x: &mut [f32]) {
+    for v in x {
+        *v += 1.0;
+    }
 }
 
 fn sigmoid_f32(x: f32) -> f32 {
@@ -1220,6 +1427,14 @@ fn l2norm_inplace(x: &mut [f32], eps: f32) {
     }
 }
 
+fn l2norm_value(x: &[f32]) -> f32 {
+    let mut s = 0.0f32;
+    for &v in x {
+        s += v * v;
+    }
+    s.sqrt()
+}
+
 fn rms_norm_inplace_f32(x: &mut [f32], weight: &[f32], eps: f32) {
     debug_assert_eq!(x.len(), weight.len());
     let mut var = 0.0f32;
@@ -1230,6 +1445,33 @@ fn rms_norm_inplace_f32(x: &mut [f32], weight: &[f32], eps: f32) {
     let inv = 1.0 / (var + eps).sqrt();
     for i in 0..x.len() {
         x[i] = x[i] * inv * weight[i];
+    }
+}
+
+fn rope_inplace_f32_partial(
+    x: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    pos: usize,
+    theta: f32,
+) {
+    debug_assert_eq!(x.len(), n_heads * head_dim);
+    debug_assert!(rotary_dim <= head_dim);
+    debug_assert!(rotary_dim % 2 == 0);
+
+    let half = rotary_dim / 2;
+    for h in 0..n_heads {
+        let base = h * head_dim;
+        for i in 0..half {
+            let inv_freq = theta.powf(-(2.0 * i as f32) / rotary_dim as f32);
+            let angle = pos as f32 * inv_freq;
+            let (sin, cos) = angle.sin_cos();
+            let x0 = x[base + i];
+            let x1 = x[base + half + i];
+            x[base + i] = x0 * cos - x1 * sin;
+            x[base + half + i] = x1 * cos + x0 * sin;
+        }
     }
 }
 
@@ -1270,8 +1512,62 @@ fn causal_conv1d_update_silu(
     }
 }
 
+fn resolve_tensor_name_file(file: &CellmFile, name: &str) -> String {
+    if file.tensor_index(name).is_some() {
+        return name.to_string();
+    }
+    if let Some(rest) = name.strip_prefix("language_model.model.") {
+        let candidates = [
+            format!("model.{rest}"),
+            format!("model.language_model.{rest}"),
+        ];
+        for candidate in candidates {
+            if file.tensor_index(&candidate).is_some() {
+                return candidate;
+            }
+        }
+    }
+    if let Some(rest) = name.strip_prefix("model.") {
+        let candidates = [
+            format!("language_model.model.{rest}"),
+            format!("model.language_model.{rest}"),
+        ];
+        for candidate in candidates {
+            if file.tensor_index(&candidate).is_some() {
+                return candidate;
+            }
+        }
+    }
+    if let Some(rest) = name.strip_prefix("model.language_model.") {
+        let candidates = [
+            format!("language_model.model.{rest}"),
+            format!("model.{rest}"),
+        ];
+        for candidate in candidates {
+            if file.tensor_index(&candidate).is_some() {
+                return candidate;
+            }
+        }
+    }
+    name.to_string()
+}
+
+fn has_tensor_file(file: &CellmFile, name: &str) -> bool {
+    let resolved = resolve_tensor_name_file(file, name);
+    file.tensor_index(&resolved).is_some()
+}
+
+fn tensor_index_file<'a>(
+    file: &'a CellmFile,
+    name: &str,
+) -> Option<&'a crate::cellm_file::CellmTensorIndex> {
+    let resolved = resolve_tensor_name_file(file, name);
+    file.tensor_index(&resolved)
+}
+
 fn tensor_f16_file<'a>(file: &'a CellmFile, name: &str) -> Result<&'a [u16], CoreError> {
-    let bytes = file.tensor_bytes(name)?;
+    let resolved = resolve_tensor_name_file(file, name);
+    let bytes = file.tensor_bytes(&resolved)?;
     if bytes.len() % 2 != 0 {
         return Err(CoreError::Backend(format!("tensor {name} nbytes not even")));
     }
@@ -1279,13 +1575,20 @@ fn tensor_f16_file<'a>(file: &'a CellmFile, name: &str) -> Result<&'a [u16], Cor
 }
 
 fn tensor_i8_file<'a>(file: &'a CellmFile, name: &str) -> Result<&'a [i8], CoreError> {
-    let bytes = file.tensor_bytes(name)?;
+    let resolved = resolve_tensor_name_file(file, name);
+    let bytes = file.tensor_bytes(&resolved)?;
     Ok(cast_slice(bytes))
 }
 
+fn tensor_u8_file<'a>(file: &'a CellmFile, name: &str) -> Result<&'a [u8], CoreError> {
+    let resolved = resolve_tensor_name_file(file, name);
+    file.tensor_bytes(&resolved)
+}
+
 fn tensor_shape_file(file: &CellmFile, name: &str) -> Result<Vec<usize>, CoreError> {
+    let resolved = resolve_tensor_name_file(file, name);
     let t = file
-        .tensor_index(name)
+        .tensor_index(&resolved)
         .ok_or_else(|| CoreError::Backend(format!("unknown tensor {name}")))?;
     Ok(t.shape.clone())
 }
@@ -1306,9 +1609,10 @@ fn linear_f16_out_in_file(
         )));
     }
 
+    let resolved = resolve_tensor_name_file(file, weight_name);
     let shape = tensor_shape_file(file, weight_name)?;
     let meta = file
-        .tensor_index(weight_name)
+        .tensor_index(&resolved)
         .ok_or_else(|| CoreError::Backend(format!("unknown tensor {weight_name}")))?;
     if shape.len() != 2 {
         return Err(CoreError::Backend(format!(
@@ -1370,6 +1674,35 @@ fn linear_f16_out_in_file(
                 out[j] = acc;
             }
         }
+        "i4" => {
+            let w = tensor_u8_file(file, weight_name)?;
+            let row_stride = in_dim.div_ceil(2);
+            if w.len() != out_dim * row_stride {
+                return Err(CoreError::Backend(format!(
+                    "weight {weight_name} len mismatch: {} expected {}",
+                    w.len(),
+                    out_dim * row_stride
+                )));
+            }
+            let scales_name = format!("{weight_name}.qscale");
+            let scales = tensor_f16_file(file, &scales_name)?;
+            if scales.len() != out_dim {
+                return Err(CoreError::Backend(format!(
+                    "weight {weight_name} qscale len mismatch: {} expected {}",
+                    scales.len(),
+                    out_dim
+                )));
+            }
+            for j in 0..out_dim {
+                let row = &w[j * row_stride..(j + 1) * row_stride];
+                let scale = f16::from_bits(scales[j]).to_f32();
+                let mut acc = 0.0f32;
+                for i in 0..in_dim {
+                    acc += x[i] * unpack_i4(row, i) * scale;
+                }
+                out[j] = acc;
+            }
+        }
         other => {
             return Err(CoreError::Backend(format!(
                 "unsupported weight dtype for {weight_name}: {other}"
@@ -1377,4 +1710,14 @@ fn linear_f16_out_in_file(
         }
     }
     Ok(())
+}
+
+fn unpack_i4(packed_row: &[u8], idx: usize) -> f32 {
+    let byte = packed_row[idx / 2];
+    let nibble = if idx % 2 == 0 {
+        byte & 0x0f
+    } else {
+        (byte >> 4) & 0x0f
+    };
+    (nibble as i8 - 8) as f32
 }

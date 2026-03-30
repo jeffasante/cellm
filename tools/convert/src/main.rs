@@ -43,6 +43,16 @@ struct Args {
     /// This is weight-only quantization and currently targets Llama/Qwen text stacks.
     #[arg(long, default_value_t = false)]
     quantize_int8_symmetric: bool,
+
+    /// Quantize eligible text 2D weights to per-row symmetric int4 packed nibbles (+ f16 scales).
+    ///
+    /// This is an aggressive weight-only mode for Qwen text stacks.
+    #[arg(long, default_value_t = false)]
+    quantize_int4_symmetric: bool,
+
+    /// Keep only text-stack tensors (drop vision/projector tensors).
+    #[arg(long, default_value_t = false)]
+    text_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,6 +171,8 @@ enum TensorOp {
     Dequant4Affine { group_size: usize },
     QuantizeI8Data,
     QuantizeI8Scales { weight_name: String },
+    QuantizeI4Data,
+    QuantizeI4Scales { weight_name: String },
 }
 
 fn main() -> Result<()> {
@@ -238,6 +250,15 @@ fn main() -> Result<()> {
             selected.model_type
         );
     }
+    if args.quantize_int4_symmetric && args.quantize_int8_symmetric {
+        anyhow::bail!("choose only one quantization mode: --quantize-int8-symmetric or --quantize-int4-symmetric");
+    }
+    if args.quantize_int4_symmetric && !selected.model_type.starts_with("qwen") {
+        anyhow::bail!(
+            "--quantize-int4-symmetric is currently supported for qwen text stacks only (detected model_type={}).",
+            selected.model_type
+        );
+    }
 
     let plans = build_tensor_plans(
         &safetensors_paths,
@@ -245,6 +266,8 @@ fn main() -> Result<()> {
         has_4bit_affine,
         quant_group_size,
         args.quantize_int8_symmetric,
+        args.quantize_int4_symmetric,
+        args.text_only,
         &selected.model_type,
     )?;
     let (text_tensor_prefix, vision_tensor_prefix, projector_tensor_prefix) =
@@ -432,6 +455,18 @@ fn main() -> Result<()> {
                     format!("tensor {} in {:?}", weight_name, safetensors_paths[p.file_idx])
                 })?;
                 write_quant_i8_scales_per_row_symmetric(t.data(), t.shape(), t.dtype(), &mut w)?;
+            }
+            TensorOp::QuantizeI4Data => {
+                let t = st.tensor(&p.name).with_context(|| {
+                    format!("tensor {} in {:?}", p.name, safetensors_paths[p.file_idx])
+                })?;
+                write_quant_i4_data_per_row_symmetric(t.data(), t.shape(), t.dtype(), &mut w)?;
+            }
+            TensorOp::QuantizeI4Scales { weight_name } => {
+                let t = st.tensor(weight_name).with_context(|| {
+                    format!("tensor {} in {:?}", weight_name, safetensors_paths[p.file_idx])
+                })?;
+                write_quant_i4_scales_per_row_symmetric(t.data(), t.shape(), t.dtype(), &mut w)?;
             }
         }
 
@@ -644,6 +679,8 @@ fn build_tensor_plans(
     has_4bit_affine: bool,
     group_size: usize,
     quantize_int8_symmetric: bool,
+    quantize_int4_symmetric: bool,
+    text_only: bool,
     model_type: &str,
 ) -> Result<Vec<TensorPlan>> {
     let mmaps = mmap_all(paths)?;
@@ -658,6 +695,9 @@ fn build_tensor_plans(
             names.iter().map(|s| s.as_str()).collect();
 
         for name in st.names() {
+            if text_only && !is_text_tensor_name(name) {
+                continue;
+            }
             let t = st.tensor(name)?;
             let shape: Vec<usize> = t.shape().iter().map(|&d| d as usize).collect();
             let mut out_shape = shape.clone();
@@ -687,6 +727,11 @@ fn build_tensor_plans(
             {
                 out_dtype = "i8".to_string();
                 TensorOp::QuantizeI8Data
+            } else if quantize_int4_symmetric
+                && should_quantize_i4_weight(model_type, name, &shape)
+            {
+                out_dtype = "i4".to_string();
+                TensorOp::QuantizeI4Data
             } else {
                 TensorOp::CopyAsF16
             };
@@ -709,7 +754,13 @@ fn build_tensor_plans(
             }
 
             let numel = out_shape.iter().product::<usize>();
-            let out_nbytes = if out_dtype == "i8" { numel } else { numel * 2 };
+            let out_nbytes = if out_dtype == "i8" {
+                numel
+            } else if out_dtype == "i4" {
+                numel.div_ceil(2)
+            } else {
+                numel * 2
+            };
 
             // Validate input dtype early unless we are dequantizing it.
             if !matches!(&op, TensorOp::Dequant4Affine { .. }) {
@@ -743,6 +794,19 @@ fn build_tensor_plans(
                     out_nbytes: out_dim * 2,
                     out_dtype: "f16".to_string(),
                     op: TensorOp::QuantizeI8Scales {
+                        weight_name: name.to_string(),
+                    },
+                });
+            } else if out_dtype == "i4" {
+                let out_dim = shape[0];
+                plans.push(TensorPlan {
+                    name: format!("{name}.qscale"),
+                    shape: vec![out_dim],
+                    file_idx,
+                    offset_bytes: 0,
+                    out_nbytes: out_dim * 2,
+                    out_dtype: "f16".to_string(),
+                    op: TensorOp::QuantizeI4Scales {
                         weight_name: name.to_string(),
                     },
                 });
@@ -794,6 +858,15 @@ fn infer_tensor_prefixes(
     (text, vision, projector)
 }
 
+fn is_text_tensor_name(name: &str) -> bool {
+    name.starts_with("model.language_model.")
+        || name.starts_with("language_model.model.")
+        || name.starts_with("model.text_model.")
+        || name.starts_with("text_model.")
+        || name == "lm_head.weight"
+        || name == "model.lm_head.weight"
+}
+
 fn should_quantize_i8_llama_weight(name: &str, shape: &[usize]) -> bool {
     if shape.len() != 2 || !name.ends_with(".weight") {
         return false;
@@ -808,7 +881,11 @@ fn should_quantize_i8_qwen_weight(name: &str, shape: &[usize]) -> bool {
     if shape.len() != 2 || !name.ends_with(".weight") {
         return false;
     }
-    if !name.contains("language_model.model.layers.") {
+    let in_qwen_layer = name.contains("language_model.model.layers.")
+        || name.contains("model.layers.")
+        || name.contains("model.text_model.layers.")
+        || name.contains("model.language_model.layers.");
+    if !in_qwen_layer {
         return false;
     }
     if name.contains("embed_tokens")
@@ -821,12 +898,30 @@ fn should_quantize_i8_qwen_weight(name: &str, shape: &[usize]) -> bool {
     true
 }
 
+fn should_quantize_i4_qwen_weight(name: &str, shape: &[usize]) -> bool {
+    if shape.len() != 2 || !name.ends_with(".weight") {
+        return false;
+    }
+    // Quantize all 2D text tensors for aggressive size reduction, including
+    // embeddings, LM head, attention/MLP linears, and linear-attn projections.
+    name.starts_with("model.language_model.")
+        || name.starts_with("language_model.model.")
+        || name.starts_with("model.text_model.")
+}
+
 fn should_quantize_i8_weight(model_type: &str, name: &str, shape: &[usize]) -> bool {
     if model_type == "llama" {
         return should_quantize_i8_llama_weight(name, shape);
     }
     if model_type.starts_with("qwen") {
         return should_quantize_i8_qwen_weight(name, shape);
+    }
+    false
+}
+
+fn should_quantize_i4_weight(model_type: &str, name: &str, shape: &[usize]) -> bool {
+    if model_type.starts_with("qwen") {
+        return should_quantize_i4_qwen_weight(name, shape);
     }
     false
 }
@@ -928,6 +1023,87 @@ fn write_quant_i8_scales_per_row_symmetric(
             }
         }
         let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+        let h = f16::from_f32(scale);
+        w.write_all(&h.to_bits().to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn write_quant_i4_data_per_row_symmetric(
+    data: &[u8],
+    shape: &[usize],
+    dtype: Dtype,
+    w: &mut impl Write,
+) -> Result<()> {
+    if shape.len() != 2 {
+        anyhow::bail!("int4 quantization expects 2D weight, got shape={shape:?}");
+    }
+    let out_dim = shape[0];
+    let in_dim = shape[1];
+    let values = tensor_data_to_f32(data, dtype)?;
+    if values.len() != out_dim * in_dim {
+        anyhow::bail!(
+            "int4 quantization data length mismatch: {} vs {}",
+            values.len(),
+            out_dim * in_dim
+        );
+    }
+
+    for r in 0..out_dim {
+        let row = &values[r * in_dim..(r + 1) * in_dim];
+        let mut max_abs = 0.0f32;
+        for &v in row {
+            let a = v.abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+        let scale = if max_abs > 0.0 { max_abs / 7.0 } else { 1.0 };
+        for i in (0..in_dim).step_by(2) {
+            let q0 = (row[i] / scale).round().clamp(-7.0, 7.0) as i8;
+            let q1 = if i + 1 < in_dim {
+                (row[i + 1] / scale).round().clamp(-7.0, 7.0) as i8
+            } else {
+                0
+            };
+            let n0 = (q0 + 8) as u8 & 0x0f;
+            let n1 = (q1 + 8) as u8 & 0x0f;
+            w.write_all(&[n0 | (n1 << 4)])?;
+        }
+    }
+    Ok(())
+}
+
+fn write_quant_i4_scales_per_row_symmetric(
+    data: &[u8],
+    shape: &[usize],
+    dtype: Dtype,
+    w: &mut impl Write,
+) -> Result<()> {
+    if shape.len() != 2 {
+        anyhow::bail!("int4 quantization expects 2D weight, got shape={shape:?}");
+    }
+    let out_dim = shape[0];
+    let in_dim = shape[1];
+    let values = tensor_data_to_f32(data, dtype)?;
+    if values.len() != out_dim * in_dim {
+        anyhow::bail!(
+            "int4 quantization data length mismatch: {} vs {}",
+            values.len(),
+            out_dim * in_dim
+        );
+    }
+
+    for r in 0..out_dim {
+        let row = &values[r * in_dim..(r + 1) * in_dim];
+        let mut max_abs = 0.0f32;
+        for &v in row {
+            let a = v.abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+        let scale = if max_abs > 0.0 { max_abs / 7.0 } else { 1.0 };
         let h = f16::from_f32(scale);
         w.write_all(&h.to_bits().to_le_bytes())?;
     }

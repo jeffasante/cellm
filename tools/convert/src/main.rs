@@ -38,9 +38,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     dequant_4bit_affine: bool,
 
-    /// Quantize eligible Llama linear weights to per-row symmetric int8 (+ f16 scales).
+    /// Quantize eligible text linear weights to per-row symmetric int8 (+ f16 scales).
     ///
-    /// This is weight-only quantization and currently targets Llama-family text stacks.
+    /// This is weight-only quantization and currently targets Llama/Qwen text stacks.
     #[arg(long, default_value_t = false)]
     quantize_int8_symmetric: bool,
 }
@@ -228,9 +228,11 @@ fn main() -> Result<()> {
             "input appears to be 4-bit affine quantized (uint32 weights + scales/biases). Re-run with --dequant-4bit-affine to expand weights to f16."
         );
     }
-    if args.quantize_int8_symmetric && selected.model_type != "llama" {
+    if args.quantize_int8_symmetric
+        && !(selected.model_type == "llama" || selected.model_type.starts_with("qwen"))
+    {
         anyhow::bail!(
-            "--quantize-int8-symmetric is currently supported for llama text stacks only (detected model_type={}).",
+            "--quantize-int8-symmetric is currently supported for llama/qwen text stacks only (detected model_type={}).",
             selected.model_type
         );
     }
@@ -626,8 +628,7 @@ fn build_tensor_plans(
                     );
                 }
             } else if quantize_int8_symmetric
-                && model_type == "llama"
-                && should_quantize_i8_llama_weight(name, &shape)
+                && should_quantize_i8_weight(model_type, name, &shape)
             {
                 out_dtype = "i8".to_string();
                 TensorOp::QuantizeI8Data
@@ -746,6 +747,33 @@ fn should_quantize_i8_llama_weight(name: &str, shape: &[usize]) -> bool {
         return false;
     }
     name.contains(".self_attn.") || name.contains(".mlp.")
+}
+
+fn should_quantize_i8_qwen_weight(name: &str, shape: &[usize]) -> bool {
+    if shape.len() != 2 || !name.ends_with(".weight") {
+        return false;
+    }
+    if !name.contains("language_model.model.layers.") {
+        return false;
+    }
+    if name.contains("embed_tokens")
+        || name.contains("lm_head")
+        || name.contains("norm")
+        || name.contains("conv1d")
+    {
+        return false;
+    }
+    true
+}
+
+fn should_quantize_i8_weight(model_type: &str, name: &str, shape: &[usize]) -> bool {
+    if model_type == "llama" {
+        return should_quantize_i8_llama_weight(name, shape);
+    }
+    if model_type.starts_with("qwen") {
+        return should_quantize_i8_qwen_weight(name, shape);
+    }
+    false
 }
 
 fn write_f32_as_f16(bytes: &[u8], w: &mut impl Write) -> Result<()> {

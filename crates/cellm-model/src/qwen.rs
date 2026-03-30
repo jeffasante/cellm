@@ -501,6 +501,11 @@ impl QwenRunner {
         Ok(cast_slice(bytes))
     }
 
+    fn tensor_i8(&self, name: &str) -> Result<&[i8], CoreError> {
+        let bytes = self.file.tensor_bytes(name)?;
+        Ok(cast_slice(bytes))
+    }
+
     fn tensor_shape(&self, name: &str) -> Result<Vec<usize>, CoreError> {
         let t = self
             .file
@@ -552,8 +557,11 @@ impl QwenRunner {
             )));
         }
 
-        let w = self.tensor_f16(weight_name)?;
         let shape = self.tensor_shape(weight_name)?;
+        let meta = self
+            .file
+            .tensor_index(weight_name)
+            .ok_or_else(|| CoreError::Backend(format!("unknown tensor {weight_name}")))?;
         if shape.len() != 2 {
             return Err(CoreError::Backend(format!(
                 "weight {weight_name} expected 2D, got {:?}",
@@ -567,21 +575,58 @@ impl QwenRunner {
                 shape
             )));
         }
-        if w.len() != out_dim * in_dim {
-            return Err(CoreError::Backend(format!(
-                "weight {weight_name} len mismatch: {} expected {}",
-                w.len(),
-                out_dim * in_dim
-            )));
-        }
-
-        for j in 0..out_dim {
-            let row = &w[j * in_dim..(j + 1) * in_dim];
-            let mut acc = 0.0f32;
-            for i in 0..in_dim {
-                acc += x[i] * f16::from_bits(row[i]).to_f32();
+        match meta.dtype.as_str() {
+            "f16" => {
+                let w = self.tensor_f16(weight_name)?;
+                if w.len() != out_dim * in_dim {
+                    return Err(CoreError::Backend(format!(
+                        "weight {weight_name} len mismatch: {} expected {}",
+                        w.len(),
+                        out_dim * in_dim
+                    )));
+                }
+                for j in 0..out_dim {
+                    let row = &w[j * in_dim..(j + 1) * in_dim];
+                    let mut acc = 0.0f32;
+                    for i in 0..in_dim {
+                        acc += x[i] * f16::from_bits(row[i]).to_f32();
+                    }
+                    out[j] = acc;
+                }
             }
-            out[j] = acc;
+            "i8" => {
+                let w = self.tensor_i8(weight_name)?;
+                if w.len() != out_dim * in_dim {
+                    return Err(CoreError::Backend(format!(
+                        "weight {weight_name} len mismatch: {} expected {}",
+                        w.len(),
+                        out_dim * in_dim
+                    )));
+                }
+                let scales_name = format!("{weight_name}.qscale");
+                let scales = self.tensor_f16(&scales_name)?;
+                if scales.len() != out_dim {
+                    return Err(CoreError::Backend(format!(
+                        "weight {weight_name} qscale len mismatch: {} expected {}",
+                        scales.len(),
+                        out_dim
+                    )));
+                }
+                for j in 0..out_dim {
+                    let row = &w[j * in_dim..(j + 1) * in_dim];
+                    let scale = f16::from_bits(scales[j]).to_f32();
+                    let mut acc = 0.0f32;
+                    for i in 0..in_dim {
+                        acc += x[i] * (row[i] as f32) * scale;
+                    }
+                    out[j] = acc;
+                }
+            }
+            other => {
+                return Err(CoreError::Backend(format!(
+                    "unsupported weight dtype for {weight_name}: {other}"
+                )));
+            }
         }
         Ok(())
     }
@@ -1179,6 +1224,11 @@ fn tensor_f16_file<'a>(file: &'a CellmFile, name: &str) -> Result<&'a [u16], Cor
     Ok(cast_slice(bytes))
 }
 
+fn tensor_i8_file<'a>(file: &'a CellmFile, name: &str) -> Result<&'a [i8], CoreError> {
+    let bytes = file.tensor_bytes(name)?;
+    Ok(cast_slice(bytes))
+}
+
 fn tensor_shape_file(file: &CellmFile, name: &str) -> Result<Vec<usize>, CoreError> {
     let t = file
         .tensor_index(name)
@@ -1202,8 +1252,10 @@ fn linear_f16_out_in_file(
         )));
     }
 
-    let w = tensor_f16_file(file, weight_name)?;
     let shape = tensor_shape_file(file, weight_name)?;
+    let meta = file
+        .tensor_index(weight_name)
+        .ok_or_else(|| CoreError::Backend(format!("unknown tensor {weight_name}")))?;
     if shape.len() != 2 {
         return Err(CoreError::Backend(format!(
             "weight {weight_name} expected 2D, got {:?}",
@@ -1217,21 +1269,58 @@ fn linear_f16_out_in_file(
             shape
         )));
     }
-    if w.len() != out_dim * in_dim {
-        return Err(CoreError::Backend(format!(
-            "weight {weight_name} len mismatch: {} expected {}",
-            w.len(),
-            out_dim * in_dim
-        )));
-    }
-
-    for j in 0..out_dim {
-        let row = &w[j * in_dim..(j + 1) * in_dim];
-        let mut acc = 0.0f32;
-        for i in 0..in_dim {
-            acc += x[i] * f16::from_bits(row[i]).to_f32();
+    match meta.dtype.as_str() {
+        "f16" => {
+            let w = tensor_f16_file(file, weight_name)?;
+            if w.len() != out_dim * in_dim {
+                return Err(CoreError::Backend(format!(
+                    "weight {weight_name} len mismatch: {} expected {}",
+                    w.len(),
+                    out_dim * in_dim
+                )));
+            }
+            for j in 0..out_dim {
+                let row = &w[j * in_dim..(j + 1) * in_dim];
+                let mut acc = 0.0f32;
+                for i in 0..in_dim {
+                    acc += x[i] * f16::from_bits(row[i]).to_f32();
+                }
+                out[j] = acc;
+            }
         }
-        out[j] = acc;
+        "i8" => {
+            let w = tensor_i8_file(file, weight_name)?;
+            if w.len() != out_dim * in_dim {
+                return Err(CoreError::Backend(format!(
+                    "weight {weight_name} len mismatch: {} expected {}",
+                    w.len(),
+                    out_dim * in_dim
+                )));
+            }
+            let scales_name = format!("{weight_name}.qscale");
+            let scales = tensor_f16_file(file, &scales_name)?;
+            if scales.len() != out_dim {
+                return Err(CoreError::Backend(format!(
+                    "weight {weight_name} qscale len mismatch: {} expected {}",
+                    scales.len(),
+                    out_dim
+                )));
+            }
+            for j in 0..out_dim {
+                let row = &w[j * in_dim..(j + 1) * in_dim];
+                let scale = f16::from_bits(scales[j]).to_f32();
+                let mut acc = 0.0f32;
+                for i in 0..in_dim {
+                    acc += x[i] * (row[i] as f32) * scale;
+                }
+                out[j] = acc;
+            }
+        }
+        other => {
+            return Err(CoreError::Backend(format!(
+                "unsupported weight dtype for {weight_name}: {other}"
+            )));
+        }
     }
     Ok(())
 }

@@ -13,6 +13,11 @@ cellm-kernels = { path = "../cellm-kernels" }
 anyhow = { workspace = true }
 tokenizers = "0.19"
 serde_json = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+rand = "0.8"
+ndarray = "0.17"
+bytemuck = { workspace = true }
+half = { workspace = true }
 
 [lib]
 crate-type = ["lib", "staticlib", "cdylib"]

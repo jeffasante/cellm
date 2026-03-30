@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use cellm_cache::{KVCache, PageTable};
@@ -12,6 +12,7 @@ use serde_json::Value;
 pub type SessionId = u64;
 
 pub mod ffi;
+pub mod vlm;
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -65,6 +66,7 @@ enum Runner {
 /// Early wiring that owns a shared paged KV cache while each session owns a `PageTable`.
 /// Text-only for now.
 pub struct Engine {
+    model_path: PathBuf,
     cfg: ModelConfig,
     runner: Runner,
     backend: BackendKind,
@@ -115,6 +117,7 @@ impl Engine {
         let kv_cache = KVCache::new(layout)?;
 
         Ok(Self {
+            model_path: model_path.to_path_buf(),
             cfg,
             runner,
             backend: selected_backend,
@@ -279,6 +282,22 @@ impl Engine {
         &self.cfg
     }
 
+    pub fn model_path(&self) -> &Path {
+        &self.model_path
+    }
+
+    pub fn has_session(&self, id: SessionId) -> bool {
+        self.sessions.contains_key(&id)
+    }
+
+    pub fn sampling_params(&self) -> SamplingParams {
+        SamplingParams {
+            top_k: self.top_k,
+            temperature: self.temperature,
+            seed: self.seed,
+        }
+    }
+
     fn seed_for_session(&self, id: SessionId) -> u64 {
         // A cheap derivation to make sessions independent.
         let mut x = id ^ 0x9E3779B97F4A7C15u64;
@@ -410,6 +429,13 @@ pub struct EngineStats {
     pub active_sessions: usize,
     pub used_kv_blocks: usize,
     pub free_kv_blocks: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SamplingParams {
+    pub top_k: usize,
+    pub temperature: f64,
+    pub seed: u64,
 }
 
 fn infer_qwen_kv_head_dim(file: &CellmFile) -> Result<usize> {

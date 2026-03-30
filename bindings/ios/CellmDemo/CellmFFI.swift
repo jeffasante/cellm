@@ -262,8 +262,9 @@ final class CellmEngine {
             return .smolChat
         }
         if tpl.contains("<|im_start|>") && tpl.contains("<|im_end|>") {
-            let includeThinkPrefill = tpl.contains("<think>") && tpl.contains("</think>")
-            return .chatML(includeThinkPrefill: includeThinkPrefill)
+            // Qwen chat templates may include `<think>...</think>` prefill, but
+            // forcing that path in our mobile runner currently increases degenerate output.
+            return .chatML(includeThinkPrefill: false)
         }
         return .plain
     }

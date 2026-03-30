@@ -1,11 +1,13 @@
 import Foundation
 
 enum DemoAssetLinks {
-    static let qwen35Int4TextOnly = "https://github.com/jeffasante/cellm/blob/main/models/qwen3.5-0.8b-int4-textonly.cellm"
+    static let qwen35Stable = "https://github.com/jeffasante/cellm/blob/main/models/qwen3.5-0.8b.cellm"
+    static let qwen35CompactInt4TextOnly = "https://github.com/jeffasante/cellm/blob/main/models/qwen3.5-0.8b-int4-textonly.cellm"
     static let qwen35Tokenizer = "https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/tokenizer.json"
     static let qwen35TokenizerConfig = "https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/tokenizer_config.json"
     static let qwen35Dir = "samples/qwen3.5-0.8b"
-    static let qwen35FileName = "\(qwen35Dir)/qwen3.5-0.8b-int4-textonly.cellm"
+    static let qwen35StableFileName = "\(qwen35Dir)/qwen3.5-0.8b.cellm"
+    static let qwen35CompactFileName = "\(qwen35Dir)/qwen3.5-0.8b-int4-textonly.cellm"
     static let qwen35TokenizerFileName = "\(qwen35Dir)/tokenizer-qwen3.5-0.8b.json"
     static let qwen35TokenizerConfigFileName = "\(qwen35Dir)/tokenizer_config.json"
 

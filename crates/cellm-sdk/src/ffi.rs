@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{c_char, CStr};
 use std::path::Path;
 use std::slice;
@@ -68,6 +69,11 @@ pub type cellm_engine_t = u64;
 #[allow(non_camel_case_types)]
 pub type cellm_tokenizer_t = u64;
 
+struct TokenizerHandle {
+    tok: Tokenizer,
+    added_token_ids: HashMap<String, u32>,
+}
+
 #[no_mangle]
 pub extern "C" fn cellm_last_error_message(out_buf: *mut c_char, buf_len: usize) -> usize {
     if out_buf.is_null() || buf_len == 0 {
@@ -89,7 +95,9 @@ pub extern "C" fn cellm_tokenizer_create(tokenizer_path: *const c_char) -> cellm
         let tokenizer_path = cstr_to_str(tokenizer_path)?;
         let path = Path::new(tokenizer_path);
         let tok = load_tokenizer(path).map_err(|e| format!("tokenizer_create failed: {e}"))?;
-        Ok::<cellm_tokenizer_t, String>(Box::into_raw(Box::new(tok)) as u64)
+        let added_token_ids = load_added_token_ids(path)?;
+        let handle = TokenizerHandle { tok, added_token_ids };
+        Ok::<cellm_tokenizer_t, String>(Box::into_raw(Box::new(handle)) as u64)
     })();
 
     match result {
@@ -107,7 +115,7 @@ pub extern "C" fn cellm_tokenizer_destroy(tok: cellm_tokenizer_t) {
         return;
     }
     unsafe {
-        drop(Box::from_raw(tok as *mut Tokenizer));
+        drop(Box::from_raw(tok as *mut TokenizerHandle));
     }
 }
 
@@ -127,9 +135,9 @@ pub extern "C" fn cellm_tokenizer_encode(
             return Err("tokenizer_encode: null tokenizer".to_string());
         }
         let text = cstr_to_str(text_utf8)?;
-        let t = unsafe { &*(tok as *const Tokenizer) };
-        let enc = t.encode(text, true).map_err(|e| format!("encode failed: {e}"))?;
-        let ids = enc.get_ids();
+        let handle = unsafe { &*(tok as *const TokenizerHandle) };
+        let ids = encode_with_explicit_added_tokens(&handle.tok, &handle.added_token_ids, text)
+            .map_err(|e| format!("encode failed: {e}"))?;
         if out_tokens.is_null() || max_tokens == 0 {
             return Ok::<usize, String>(ids.len());
         }
@@ -171,9 +179,10 @@ pub extern "C" fn cellm_tokenizer_decode(
             return Err("tokenizer_decode: null/empty tokens".to_string());
         }
 
-        let t = unsafe { &*(tok as *const Tokenizer) };
+        let handle = unsafe { &*(tok as *const TokenizerHandle) };
         let ids = unsafe { std::slice::from_raw_parts(tokens, token_count) };
-        let text = t
+        let text = handle
+            .tok
             .decode(ids, true)
             .map_err(|e| format!("decode failed: {e}"))?;
         let bytes = text.as_bytes();
@@ -330,6 +339,88 @@ fn load_tokenizer(path: &std::path::Path) -> Result<Tokenizer, String> {
             Err(format!("load tokenizer failed: {e}"))
         }
     }
+}
+
+fn load_added_token_ids(path: &std::path::Path) -> Result<HashMap<String, u32>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read tokenizer failed: {e}"))?;
+    let v: Value = serde_json::from_slice(&bytes).map_err(|e| format!("parse tokenizer failed: {e}"))?;
+    let mut out = HashMap::new();
+    if let Some(arr) = v.get("added_tokens").and_then(|x| x.as_array()) {
+        for item in arr {
+            let Some(content) = item.get("content").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            let Some(id) = item.get("id").and_then(|x| x.as_u64()) else {
+                continue;
+            };
+            out.insert(content.to_string(), id as u32);
+        }
+    }
+    Ok(out)
+}
+
+fn encode_with_explicit_added_tokens(
+    tok: &Tokenizer,
+    added_token_ids: &HashMap<String, u32>,
+    text: &str,
+) -> Result<Vec<u32>, String> {
+    if added_token_ids.is_empty() {
+        let enc = tok
+            .encode(text, false)
+            .map_err(|e| format!("tokenize failed: {e}"))?;
+        return Ok(enc.get_ids().to_vec());
+    }
+
+    let mut specials: Vec<(&str, u32)> = added_token_ids
+        .iter()
+        .map(|(token, &id)| (token.as_str(), id))
+        .collect();
+    specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+    let mut out: Vec<u32> = Vec::new();
+    let mut i = 0usize;
+    let mut chunk_start = 0usize;
+    let bytes = text.as_bytes();
+
+    while i < bytes.len() {
+        let rest = &text[i..];
+        let mut matched: Option<(&str, u32)> = None;
+        for &(token, id) in &specials {
+            if rest.starts_with(token) {
+                matched = Some((token, id));
+                break;
+            }
+        }
+
+        if let Some((token, id)) = matched {
+            if chunk_start < i {
+                let chunk = &text[chunk_start..i];
+                let enc = tok
+                    .encode(chunk, false)
+                    .map_err(|e| format!("tokenize failed: {e}"))?;
+                out.extend_from_slice(enc.get_ids());
+            }
+            out.push(id);
+            i += token.len();
+            chunk_start = i;
+        } else {
+            let ch = rest
+                .chars()
+                .next()
+                .ok_or_else(|| "tokenize failed: invalid utf-8 boundary".to_string())?;
+            i += ch.len_utf8();
+        }
+    }
+
+    if chunk_start < text.len() {
+        let chunk = &text[chunk_start..];
+        let enc = tok
+            .encode(chunk, false)
+            .map_err(|e| format!("tokenize failed: {e}"))?;
+        out.extend_from_slice(enc.get_ids());
+    }
+
+    Ok(out)
 }
 
 fn try_normalize_tokenizer_json(path: &std::path::Path) -> Result<Option<std::path::PathBuf>, String> {

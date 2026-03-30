@@ -22,6 +22,23 @@ enum RemoteAssets {
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
+    static func removeDocumentsFile(fileName: String) {
+        let url = documentsURL(fileName: fileName)
+        if FileManager.default.fileExists(atPath: url.path) {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    static func fileSizeString(url: URL?) -> String? {
+        guard let url else { return nil }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let bytes = attrs[.size] as? NSNumber else { return nil }
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useMB, .useGB]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes.int64Value)
+    }
+
     static func normalizeGitHubBlobURL(_ raw: String) throws -> URL {
         guard let url = URL(string: raw) else {
             throw CellmError.message("Invalid URL: \(raw)")

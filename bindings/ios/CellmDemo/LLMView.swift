@@ -22,6 +22,7 @@ struct LLMView: View {
             VStack(alignment: .leading, spacing: 16) {
                 header
                 filesCard
+                storageCard
                 promptCard
                 backendCard
                 generateButton
@@ -76,6 +77,32 @@ struct LLMView: View {
                 .padding(8)
                 .background(Color(.systemBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 10))
+        }
+    }
+
+    private var storageCard: some View {
+        card("Storage") {
+            if modelURL == nil && tokenizerURL == nil {
+                Text("No local sample files found.")
+                    .foregroundStyle(.secondary)
+                    .font(.footnote)
+            } else {
+                if let modelSize = RemoteAssets.fileSizeString(url: modelURL) {
+                    Text("Model: \(modelSize)").font(.footnote).foregroundStyle(.secondary)
+                }
+                if let tokSize = RemoteAssets.fileSizeString(url: tokenizerURL) {
+                    Text("Tokenizer: \(tokSize)").font(.footnote).foregroundStyle(.secondary)
+                }
+            }
+
+            HStack(spacing: 10) {
+                Button("Re-download") { forceRedownload() }
+                    .buttonStyle(.bordered)
+                    .disabled(isDownloading || isRunning)
+                Button("Delete local files") { clearLocalFiles() }
+                    .buttonStyle(.bordered)
+                    .disabled(isDownloading || isRunning || (modelURL == nil && tokenizerURL == nil))
+            }
         }
     }
 
@@ -154,6 +181,9 @@ struct LLMView: View {
     }
 
     private func run() {
+        // Dismiss keyboard
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+
         errorText = nil
         output = ""
         backendWarning = nil
@@ -227,6 +257,19 @@ struct LLMView: View {
         if modelURL != nil && tokenizerURL != nil && downloadStatus.isEmpty {
             downloadStatus = "Loaded local sample files."
         }
+    }
+
+    private func clearLocalFiles() {
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smollm2FileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerFileName)
+        modelURL = nil
+        tokenizerURL = nil
+        downloadStatus = "Local sample files deleted."
+    }
+
+    private func forceRedownload() {
+        clearLocalFiles()
+        downloadSampleAssets()
     }
 }
 

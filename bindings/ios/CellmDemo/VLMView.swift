@@ -10,6 +10,7 @@ struct VLMView: View {
     @State private var output: String = ""
     @State private var isRunning: Bool = false
     @State private var errorText: String?
+    @State private var infoText: String?
     @State private var selectedBackend: CellmBackend = .metal
     @State private var activeBackend: String = ""
     @State private var downloadStatus: String = ""
@@ -46,6 +47,30 @@ struct VLMView: View {
                     .buttonStyle(.plain)
                     if !downloadStatus.isEmpty {
                         Text(downloadStatus).font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+
+                card("Storage") {
+                    if modelURL == nil && imageBytes == nil {
+                        Text("No local sample files found.")
+                            .foregroundStyle(.secondary)
+                            .font(.footnote)
+                    } else {
+                        if let modelSize = RemoteAssets.fileSizeString(url: modelURL) {
+                            Text("Model: \(modelSize)").font(.footnote).foregroundStyle(.secondary)
+                        }
+                        if let imageURL = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.rococoFileName),
+                           let imageSize = RemoteAssets.fileSizeString(url: imageURL) {
+                            Text("Image: \(imageSize)").font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
+                    HStack(spacing: 10) {
+                        Button("Re-download") { forceRedownload() }
+                            .buttonStyle(.bordered)
+                            .disabled(isDownloading || isRunning)
+                        Button("Delete local files") { clearLocalFiles() }
+                            .buttonStyle(.bordered)
+                            .disabled(isDownloading || isRunning || (modelURL == nil && imageBytes == nil))
                     }
                 }
 
@@ -88,6 +113,12 @@ struct VLMView: View {
                     .controlSize(.large)
                     .frame(maxWidth: .infinity)
                     .disabled(isRunning || modelURL == nil || imageBytes == nil || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                if let infoText {
+                    card("Status") {
+                        Text(infoText).foregroundStyle(.secondary)
+                    }
+                }
 
                 if let errorText {
                     card("Error") { Text(errorText).foregroundStyle(.red) }
@@ -160,7 +191,11 @@ struct VLMView: View {
     }
 
     private func run() {
+        // Dismiss keyboard
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+
         errorText = nil
+        infoText = nil
         output = ""
         backendWarning = nil
         guard let modelURL, let imageBytes else { return }
@@ -182,7 +217,13 @@ struct VLMView: View {
                 }
             } catch {
                 await MainActor.run {
-                    self.errorText = String(describing: error)
+                    let message = String(describing: error)
+                    if message.localizedCaseInsensitiveContains("vlm not implemented yet") {
+                        self.infoText = "VLM on iOS is coming soon. Use the LLM tab for now."
+                        self.errorText = nil
+                    } else {
+                        self.errorText = message
+                    }
                     self.isRunning = false
                 }
             }
@@ -244,5 +285,19 @@ struct VLMView: View {
         if modelURL != nil && imageBytes != nil && downloadStatus.isEmpty {
             downloadStatus = "Loaded local sample files."
         }
+    }
+
+    private func clearLocalFiles() {
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smolvlmFileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.rococoFileName)
+        modelURL = nil
+        imageBytes = nil
+        image = nil
+        downloadStatus = "Local sample files deleted."
+    }
+
+    private func forceRedownload() {
+        clearLocalFiles()
+        downloadSampleAssets()
     }
 }

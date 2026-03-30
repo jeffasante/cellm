@@ -3,7 +3,7 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 77;
+	objectVersion = 63;
 	objects = {
 
 /* Begin PBXBuildFile section */
@@ -34,7 +34,7 @@
 
 /* Begin PBXFileReference section */
 		01D85AA09B04048C83767567 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
-		2ACCC6A3F50B75CBA1584E38 /* CellmDemo.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = CellmDemo.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		2ACCC6A3F50B75CBA1584E38 /* CellmDemo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CellmDemo.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		55CD44D025518BE135578DC4 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 		6C06F9AA20D6B94DC93953B0 /* CellmDemoApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CellmDemoApp.swift; sourceTree = "<group>"; };
 		8B7D734A1A2006E827AB2D78 /* LLMView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LLMView.swift; sourceTree = "<group>"; };
@@ -144,7 +144,6 @@
 			);
 			mainGroup = 0EB92905FFC461A459D3F5FA;
 			minimizedProjectReferenceProxies = 1;
-			preferredProjectObjectVersion = 77;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -243,6 +242,7 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 27CP8SWWRP;
 				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
@@ -271,6 +271,7 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 27CP8SWWRP;
 				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",

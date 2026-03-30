@@ -221,7 +221,8 @@ struct LLMView: View {
     private func downloadSampleAssets() {
         errorText = nil
         if let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2FileName),
-           let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerFileName) {
+           let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerFileName),
+           RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerConfigFileName) != nil {
             modelURL = model
             tokenizerURL = tok
             downloadStatus = "Using existing files in Documents."
@@ -234,7 +235,11 @@ struct LLMView: View {
             do {
                 async let model = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.smollm2Int8, fileName: DemoAssetLinks.smollm2FileName)
                 async let tok = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.smollm2Tokenizer, fileName: DemoAssetLinks.smollm2TokenizerFileName)
-                let (modelPath, tokPath) = try await (model, tok)
+                async let tokCfg = RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.smollm2TokenizerConfig,
+                    fileName: DemoAssetLinks.smollm2TokenizerConfigFileName
+                )
+                let (modelPath, tokPath, _) = try await (model, tok, tokCfg)
                 await MainActor.run {
                     self.modelURL = modelPath
                     self.tokenizerURL = tokPath
@@ -258,7 +263,8 @@ struct LLMView: View {
         if tokenizerURL == nil, let url = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerFileName) {
             tokenizerURL = url
         }
-        if modelURL != nil && tokenizerURL != nil && downloadStatus.isEmpty {
+        let hasTokCfg = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerConfigFileName) != nil
+        if modelURL != nil && tokenizerURL != nil && hasTokCfg && downloadStatus.isEmpty {
             downloadStatus = "Loaded local sample files."
         }
     }
@@ -266,6 +272,7 @@ struct LLMView: View {
     private func clearLocalFiles() {
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smollm2FileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerFileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerConfigFileName)
         modelURL = nil
         tokenizerURL = nil
         downloadStatus = "Local sample files deleted."

@@ -295,6 +295,8 @@ impl Engine {
             top_k: self.top_k,
             temperature: self.temperature,
             seed: self.seed,
+            repeat_penalty: self.repeat_penalty,
+            repeat_window: self.repeat_window,
         }
     }
 
@@ -436,6 +438,8 @@ pub struct SamplingParams {
     pub top_k: usize,
     pub temperature: f64,
     pub seed: u64,
+    pub repeat_penalty: f64,
+    pub repeat_window: usize,
 }
 
 fn infer_qwen_kv_head_dim(file: &CellmFile) -> Result<usize> {

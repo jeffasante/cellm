@@ -19,6 +19,8 @@ pub struct VlmRunConfig {
     pub top_k: usize,
     pub temperature: f32,
     pub seed: u64,
+    pub repeat_penalty: f32,
+    pub repeat_window: usize,
     pub max_new_tokens: usize,
     pub min_new_tokens: usize,
 }
@@ -30,6 +32,8 @@ impl Default for VlmRunConfig {
             top_k: 40,
             temperature: 0.7,
             seed: 1,
+            repeat_penalty: 1.05,
+            repeat_window: 64,
             max_new_tokens: 96,
             min_new_tokens: 16,
         }
@@ -133,6 +137,7 @@ fn run_decode_cellm(
     let mut image_idx = 0usize;
     let mut x = vec![0.0f32; hidden];
     let mut rng = StdRng::seed_from_u64(cfg.seed.max(1));
+    let mut recent: Vec<u32> = Vec::new();
     let mut next: i64 = 0;
 
     for (pos, &tok_id) in input_ids.iter().enumerate() {
@@ -151,7 +156,16 @@ fn run_decode_cellm(
         let cand = runner
             .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        next = sample_from_candidates(&cand, cfg.temperature, banned_token_ids, &mut rng)?;
+        next = sample_from_candidates(
+            &cand,
+            cfg.temperature,
+            cfg.repeat_penalty,
+            cfg.repeat_window,
+            banned_token_ids,
+            &recent,
+            &mut rng,
+        )?;
+        recent.push(tok_id as u32);
     }
     if image_idx != image_features.shape()[0] {
         anyhow::bail!(
@@ -163,6 +177,9 @@ fn run_decode_cellm(
     let mut generated = Vec::new();
     for step in 0..cfg.max_new_tokens {
         generated.push(next);
+        if should_stop_for_repetition(&generated) && (step + 1) >= cfg.min_new_tokens {
+            break;
+        }
         if (next == eos_token_id || end_of_utterance_id == Some(next))
             && (step + 1) >= cfg.min_new_tokens
         {
@@ -175,16 +192,44 @@ fn run_decode_cellm(
         let cand = runner
             .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        next = sample_from_candidates(&cand, cfg.temperature, banned_token_ids, &mut rng)?;
+        next = sample_from_candidates(
+            &cand,
+            cfg.temperature,
+            cfg.repeat_penalty,
+            cfg.repeat_window,
+            banned_token_ids,
+            &recent,
+            &mut rng,
+        )?;
+        recent.push(generated[generated.len() - 1] as u32);
     }
 
     Ok(generated)
 }
 
+fn should_stop_for_repetition(generated: &[i64]) -> bool {
+    if generated.len() < 12 {
+        return false;
+    }
+    let tail = &generated[generated.len() - 12..];
+    let mut uniq = std::collections::BTreeSet::new();
+    for &tok in tail {
+        uniq.insert(tok);
+    }
+    if uniq.len() <= 2 {
+        return true;
+    }
+    let last = generated[generated.len() - 1];
+    generated[generated.len() - 8..].iter().all(|&t| t == last)
+}
+
 fn sample_from_candidates(
     candidates: &[(u32, f32)],
     temperature: f32,
+    repeat_penalty: f32,
+    repeat_window: usize,
     banned_token_ids: &[i64],
+    recent: &[u32],
     rng: &mut StdRng,
 ) -> Result<i64> {
     let mut filtered: Vec<(u32, f32)> = candidates
@@ -198,6 +243,16 @@ fn sample_from_candidates(
     if filtered.is_empty() {
         anyhow::bail!("no candidates to sample from");
     }
+    if repeat_penalty > 1.0 && repeat_window > 0 && !recent.is_empty() {
+        let start = recent.len().saturating_sub(repeat_window);
+        for (id, score) in &mut filtered {
+            if recent[start..].contains(id) {
+                *score /= repeat_penalty;
+            }
+        }
+    }
+    filtered.sort_by(|a, b| b.1.total_cmp(&a.1));
+
     if temperature <= 0.0 {
         return Ok(filtered[0].0 as i64);
     }

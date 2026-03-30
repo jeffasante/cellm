@@ -4,8 +4,6 @@
 
 Not a wrapper around `llama.cpp`. Not a port of `vLLM`. A new runtime designed for mobile constraints from scratch.
 
-That’s it. Everything else — the six crates, the benchmarks, the Metal shaders — is how you prove those three sentences are true.
-
 ## Current Status: Phase 6 (Multimodal Vision)
 **cellm** has evolved from an honest baseline into a multimodal-ready inference engine:
 

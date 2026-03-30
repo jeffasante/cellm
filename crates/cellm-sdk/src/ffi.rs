@@ -536,8 +536,10 @@ pub extern "C" fn cellm_vlm_describe_image(
                 top_k: sampling.top_k.max(1),
                 temperature: sampling.temperature as f32,
                 seed: sampling.seed,
-                max_new_tokens: 96,
-                min_new_tokens: 16,
+                repeat_penalty: sampling.repeat_penalty as f32,
+                repeat_window: sampling.repeat_window,
+                max_new_tokens: 48,
+                min_new_tokens: 4,
             },
         )
         .map_err(|err| format!("vlm_describe_image failed: {err}"))?;

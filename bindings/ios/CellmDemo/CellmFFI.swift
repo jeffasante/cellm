@@ -26,8 +26,10 @@ enum CellmError: Error, CustomStringConvertible {
 
 final class CellmTokenizer {
     private var handle: cellm_tokenizer_t = 0
+    let tokenizerURL: URL
 
     init(tokenizerURL: URL) throws {
+        self.tokenizerURL = tokenizerURL
         let path = tokenizerURL.path
         let h = path.withCString { cstr in
             cellm_tokenizer_create(cstr)
@@ -111,7 +113,7 @@ final class CellmEngine {
     }
 
     func generate(prompt: String, maxNewTokens: Int) throws -> String {
-        let promptText = "User: \(prompt)\nAssistant:"
+        let promptText = Self.wrapPrompt(prompt, tokenizerURL: tokenizer.tokenizerURL)
         let promptTokens = try tokenizer.encode(promptText)
 
         var next: UInt32 = 0
@@ -137,6 +139,25 @@ final class CellmEngine {
         }
         return out
     }
+
+    private static func wrapPrompt(_ prompt: String, tokenizerURL: URL) -> String {
+        if usesChatML(tokenizerURL: tokenizerURL) {
+            return "<|im_start|>user\n\(prompt)<|im_end|>\n<|im_start|>assistant\n"
+        }
+        return "User: \(prompt)\nAssistant:"
+    }
+
+    private static func usesChatML(tokenizerURL: URL) -> Bool {
+        let cfgURL = tokenizerURL.deletingLastPathComponent().appendingPathComponent("tokenizer_config.json")
+        guard
+            let data = try? Data(contentsOf: cfgURL),
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let tpl = obj["chat_template"] as? String
+        else {
+            return false
+        }
+        return tpl.contains("<|im_start|>") && tpl.contains("<|im_end|>")
+    }
 }
 
 final class CellmVLMEngine {
@@ -145,7 +166,7 @@ final class CellmVLMEngine {
 
     let activeBackend: String
 
-    init(modelURL: URL, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 512, topK: UInt32 = 40, temperature: Float = 0.0, repeatPenalty: Float = 1.05, repeatWindow: UInt32 = 64, seed: UInt64 = 1, backend: CellmBackend = .metal) throws {
+    init(modelURL: URL, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 512, topK: UInt32 = 40, temperature: Float = 0.7, repeatPenalty: Float = 1.15, repeatWindow: UInt32 = 128, seed: UInt64 = 1, backend: CellmBackend = .metal) throws {
         let path = modelURL.path
         let h = path.withCString { cstr in
             cellm_engine_create_v3(cstr, tokensPerBlock, totalBlocks, topK, temperature, repeatPenalty, repeatWindow, seed, backend.rawValue)

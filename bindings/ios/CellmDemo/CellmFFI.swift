@@ -148,6 +148,7 @@ final class CellmEngine {
             if r == 0 { break }
             let piece = try tokenizer.decodeOne(tok)
             if Self.isStopPiece(piece) { break }
+            if Self.hasLongDigitRun(piece, threshold: 10) { break }
             out += piece
         }
         return out
@@ -192,6 +193,20 @@ final class CellmEngine {
     private static func isStopPiece(_ piece: String) -> Bool {
         let p = piece.trimmingCharacters(in: .whitespacesAndNewlines)
         return p == "<|im_end|>" || p == "<end_of_utterance>" || p == "<|endoftext|>"
+    }
+
+    private static func hasLongDigitRun(_ piece: String, threshold: Int) -> Bool {
+        guard threshold > 1 else { return false }
+        var run = 0
+        for scalar in piece.unicodeScalars {
+            if CharacterSet.decimalDigits.contains(scalar) {
+                run += 1
+                if run >= threshold { return true }
+            } else {
+                run = 0
+            }
+        }
+        return false
     }
 }
 

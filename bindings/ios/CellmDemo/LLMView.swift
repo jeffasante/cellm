@@ -11,31 +11,31 @@ struct LLMView: View {
 
         var temperature: Float {
             switch self {
-            case .chat: return 0.2
-            case .balanced: return 0.5
+            case .chat: return 0.1
+            case .balanced: return 0.35
             case .strict: return 0.0
             }
         }
 
         var topK: UInt32 {
             switch self {
-            case .chat: return 40
-            case .balanced: return 60
+            case .chat: return 20
+            case .balanced: return 40
             case .strict: return 1
             }
         }
 
         var repeatPenalty: Float {
             switch self {
-            case .chat: return 1.08
-            case .balanced: return 1.04
+            case .chat: return 1.14
+            case .balanced: return 1.08
             case .strict: return 1.0
             }
         }
 
         var repeatWindow: UInt32 {
             switch self {
-            case .chat: return 96
+            case .chat: return 128
             case .balanced: return 64
             case .strict: return 0
             }
@@ -43,9 +43,9 @@ struct LLMView: View {
 
         var maxTokens: Int {
             switch self {
-            case .chat: return 64
-            case .balanced: return 96
-            case .strict: return 64
+            case .chat: return 32
+            case .balanced: return 64
+            case .strict: return 32
             }
         }
     }

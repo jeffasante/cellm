@@ -5,7 +5,7 @@ use anyhow::Result;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "vlm-smoke", about = "Smoke test the VLM FFI call path (currently not implemented)")]
+#[command(name = "vlm-smoke", about = "Smoke test the native .cellm VLM FFI call path")]
 struct Args {
     /// Path to .cellm model file
     #[arg(long)]
@@ -32,7 +32,7 @@ fn main() -> Result<()> {
             16,
             256,
             40,
-            0.7,
+            0.0,
             1.05,
             64,
             1,
@@ -46,21 +46,23 @@ fn main() -> Result<()> {
             anyhow::bail!("session_create failed: {}", last_error());
         }
 
+        let mut out = vec![0i8; 32 * 1024];
         let rc = cellm_sdk::ffi::cellm_vlm_describe_image(
             engine,
             session,
             image_bytes.as_ptr(),
             image_bytes.len(),
             cstr(&args.prompt).as_ptr(),
-            std::ptr::null_mut(),
-            0,
+            out.as_mut_ptr(),
+            out.len(),
         );
-
-        // We currently expect this to fail with a clear message.
         if rc == 0 {
-            println!("VLM returned success (unexpected for now).");
+            let text = std::ffi::CStr::from_ptr(out.as_ptr())
+                .to_string_lossy()
+                .to_string();
+            println!("VLM output:\n{text}");
         } else {
-            println!("VLM returned error (expected for now): {}", last_error());
+            println!("VLM returned error: {}", last_error());
         }
 
         let _ = cellm_sdk::ffi::cellm_session_cancel(engine, session);
@@ -84,4 +86,3 @@ unsafe fn last_error() -> String {
         .to_string_lossy()
         .to_string()
 }
-

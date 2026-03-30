@@ -5,15 +5,16 @@ This folder contains SwiftUI source files for a small iOS app that can load a `.
 ## What works today
 
 - LLM text generation (tokenize prompt → prefill → decode tokens)
+- VLM image description through native `.cellm` path in `cellm-sdk` (vision encoder + multimodal prompt packing + text decode)
 - Backend request from iOS UI (`CPU` / `Metal`) through FFI (`cellm_engine_create_v3`)
 - Active backend reporting (`cellm_engine_backend_name`) so app confirms what was selected
-- One-tap sample asset download in-app (GitHub-hosted `.cellm` + sample image)
+- One-tap sample asset download in-app (GitHub-hosted `.cellm` + sample image + tokenizer)
 
 Note: requesting `Metal` currently verifies Metal availability and selects the Metal backend label, but full LLM/VLM forward math kernels are still CPU in this phase.
 
-## What is stubbed for now
+## Current limits
 
-- VLM (image/video) inference: the UI can be added now, but the Rust runtime currently does not implement a vision encoder / multimodal prompt packing yet.
+- Native VLM path is currently CPU math in this phase; requesting `Metal` preserves backend selection/fallback behavior but does not yet run a full Metal-native VLM forward path.
 
 ## How to run it in Xcode
 

@@ -63,6 +63,10 @@ struct VLMView: View {
                            let imageSize = RemoteAssets.fileSizeString(url: imageURL) {
                             Text("Image: \(imageSize)").font(.footnote).foregroundStyle(.secondary)
                         }
+                        if let tokURL = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smolvlmTokenizerFileName),
+                           let tokSize = RemoteAssets.fileSizeString(url: tokURL) {
+                            Text("Tokenizer: \(tokSize)").font(.footnote).foregroundStyle(.secondary)
+                        }
                     }
                     HStack(spacing: 10) {
                         Button("Re-download") { forceRedownload() }
@@ -221,13 +225,7 @@ struct VLMView: View {
                 }
             } catch {
                 await MainActor.run {
-                    let message = String(describing: error)
-                    if message.localizedCaseInsensitiveContains("vlm not implemented yet") {
-                        self.infoText = "VLM on iOS is coming soon. Use the LLM tab for now."
-                        self.errorText = nil
-                    } else {
-                        self.errorText = message
-                    }
+                    self.errorText = String(describing: error)
                     self.isRunning = false
                 }
             }
@@ -238,6 +236,7 @@ struct VLMView: View {
         errorText = nil
         if let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smolvlmFileName),
            let imageURL = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.rococoFileName),
+           RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smolvlmTokenizerFileName) != nil,
            let bytes = try? Data(contentsOf: imageURL),
            let ui = UIImage(data: bytes) {
             modelURL = model
@@ -253,7 +252,8 @@ struct VLMView: View {
             do {
                 async let model = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.smolvlmInt8, fileName: DemoAssetLinks.smolvlmFileName)
                 async let imageURL = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.rococoImage, fileName: DemoAssetLinks.rococoFileName)
-                let (modelPath, imagePath) = try await (model, imageURL)
+                async let tokenizer = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.smolvlmTokenizer, fileName: DemoAssetLinks.smolvlmTokenizerFileName)
+                let (modelPath, imagePath, _) = try await (model, imageURL, tokenizer)
                 let bytes = try Data(contentsOf: imagePath)
                 guard let ui = UIImage(data: bytes) else {
                     throw CellmError.message("Downloaded image could not be decoded")
@@ -262,7 +262,7 @@ struct VLMView: View {
                     self.modelURL = modelPath
                     self.imageBytes = bytes
                     self.image = Image(uiImage: ui)
-                    self.downloadStatus = "Saved model and loaded sample image"
+                    self.downloadStatus = "Saved model, tokenizer and sample image"
                     self.isDownloading = false
                 }
             } catch {
@@ -286,13 +286,15 @@ struct VLMView: View {
             imageBytes = bytes
             image = Image(uiImage: ui)
         }
-        if modelURL != nil && imageBytes != nil && downloadStatus.isEmpty {
+        let hasTokenizer = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smolvlmTokenizerFileName) != nil
+        if modelURL != nil && imageBytes != nil && hasTokenizer && downloadStatus.isEmpty {
             downloadStatus = "Loaded local sample files."
         }
     }
 
     private func clearLocalFiles() {
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smolvlmFileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smolvlmTokenizerFileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.rococoFileName)
         modelURL = nil
         imageBytes = nil

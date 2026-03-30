@@ -3,7 +3,7 @@ use std::ffi::{c_char, CStr};
 use std::path::Path;
 use std::slice;
 
-use crate::{BackendKind, Engine, EngineConfig, SessionId};
+use crate::{vlm::VlmRunConfig, BackendKind, Engine, EngineConfig, SessionId};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
@@ -520,20 +520,37 @@ pub extern "C" fn cellm_vlm_describe_image(
         if image_bytes.is_null() || image_len == 0 {
             return Err("vlm_describe_image: null/empty image bytes".to_string());
         }
-        let _prompt = cstr_to_str(prompt_utf8)?;
-        let _img = unsafe { slice::from_raw_parts(image_bytes, image_len) };
+        let prompt = cstr_to_str(prompt_utf8)?;
+        let img = unsafe { slice::from_raw_parts(image_bytes, image_len) };
+        let e = unsafe { &mut *(engine as *mut Engine) };
+        if !e.has_session(session) {
+            return Err(format!("vlm_describe_image: unknown session id {session}"));
+        }
+        let sampling = e.sampling_params();
+        let text = crate::vlm::describe_image_with_cellm(
+            e.model_path(),
+            img,
+            prompt,
+            VlmRunConfig {
+                tokens_per_block: 16,
+                top_k: sampling.top_k.max(1),
+                temperature: sampling.temperature as f32,
+                seed: sampling.seed,
+                max_new_tokens: 96,
+                min_new_tokens: 16,
+            },
+        )
+        .map_err(|err| format!("vlm_describe_image failed: {err}"))?;
 
-        // Not implemented: there is currently no vision encoder / multimodal runner in the Rust core.
-        // This stub exists so iOS/macOS apps can wire up the image pick + FFI path now.
-        //
-        // When VLM is implemented, this function should:
-        // - decode the image into pixels
-        // - run the vision encoder
-        // - pack multimodal tokens/embeddings
-        // - run the text decoder to produce an answer
-        let _ = out_buf;
-        let _ = buf_len;
-        Err("VLM not implemented yet (vision encoder + multimodal runner missing)".to_string())
+        if !out_buf.is_null() && buf_len > 0 {
+            let bytes = text.as_bytes();
+            let n = bytes.len().min(buf_len.saturating_sub(1));
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf as *mut u8, n);
+                *out_buf.add(n) = 0;
+            }
+        }
+        Ok(())
     })();
 
     match result {

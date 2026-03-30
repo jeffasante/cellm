@@ -117,8 +117,10 @@ int32_t cellm_engine_kv_stats(
     uint32_t* out_free_blocks
 );
 
-// VLM (not implemented yet).
-// For now this will return -1 with a clear error message via cellm_last_error_message.
+// VLM image description path.
+// - `image_bytes` should be encoded image data (jpeg/png).
+// - `prompt_utf8` is the user prompt/question.
+// - If `out_buf` is non-null and `buf_len > 0`, generated text is written and null-terminated.
 int32_t cellm_vlm_describe_image(
     cellm_engine_t engine,
     cellm_session_t session,

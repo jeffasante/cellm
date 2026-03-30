@@ -145,7 +145,7 @@ final class CellmVLMEngine {
 
     let activeBackend: String
 
-    init(modelURL: URL, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 512, topK: UInt32 = 40, temperature: Float = 0.7, repeatPenalty: Float = 1.05, repeatWindow: UInt32 = 64, seed: UInt64 = 1, backend: CellmBackend = .metal) throws {
+    init(modelURL: URL, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 512, topK: UInt32 = 40, temperature: Float = 0.0, repeatPenalty: Float = 1.05, repeatWindow: UInt32 = 64, seed: UInt64 = 1, backend: CellmBackend = .metal) throws {
         let path = modelURL.path
         let h = path.withCString { cstr in
             cellm_engine_create_v3(cstr, tokensPerBlock, totalBlocks, topK, temperature, repeatPenalty, repeatWindow, seed, backend.rawValue)
@@ -168,16 +168,26 @@ final class CellmVLMEngine {
     }
 
     func describe(imageBytes: Data, prompt: String) throws -> String {
+        var out = [CChar](repeating: 0, count: 32 * 1024)
         let rc = prompt.withCString { cPrompt in
             imageBytes.withUnsafeBytes { raw in
-                cellm_vlm_describe_image(handle, session, raw.bindMemory(to: UInt8.self).baseAddress, raw.count, cPrompt, nil, 0)
+                out.withUnsafeMutableBufferPointer { buf in
+                    cellm_vlm_describe_image(
+                        handle,
+                        session,
+                        raw.bindMemory(to: UInt8.self).baseAddress,
+                        raw.count,
+                        cPrompt,
+                        buf.baseAddress,
+                        buf.count
+                    )
+                }
             }
         }
         if rc != 0 {
             throw CellmError.message(CellmFFI.lastError())
         }
-        // When implemented, this will return text. For now it always errors.
-        return ""
+        return String(cString: out)
     }
 }
 

@@ -156,6 +156,15 @@ Native `.cellm` vision + decoder path (experimental):
 - The native path now uses SIMD-optimized BLAS (`Accelerate` SGEMM on macOS) for linear layers and attention matmuls.
 - Current limitation: ONNX Runtime is still faster for vision on the same machine.
 
+SDK FFI VLM smoke test (same native `.cellm` vision+decoder stack used by iOS):
+```bash
+CELLM_VLM_TOKENIZER=models/hf/smolvlm-256m-instruct/tokenizer.json \
+cargo run --release --bin vlm-smoke -- \
+  --model models/smolvlm-256m-int8.cellm \
+  --image models/test_images/rococo_1.jpg \
+  --prompt "Describe this image."
+```
+
 Run VLM with backend selection:
 ```bash
 # ONNX vision+decoder, CPU backend selection

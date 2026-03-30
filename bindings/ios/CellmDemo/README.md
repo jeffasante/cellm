@@ -38,13 +38,27 @@ Note: requesting `Metal` currently verifies Metal availability and selects the M
    - use the document picker manually.
 
    Manual picker flow:
-   - the model file (example: `qwen3.5-0.8b.cellm`)
+   - the model file (example: `qwen3.5-0.8b-int4-textonly.cellm`)
    - the tokenizer file (example: `tokenizer.json`)
    - backend (`Metal` recommended on iPhone/iPad with Apple GPU)
 
+## Qwen iOS smoke test flow
+
+- In `LLM` tab, tap **Download Qwen sample model + tokenizer**
+- Tap **Run Qwen Smoke Test**
+- Default smoke prompt: `Return exactly one uppercase letter: R`
+- The output panel shows generation diagnostics:
+  - `prompt_tokens`
+  - `generated_tokens`
+  - `first_piece`
+  - `prefill/decode/total` timing in ms
+
 ## Sample hosted assets used by the app
 
+- `https://github.com/jeffasante/cellm/blob/main/models/qwen3.5-0.8b-int4-textonly.cellm`
 - `https://github.com/jeffasante/cellm/blob/main/models/smollm2-135m-int8.cellm`
+- `https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/tokenizer.json`
+- `https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/main/tokenizer.json`
 - `https://github.com/jeffasante/cellm/blob/main/models/smolvlm-256m-int8.cellm`
 - `https://github.com/jeffasante/cellm/blob/main/models/test_images/rococo_1.jpg`
 
@@ -54,3 +68,4 @@ The app normalizes GitHub `blob` URLs to raw-download URLs before fetching.
 
 - Large model files are slow to load over the simulator and can exceed simulator storage limits. A physical device is the fastest way to validate end-to-end.
 - Keep `tokenizer.json` next to the `.cellm` model when you manage files on disk; the app lets you pick both explicitly.
+- For Qwen in this phase, requesting `Metal` verifies backend selection and reports active backend, but forward math remains CPU-path.

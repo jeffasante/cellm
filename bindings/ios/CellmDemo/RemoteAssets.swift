@@ -1,15 +1,24 @@
 import Foundation
 
 enum DemoAssetLinks {
+    static let qwen35Int4TextOnly = "https://github.com/jeffasante/cellm/blob/main/models/qwen3.5-0.8b-int4-textonly.cellm"
+    static let qwen35Tokenizer = "https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/tokenizer.json"
+    static let qwen35TokenizerConfig = "https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/tokenizer_config.json"
+    static let qwen35Dir = "samples/qwen3.5-0.8b"
+    static let qwen35FileName = "\(qwen35Dir)/qwen3.5-0.8b-int4-textonly.cellm"
+    static let qwen35TokenizerFileName = "\(qwen35Dir)/tokenizer-qwen3.5-0.8b.json"
+    static let qwen35TokenizerConfigFileName = "\(qwen35Dir)/tokenizer_config.json"
+
     static let smollm2Int8 = "https://github.com/jeffasante/cellm/blob/main/models/smollm2-135m-int8.cellm"
     static let smolvlmInt8 = "https://github.com/jeffasante/cellm/blob/main/models/smolvlm-256m-int8.cellm"
     static let rococoImage = "https://github.com/jeffasante/cellm/blob/main/models/test_images/rococo_1.jpg"
     static let smollm2Tokenizer = "https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/main/tokenizer.json"
     static let smollm2TokenizerConfig = "https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/main/tokenizer_config.json"
     static let smolvlmTokenizer = "https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct/resolve/main/tokenizer.json"
-    static let smollm2FileName = "smollm2-135m-int8.cellm"
-    static let smollm2TokenizerFileName = "tokenizer-smollm2-135m.json"
-    static let smollm2TokenizerConfigFileName = "tokenizer_config.json"
+    static let smollm2Dir = "samples/smollm2-135m"
+    static let smollm2FileName = "\(smollm2Dir)/smollm2-135m-int8.cellm"
+    static let smollm2TokenizerFileName = "\(smollm2Dir)/tokenizer-smollm2-135m.json"
+    static let smollm2TokenizerConfigFileName = "\(smollm2Dir)/tokenizer_config.json"
     static let smolvlmFileName = "smolvlm-256m-int8.cellm"
     static let smolvlmTokenizerFileName = "tokenizer-smolvlm-256m.json"
     static let rococoFileName = "rococo_1.jpg"
@@ -124,6 +133,8 @@ enum RemoteAssets {
         }
 
         let destURL = documentsURL(fileName: targetName)
+        let dirURL = destURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true, attributes: nil)
 
         if FileManager.default.fileExists(atPath: destURL.path) {
             try FileManager.default.removeItem(at: destURL)

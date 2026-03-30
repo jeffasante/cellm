@@ -52,8 +52,9 @@ struct LLMView: View {
 
     @State private var modelURL: URL?
     @State private var tokenizerURL: URL?
-    @State private var prompt: String = "Hello, how are you?"
+    @State private var prompt: String = "Return exactly one uppercase letter: R"
     @State private var output: String = ""
+    @State private var runDiagnostics: String = ""
     @State private var isRunning: Bool = false
     @State private var errorText: String?
     @State private var selectedBackend: CellmBackend = .metal
@@ -62,6 +63,7 @@ struct LLMView: View {
     @State private var isDownloading: Bool = false
     @State private var backendWarning: String?
     @State private var selectedPreset: GenerationPreset = .chat
+    @State private var selectedSampleLabel: String = ""
 
     @State private var showModelPicker = false
     @State private var showTokenizerPicker = false
@@ -115,11 +117,22 @@ struct LLMView: View {
         card("Files") {
             actionButton(modelURL == nil ? "Pick .cellm model" : modelURL!.lastPathComponent, icon: "externaldrive") { showModelPicker = true }
             actionButton(tokenizerURL == nil ? "Pick tokenizer.json" : tokenizerURL!.lastPathComponent, icon: "doc.text") { showTokenizerPicker = true }
-            actionButton(isDownloading ? "Downloading sample files…" : "Download sample model + tokenizer", icon: "arrow.down.circle", disabled: isDownloading || isRunning) {
-                downloadSampleAssets()
+            actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen sample model + tokenizer", icon: "arrow.down.circle", disabled: isDownloading || isRunning) {
+                downloadQwenSampleAssets()
+            }
+            actionButton(isDownloading ? "Downloading sample files…" : "Download SmolLM sample model + tokenizer", icon: "arrow.down.circle", disabled: isDownloading || isRunning) {
+                downloadSmolLMSampleAssets()
+            }
+            actionButton("Run Qwen Smoke Test", icon: "bolt.circle", disabled: isRunning || modelURL == nil || tokenizerURL == nil) {
+                runQwenSmokeTest()
             }
             if !downloadStatus.isEmpty {
                 Text(downloadStatus).font(.footnote).foregroundStyle(.secondary)
+            }
+            if !selectedSampleLabel.isEmpty {
+                Text("Selected sample: \(selectedSampleLabel)")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -210,6 +223,13 @@ struct LLMView: View {
 
     private var outputCard: some View {
         card("Output") {
+            if !runDiagnostics.isEmpty {
+                Text(runDiagnostics)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .padding(.bottom, 6)
+            }
             Text(output.isEmpty ? "No output yet." : output)
                 .font(.body)
                 .lineSpacing(4)
@@ -258,6 +278,7 @@ struct LLMView: View {
 
         errorText = nil
         output = ""
+        runDiagnostics = ""
         backendWarning = nil
         guard let modelURL, let tokenizerURL else { return }
         let promptText = prompt
@@ -281,6 +302,9 @@ struct LLMView: View {
                 let text = try eng.generate(prompt: promptText, maxNewTokens: preset.maxTokens)
                 await MainActor.run {
                     self.output = prettyOutput(text)
+                    if let stats = eng.lastGenerationStats {
+                        self.runDiagnostics = formatDiagnostics(stats: stats)
+                    }
                     self.activeBackend = eng.activeBackend
                     if backend == .metal && !eng.activeBackend.lowercased().contains("metal") {
                         self.backendWarning = "Metal requested, fell back to \(eng.activeBackend)."
@@ -296,8 +320,48 @@ struct LLMView: View {
         }
     }
 
-    private func downloadSampleAssets() {
+    private func downloadQwenSampleAssets() {
         errorText = nil
+        selectedSampleLabel = "Qwen3.5"
+        if let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35FileName),
+           let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35TokenizerFileName),
+           RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35TokenizerConfigFileName) != nil {
+            modelURL = model
+            tokenizerURL = tok
+            downloadStatus = "Using existing files in Documents."
+            return
+        }
+
+        downloadStatus = "Downloading Qwen sample files..."
+        isDownloading = true
+        Task {
+            do {
+                async let model = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.qwen35Int4TextOnly, fileName: DemoAssetLinks.qwen35FileName)
+                async let tok = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.qwen35Tokenizer, fileName: DemoAssetLinks.qwen35TokenizerFileName)
+                async let tokCfg = RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.qwen35TokenizerConfig,
+                    fileName: DemoAssetLinks.qwen35TokenizerConfigFileName
+                )
+                let (modelPath, tokPath, _) = try await (model, tok, tokCfg)
+                await MainActor.run {
+                    self.modelURL = modelPath
+                    self.tokenizerURL = tokPath
+                    self.downloadStatus = "Saved: \(modelPath.lastPathComponent), \(tokPath.lastPathComponent)"
+                    self.isDownloading = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorText = String(describing: error)
+                    self.downloadStatus = ""
+                    self.isDownloading = false
+                }
+            }
+        }
+    }
+
+    private func downloadSmolLMSampleAssets() {
+        errorText = nil
+        selectedSampleLabel = "SmolLM2"
         if let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2FileName),
            let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerFileName),
            RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerConfigFileName) != nil {
@@ -307,7 +371,7 @@ struct LLMView: View {
             return
         }
 
-        downloadStatus = "Downloading sample files..."
+        downloadStatus = "Downloading SmolLM sample files..."
         isDownloading = true
         Task {
             do {
@@ -335,30 +399,60 @@ struct LLMView: View {
     }
 
     private func restoreAssets() {
-        if modelURL == nil, let url = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2FileName) {
-            modelURL = url
+        let qwenModel = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35FileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "qwen3.5-0.8b-int4-textonly.cellm")
+        let qwenTok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35TokenizerFileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "tokenizer-qwen3.5-0.8b.json")
+        let qwenCfg = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35TokenizerConfigFileName) != nil
+            || RemoteAssets.existingDocumentsFile(fileName: "tokenizer_config.json") != nil
+        if let qwenModel, let qwenTok, qwenCfg {
+            modelURL = qwenModel
+            tokenizerURL = qwenTok
+            selectedSampleLabel = "Qwen3.5"
+            if downloadStatus.isEmpty { downloadStatus = "Loaded local sample files." }
+            return
         }
-        if tokenizerURL == nil, let url = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerFileName) {
-            tokenizerURL = url
-        }
-        let hasTokCfg = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerConfigFileName) != nil
-        if modelURL != nil && tokenizerURL != nil && hasTokCfg && downloadStatus.isEmpty {
-            downloadStatus = "Loaded local sample files."
+
+        let smolModel = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2FileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "smollm2-135m-int8.cellm")
+        let smolTok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerFileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "tokenizer-smollm2-135m.json")
+        let smolCfg = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerConfigFileName) != nil
+            || RemoteAssets.existingDocumentsFile(fileName: "tokenizer_config.json") != nil
+        if let smolModel, let smolTok, smolCfg {
+            modelURL = smolModel
+            tokenizerURL = smolTok
+            selectedSampleLabel = "SmolLM2"
+            if downloadStatus.isEmpty { downloadStatus = "Loaded local sample files." }
         }
     }
 
     private func clearLocalFiles() {
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.qwen35FileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.qwen35TokenizerFileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.qwen35TokenizerConfigFileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smollm2FileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerFileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerConfigFileName)
+        RemoteAssets.removeDocumentsFile(fileName: "qwen3.5-0.8b-int4-textonly.cellm")
+        RemoteAssets.removeDocumentsFile(fileName: "tokenizer-qwen3.5-0.8b.json")
+        RemoteAssets.removeDocumentsFile(fileName: "smollm2-135m-int8.cellm")
+        RemoteAssets.removeDocumentsFile(fileName: "tokenizer-smollm2-135m.json")
+        RemoteAssets.removeDocumentsFile(fileName: "tokenizer_config.json")
         modelURL = nil
         tokenizerURL = nil
+        selectedSampleLabel = ""
         downloadStatus = "Local sample files deleted."
     }
 
     private func forceRedownload() {
+        let priorSelection = selectedSampleLabel
         clearLocalFiles()
-        downloadSampleAssets()
+        if priorSelection == "SmolLM2" {
+            downloadSmolLMSampleAssets()
+        } else {
+            downloadQwenSampleAssets()
+        }
     }
 
     private func prettyOutput(_ text: String) -> String {
@@ -379,6 +473,33 @@ struct LLMView: View {
             out.append(trimmed)
         }
         return out.joined(separator: "\n")
+    }
+
+    private func runQwenSmokeTest() {
+        guard
+            let modelName = modelURL?.lastPathComponent.lowercased(),
+            let tokName = tokenizerURL?.lastPathComponent.lowercased(),
+            modelName.contains("qwen"),
+            tokName.contains("qwen")
+        else {
+            errorText = "Qwen smoke test requires both a Qwen model and Qwen tokenizer. Download Qwen sample assets first."
+            return
+        }
+        prompt = "Return exactly one uppercase letter: R"
+        selectedPreset = .strict
+        run()
+    }
+
+    private func formatDiagnostics(stats: LlmGenerationStats) -> String {
+        String(
+            format: "prompt_tokens=%d generated_tokens=%d first_piece=%@ prefill=%.1fms decode=%.1fms total=%.1fms",
+            stats.promptTokenCount,
+            stats.generatedTokenCount,
+            stats.firstPiece,
+            stats.prefillMs,
+            stats.decodeMs,
+            stats.totalMs
+        )
     }
 }
 

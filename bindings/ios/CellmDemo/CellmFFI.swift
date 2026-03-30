@@ -32,6 +32,15 @@ struct VlmTimings {
     let encoderLayerMs: [Double]
 }
 
+struct LlmGenerationStats {
+    let promptTokenCount: Int
+    let generatedTokenCount: Int
+    let prefillMs: Double
+    let decodeMs: Double
+    let totalMs: Double
+    let firstPiece: String
+}
+
 final class CellmTokenizer {
     private var handle: cellm_tokenizer_t = 0
     let tokenizerURL: URL
@@ -96,6 +105,7 @@ final class CellmEngine {
     private let session: cellm_session_t
 
     let activeBackend: String
+    private(set) var lastGenerationStats: LlmGenerationStats?
 
     init(modelURL: URL, tokenizer: CellmTokenizer, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 512, topK: UInt32 = 40, temperature: Float = 0.2, repeatPenalty: Float = 1.08, repeatWindow: UInt32 = 96, seed: UInt64 = 1, backend: CellmBackend = .metal) throws {
         self.tokenizer = tokenizer
@@ -121,22 +131,36 @@ final class CellmEngine {
     }
 
     func generate(prompt: String, maxNewTokens: Int) throws -> String {
+        lastGenerationStats = nil
         let promptText = Self.wrapPrompt(prompt, tokenizerURL: tokenizer.tokenizerURL)
         let promptTokens = try tokenizer.encode(promptText)
 
+        let tStart = Date()
         var next: UInt32 = 0
         let rc = promptTokens.withUnsafeBufferPointer { buf in
             cellm_submit_tokens(handle, session, buf.baseAddress, buf.count, &next)
         }
         if rc != 0 { throw CellmError.message(CellmFFI.lastError()) }
+        let tAfterPrefill = Date()
 
         var out = ""
         let firstPiece = try tokenizer.decodeOne(next)
         if !Self.isStopPiece(firstPiece) {
             out += firstPiece
         }
+        var generated = 1
 
         if maxNewTokens <= 1 {
+            let totalMs = Date().timeIntervalSince(tStart) * 1000.0
+            let prefillMs = tAfterPrefill.timeIntervalSince(tStart) * 1000.0
+            lastGenerationStats = LlmGenerationStats(
+                promptTokenCount: promptTokens.count,
+                generatedTokenCount: generated,
+                prefillMs: prefillMs,
+                decodeMs: max(0.0, totalMs - prefillMs),
+                totalMs: totalMs,
+                firstPiece: firstPiece
+            )
             return out
         }
 
@@ -150,7 +174,18 @@ final class CellmEngine {
             if Self.isStopPiece(piece) { break }
             if Self.hasLongDigitRun(piece, threshold: 10) { break }
             out += piece
+            generated += 1
         }
+        let totalMs = Date().timeIntervalSince(tStart) * 1000.0
+        let prefillMs = tAfterPrefill.timeIntervalSince(tStart) * 1000.0
+        lastGenerationStats = LlmGenerationStats(
+            promptTokenCount: promptTokens.count,
+            generatedTokenCount: generated,
+            prefillMs: prefillMs,
+            decodeMs: max(0.0, totalMs - prefillMs),
+            totalMs: totalMs,
+            firstPiece: firstPiece
+        )
         return out
     }
 
@@ -159,8 +194,12 @@ final class CellmEngine {
         switch promptStyle(tokenizerURL: tokenizerURL) {
         case .smolChat:
             return "<|im_start|>User: \(cleanPrompt)<end_of_utterance>\nAssistant:"
-        case .chatML:
-            return "<|im_start|>user\n\(cleanPrompt)<|im_end|>\n<|im_start|>assistant\n"
+        case .chatML(let includeThinkPrefill):
+            var s = "<|im_start|>user\n\(cleanPrompt)<|im_end|>\n<|im_start|>assistant\n"
+            if includeThinkPrefill {
+                s += "<think>\n\n</think>\n\n"
+            }
+            return s
         case .plain:
             return "User: \(cleanPrompt)\nAssistant:"
         }
@@ -168,7 +207,7 @@ final class CellmEngine {
 
     private enum PromptStyle {
         case smolChat
-        case chatML
+        case chatML(includeThinkPrefill: Bool)
         case plain
     }
 
@@ -185,7 +224,8 @@ final class CellmEngine {
             return .smolChat
         }
         if tpl.contains("<|im_start|>") && tpl.contains("<|im_end|>") {
-            return .chatML
+            let includeThinkPrefill = tpl.contains("<think>") && tpl.contains("</think>")
+            return .chatML(includeThinkPrefill: includeThinkPrefill)
         }
         return .plain
     }

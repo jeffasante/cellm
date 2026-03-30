@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import Dispatch
 
 struct LLMView: View {
     private enum GenerationPreset: String, CaseIterable, Identifiable {
@@ -62,6 +63,8 @@ struct LLMView: View {
     @State private var activeBackend: String = ""
     @State private var downloadStatus: String = ""
     @State private var downloadProgress: Double = 0.0
+    @State private var currentDownloadFile: String = ""
+    @State private var currentDownloadSizeText: String = ""
     @State private var isDownloading: Bool = false
     @State private var backendWarning: String?
     @State private var selectedPreset: GenerationPreset = .chat
@@ -69,6 +72,11 @@ struct LLMView: View {
 
     @State private var showModelPicker = false
     @State private var showTokenizerPicker = false
+
+    private var isQwenSelected: Bool {
+        (modelURL?.lastPathComponent.lowercased().contains("qwen") ?? false) ||
+        (tokenizerURL?.lastPathComponent.lowercased().contains("qwen") ?? false)
+    }
 
     var body: some View {
         ScrollView {
@@ -122,8 +130,20 @@ struct LLMView: View {
             actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen sample model + tokenizer", icon: "arrow.down.circle", disabled: isDownloading || isRunning) {
                 downloadQwenSampleAssets()
             }
+            actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen model only", icon: "shippingbox", disabled: isDownloading || isRunning) {
+                downloadQwenModelOnly()
+            }
+            actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen tokenizer JSON only", icon: "doc.badge.arrow.down", disabled: isDownloading || isRunning) {
+                downloadQwenTokenizerOnly()
+            }
             actionButton(isDownloading ? "Downloading sample files…" : "Download SmolLM sample model + tokenizer", icon: "arrow.down.circle", disabled: isDownloading || isRunning) {
                 downloadSmolLMSampleAssets()
+            }
+            actionButton(isDownloading ? "Downloading sample files…" : "Download SmolLM model only", icon: "shippingbox", disabled: isDownloading || isRunning) {
+                downloadSmolLMModelOnly()
+            }
+            actionButton(isDownloading ? "Downloading sample files…" : "Download SmolLM tokenizer JSON only", icon: "doc.badge.arrow.down", disabled: isDownloading || isRunning) {
+                downloadSmolLMTokenizerOnly()
             }
             actionButton("Run Qwen Smoke Test", icon: "bolt.circle", disabled: isRunning || modelURL == nil || tokenizerURL == nil) {
                 runQwenSmokeTest()
@@ -140,6 +160,16 @@ struct LLMView: View {
                 Text("\(Int((downloadProgress * 100.0).rounded()))%")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+                if !currentDownloadFile.isEmpty {
+                    Text("File: \(currentDownloadFile)")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                if !currentDownloadSizeText.isEmpty {
+                    Text(currentDownloadSizeText)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
             }
             if !selectedSampleLabel.isEmpty {
                 Text("Selected sample: \(selectedSampleLabel)")
@@ -208,6 +238,11 @@ struct LLMView: View {
             Text("Note: current LLM math path is CPU in this phase; Metal selection verifies backend selection/fallback.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+            if isQwenSelected {
+                Text("Qwen is currently experimental in mobile runner parity; SmolLM is recommended for stable app tests.")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+            }
         }
     }
 
@@ -290,7 +325,7 @@ struct LLMView: View {
         .opacity(disabled ? 0.6 : 1.0)
     }
 
-    private func run(exerciseSuspendResume: Bool = false) {
+    private func run(exerciseSuspendResume: Bool = false, maxTokensOverride: Int? = nil) {
         // Dismiss keyboard
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
 
@@ -320,7 +355,7 @@ struct LLMView: View {
                 )
                 let text = try eng.generate(
                     prompt: promptText,
-                    maxNewTokens: preset.maxTokens,
+                    maxNewTokens: maxTokensOverride ?? preset.maxTokens,
                     thermalLevel: thermal,
                     exerciseSuspendResume: exerciseSuspendResume
                 )
@@ -359,6 +394,8 @@ struct LLMView: View {
 
         downloadStatus = "Downloading Qwen sample files..."
         downloadProgress = 0
+        currentDownloadFile = ""
+        currentDownloadSizeText = ""
         isDownloading = true
         Task {
             do {
@@ -367,30 +404,21 @@ struct LLMView: View {
                     from: DemoAssetLinks.qwen35Int4TextOnly,
                     fileName: DemoAssetLinks.qwen35FileName,
                     progress: { p in
-                        Task { @MainActor in
-                            self.downloadProgress = min(1.0, (0.0 + p) / totalFiles)
-                            self.downloadStatus = "Downloading Qwen sample files... \(Int((self.downloadProgress * 100).rounded()))%"
-                        }
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "Qwen", fileName: DemoAssetLinks.qwen35FileName)
                     }
                 )
                 let tokPath = try await RemoteAssets.downloadToDocuments(
                     from: DemoAssetLinks.qwen35Tokenizer,
                     fileName: DemoAssetLinks.qwen35TokenizerFileName,
                     progress: { p in
-                        Task { @MainActor in
-                            self.downloadProgress = min(1.0, (1.0 + p) / totalFiles)
-                            self.downloadStatus = "Downloading Qwen sample files... \(Int((self.downloadProgress * 100).rounded()))%"
-                        }
+                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "Qwen", fileName: DemoAssetLinks.qwen35TokenizerFileName)
                     }
                 )
                 _ = try await RemoteAssets.downloadToDocuments(
                     from: DemoAssetLinks.qwen35TokenizerConfig,
                     fileName: DemoAssetLinks.qwen35TokenizerConfigFileName,
                     progress: { p in
-                        Task { @MainActor in
-                            self.downloadProgress = min(1.0, (2.0 + p) / totalFiles)
-                            self.downloadStatus = "Downloading Qwen sample files... \(Int((self.downloadProgress * 100).rounded()))%"
-                        }
+                        setDownloadProgress(completedFiles: 2.0, progress: p, totalFiles: totalFiles, label: "Qwen", fileName: DemoAssetLinks.qwen35TokenizerConfigFileName)
                     }
                 )
                 await MainActor.run {
@@ -398,12 +426,16 @@ struct LLMView: View {
                     self.tokenizerURL = tokPath
                     self.downloadProgress = 1.0
                     self.downloadStatus = "Saved: \(modelPath.lastPathComponent), \(tokPath.lastPathComponent)"
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
                     self.isDownloading = false
                 }
             } catch {
                 await MainActor.run {
                     self.errorText = String(describing: error)
                     self.downloadStatus = ""
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
                     self.isDownloading = false
                 }
             }
@@ -425,6 +457,8 @@ struct LLMView: View {
 
         downloadStatus = "Downloading SmolLM sample files..."
         downloadProgress = 0
+        currentDownloadFile = ""
+        currentDownloadSizeText = ""
         isDownloading = true
         Task {
             do {
@@ -433,30 +467,21 @@ struct LLMView: View {
                     from: DemoAssetLinks.smollm2Int8,
                     fileName: DemoAssetLinks.smollm2FileName,
                     progress: { p in
-                        Task { @MainActor in
-                            self.downloadProgress = min(1.0, (0.0 + p) / totalFiles)
-                            self.downloadStatus = "Downloading SmolLM sample files... \(Int((self.downloadProgress * 100).rounded()))%"
-                        }
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "SmolLM", fileName: DemoAssetLinks.smollm2FileName)
                     }
                 )
                 let tokPath = try await RemoteAssets.downloadToDocuments(
                     from: DemoAssetLinks.smollm2Tokenizer,
                     fileName: DemoAssetLinks.smollm2TokenizerFileName,
                     progress: { p in
-                        Task { @MainActor in
-                            self.downloadProgress = min(1.0, (1.0 + p) / totalFiles)
-                            self.downloadStatus = "Downloading SmolLM sample files... \(Int((self.downloadProgress * 100).rounded()))%"
-                        }
+                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "SmolLM", fileName: DemoAssetLinks.smollm2TokenizerFileName)
                     }
                 )
                 _ = try await RemoteAssets.downloadToDocuments(
                     from: DemoAssetLinks.smollm2TokenizerConfig,
                     fileName: DemoAssetLinks.smollm2TokenizerConfigFileName,
                     progress: { p in
-                        Task { @MainActor in
-                            self.downloadProgress = min(1.0, (2.0 + p) / totalFiles)
-                            self.downloadStatus = "Downloading SmolLM sample files... \(Int((self.downloadProgress * 100).rounded()))%"
-                        }
+                        setDownloadProgress(completedFiles: 2.0, progress: p, totalFiles: totalFiles, label: "SmolLM", fileName: DemoAssetLinks.smollm2TokenizerConfigFileName)
                     }
                 )
                 await MainActor.run {
@@ -464,12 +489,180 @@ struct LLMView: View {
                     self.tokenizerURL = tokPath
                     self.downloadProgress = 1.0
                     self.downloadStatus = "Saved: \(modelPath.lastPathComponent), \(tokPath.lastPathComponent)"
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
                     self.isDownloading = false
                 }
             } catch {
                 await MainActor.run {
                     self.errorText = String(describing: error)
                     self.downloadStatus = ""
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
+                    self.isDownloading = false
+                }
+            }
+        }
+    }
+
+    private func downloadQwenModelOnly() {
+        errorText = nil
+        selectedSampleLabel = "Qwen3.5"
+        downloadStatus = "Downloading Qwen model only..."
+        downloadProgress = 0
+        currentDownloadFile = ""
+        currentDownloadSizeText = ""
+        isDownloading = true
+        Task {
+            do {
+                let modelPath = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.qwen35Int4TextOnly,
+                    fileName: DemoAssetLinks.qwen35FileName,
+                    progress: { p in
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: 1.0, label: "Qwen", fileName: DemoAssetLinks.qwen35FileName)
+                    }
+                )
+                await MainActor.run {
+                    self.modelURL = modelPath
+                    self.downloadProgress = 1.0
+                    self.downloadStatus = "Saved model: \(modelPath.lastPathComponent)"
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
+                    self.isDownloading = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorText = String(describing: error)
+                    self.downloadStatus = ""
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
+                    self.isDownloading = false
+                }
+            }
+        }
+    }
+
+    private func downloadQwenTokenizerOnly() {
+        errorText = nil
+        selectedSampleLabel = "Qwen3.5"
+        downloadStatus = "Downloading Qwen tokenizer JSONs..."
+        downloadProgress = 0
+        currentDownloadFile = ""
+        currentDownloadSizeText = ""
+        isDownloading = true
+        Task {
+            do {
+                let totalFiles = 2.0
+                let tokPath = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.qwen35Tokenizer,
+                    fileName: DemoAssetLinks.qwen35TokenizerFileName,
+                    progress: { p in
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "Qwen tokenizer", fileName: DemoAssetLinks.qwen35TokenizerFileName)
+                    }
+                )
+                _ = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.qwen35TokenizerConfig,
+                    fileName: DemoAssetLinks.qwen35TokenizerConfigFileName,
+                    progress: { p in
+                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "Qwen tokenizer", fileName: DemoAssetLinks.qwen35TokenizerConfigFileName)
+                    }
+                )
+                await MainActor.run {
+                    self.tokenizerURL = tokPath
+                    self.downloadProgress = 1.0
+                    self.downloadStatus = "Saved tokenizer JSONs for Qwen."
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
+                    self.isDownloading = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorText = String(describing: error)
+                    self.downloadStatus = ""
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
+                    self.isDownloading = false
+                }
+            }
+        }
+    }
+
+    private func downloadSmolLMModelOnly() {
+        errorText = nil
+        selectedSampleLabel = "SmolLM2"
+        downloadStatus = "Downloading SmolLM model only..."
+        downloadProgress = 0
+        currentDownloadFile = ""
+        currentDownloadSizeText = ""
+        isDownloading = true
+        Task {
+            do {
+                let modelPath = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.smollm2Int8,
+                    fileName: DemoAssetLinks.smollm2FileName,
+                    progress: { p in
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: 1.0, label: "SmolLM", fileName: DemoAssetLinks.smollm2FileName)
+                    }
+                )
+                await MainActor.run {
+                    self.modelURL = modelPath
+                    self.downloadProgress = 1.0
+                    self.downloadStatus = "Saved model: \(modelPath.lastPathComponent)"
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
+                    self.isDownloading = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorText = String(describing: error)
+                    self.downloadStatus = ""
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
+                    self.isDownloading = false
+                }
+            }
+        }
+    }
+
+    private func downloadSmolLMTokenizerOnly() {
+        errorText = nil
+        selectedSampleLabel = "SmolLM2"
+        downloadStatus = "Downloading SmolLM tokenizer JSONs..."
+        downloadProgress = 0
+        currentDownloadFile = ""
+        currentDownloadSizeText = ""
+        isDownloading = true
+        Task {
+            do {
+                let totalFiles = 2.0
+                let tokPath = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.smollm2Tokenizer,
+                    fileName: DemoAssetLinks.smollm2TokenizerFileName,
+                    progress: { p in
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "SmolLM tokenizer", fileName: DemoAssetLinks.smollm2TokenizerFileName)
+                    }
+                )
+                _ = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.smollm2TokenizerConfig,
+                    fileName: DemoAssetLinks.smollm2TokenizerConfigFileName,
+                    progress: { p in
+                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "SmolLM tokenizer", fileName: DemoAssetLinks.smollm2TokenizerConfigFileName)
+                    }
+                )
+                await MainActor.run {
+                    self.tokenizerURL = tokPath
+                    self.downloadProgress = 1.0
+                    self.downloadStatus = "Saved tokenizer JSONs for SmolLM."
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
+                    self.isDownloading = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorText = String(describing: error)
+                    self.downloadStatus = ""
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
                     self.isDownloading = false
                 }
             }
@@ -477,6 +670,20 @@ struct LLMView: View {
     }
 
     private func restoreAssets() {
+        let smolModel = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2FileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "smollm2-135m-int8.cellm")
+        let smolTok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerFileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "tokenizer-smollm2-135m.json")
+        let smolCfg = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerConfigFileName) != nil
+            || RemoteAssets.existingDocumentsFile(fileName: "tokenizer_config.json") != nil
+        if let smolModel, let smolTok, smolCfg {
+            modelURL = smolModel
+            tokenizerURL = smolTok
+            selectedSampleLabel = "SmolLM2"
+            if downloadStatus.isEmpty { downloadStatus = "Loaded local sample files." }
+            return
+        }
+
         let qwenModel = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35FileName)
             ?? RemoteAssets.existingDocumentsFile(fileName: "qwen3.5-0.8b-int4-textonly.cellm")
         let qwenTok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35TokenizerFileName)
@@ -489,19 +696,6 @@ struct LLMView: View {
             selectedSampleLabel = "Qwen3.5"
             if downloadStatus.isEmpty { downloadStatus = "Loaded local sample files." }
             return
-        }
-
-        let smolModel = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2FileName)
-            ?? RemoteAssets.existingDocumentsFile(fileName: "smollm2-135m-int8.cellm")
-        let smolTok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerFileName)
-            ?? RemoteAssets.existingDocumentsFile(fileName: "tokenizer-smollm2-135m.json")
-        let smolCfg = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerConfigFileName) != nil
-            || RemoteAssets.existingDocumentsFile(fileName: "tokenizer_config.json") != nil
-        if let smolModel, let smolTok, smolCfg {
-            modelURL = smolModel
-            tokenizerURL = smolTok
-            selectedSampleLabel = "SmolLM2"
-            if downloadStatus.isEmpty { downloadStatus = "Loaded local sample files." }
         }
     }
 
@@ -522,6 +716,8 @@ struct LLMView: View {
         selectedSampleLabel = ""
         downloadStatus = "Local sample files deleted."
         downloadProgress = 0
+        currentDownloadFile = ""
+        currentDownloadSizeText = ""
     }
 
     private func forceRedownload() {
@@ -566,7 +762,7 @@ struct LLMView: View {
         }
         prompt = "Return exactly one uppercase letter: R"
         selectedPreset = .strict
-        run()
+        run(maxTokensOverride: 1)
     }
 
     private func runSchedulerSmokeTest() {
@@ -585,6 +781,29 @@ struct LLMView: View {
             stats.decodeMs,
             stats.totalMs
         )
+    }
+
+    private func setDownloadProgress(completedFiles: Double, progress: RemoteAssets.DownloadProgress, totalFiles: Double, label: String, fileName: String) {
+        let clamped = min(1.0, max(0.0, progress.fraction))
+        let overall = min(1.0, max(0.0, (completedFiles + clamped) / totalFiles))
+        DispatchQueue.main.async {
+            self.downloadProgress = overall
+            self.downloadStatus = "Downloading \(label) sample files... \(Int((overall * 100).rounded()))%"
+            self.currentDownloadFile = URL(fileURLWithPath: fileName).lastPathComponent
+            self.currentDownloadSizeText = self.formatSizeProgress(received: progress.bytesReceived, expected: progress.bytesExpected)
+        }
+    }
+
+    private func formatSizeProgress(received: Int64, expected: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useMB, .useGB]
+        formatter.countStyle = .file
+        let receivedText = formatter.string(fromByteCount: max(0, received))
+        if expected > 0 {
+            let expectedText = formatter.string(fromByteCount: expected)
+            return "\(receivedText) / \(expectedText)"
+        }
+        return "\(receivedText) downloaded"
     }
 }
 

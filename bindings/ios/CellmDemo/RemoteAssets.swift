@@ -25,6 +25,19 @@ enum DemoAssetLinks {
 }
 
 enum RemoteAssets {
+    struct DownloadProgress {
+        let fraction: Double
+        let bytesReceived: Int64
+        let bytesExpected: Int64
+    }
+
+    private static func makeDownloadSession() -> URLSession {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        cfg.urlCache = nil
+        return URLSession(configuration: cfg)
+    }
+
     static func documentsURL(fileName: String) -> URL {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         return docs.appendingPathComponent(fileName)
@@ -96,68 +109,101 @@ enum RemoteAssets {
         return [url]
     }
 
-    static func downloadToDocuments(from rawURL: String, fileName: String? = nil, progress: ((Double) -> Void)? = nil) async throws -> URL {
+    static func downloadToDocuments(from rawURL: String, fileName: String? = nil, progress: ((DownloadProgress) -> Void)? = nil) async throws -> URL {
         let urls = try candidateURLs(from: rawURL)
         let targetName = fileName ?? urls[0].lastPathComponent
 
-        var downloadedData: Data?
         var lastError = "Download failed"
         for url in urls {
             do {
-                let (bytes, response) = try await URLSession.shared.bytes(from: url)
+                let session = makeDownloadSession()
+                defer { session.invalidateAndCancel() }
+                let (bytes, response) = try await session.bytes(from: url)
                 if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
                     lastError = "Download failed: HTTP \(http.statusCode)"
                     continue
                 }
-                let expected = response.expectedContentLength
-                var data = Data()
-                if expected > 0, expected < Int64(Int.max) {
-                    data.reserveCapacity(Int(expected))
+                let tempURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent(UUID().uuidString)
+                    .appendingPathExtension("download")
+                FileManager.default.createFile(atPath: tempURL.path, contents: nil)
+                let handle = try FileHandle(forWritingTo: tempURL)
+                defer {
+                    try? handle.close()
                 }
+
+                let expected = response.expectedContentLength
                 var received: Int64 = 0
+                var lastReportedBytes: Int64 = 0
+                var chunk: [UInt8] = []
+                chunk.reserveCapacity(64 * 1024)
+                var prefix = Data()
+                prefix.reserveCapacity(512)
+
                 for try await byte in bytes {
-                    data.append(byte)
+                    chunk.append(byte)
                     received += 1
+                    if prefix.count < 512 {
+                        prefix.append(byte)
+                    }
+                    if chunk.count >= 64 * 1024 {
+                        try handle.write(contentsOf: chunk)
+                        chunk.removeAll(keepingCapacity: true)
+                    }
                     if expected > 0 {
-                        let fraction = min(1.0, Double(received) / Double(expected))
-                        progress?(fraction)
+                        // Throttle progress updates to avoid excessive UI work / task churn.
+                        if (received - lastReportedBytes) >= 256 * 1024 || received == expected {
+                            lastReportedBytes = received
+                            let fraction = min(1.0, Double(received) / Double(expected))
+                            progress?(DownloadProgress(
+                                fraction: fraction,
+                                bytesReceived: received,
+                                bytesExpected: expected
+                            ))
+                        }
                     }
                 }
+                if !chunk.isEmpty {
+                    try handle.write(contentsOf: chunk)
+                }
                 if expected <= 0 {
-                    progress?(1.0)
+                    progress?(DownloadProgress(
+                        fraction: 1.0,
+                        bytesReceived: received,
+                        bytesExpected: expected
+                    ))
                 }
-                if isLikelyHTML(data) {
+
+                if isLikelyHTML(prefix) {
                     lastError = "Download returned HTML instead of model data"
+                    try? FileManager.default.removeItem(at: tempURL)
                     continue
                 }
-                if isLfsPointer(data) {
+                if isLfsPointer(prefix) {
                     lastError = "Download returned Git LFS pointer, trying fallback"
+                    try? FileManager.default.removeItem(at: tempURL)
                     continue
                 }
-                if targetName.lowercased().hasSuffix(".cellm") && !hasCellmMagic(data) {
+                if targetName.lowercased().hasSuffix(".cellm") && !hasCellmMagic(prefix) {
                     lastError = "Downloaded file is not a valid .cellm binary"
+                    try? FileManager.default.removeItem(at: tempURL)
                     continue
                 }
-                downloadedData = data
-                break
+
+                let destURL = documentsURL(fileName: targetName)
+                let dirURL = destURL.deletingLastPathComponent()
+                try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true, attributes: nil)
+                if FileManager.default.fileExists(atPath: destURL.path) {
+                    try FileManager.default.removeItem(at: destURL)
+                }
+                try FileManager.default.moveItem(at: tempURL, to: destURL)
+                return destURL
             } catch {
                 lastError = String(describing: error)
             }
         }
 
-        guard let downloadedData else {
-            throw CellmError.message(lastError)
-        }
-
-        let destURL = documentsURL(fileName: targetName)
-        let dirURL = destURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true, attributes: nil)
-
-        if FileManager.default.fileExists(atPath: destURL.path) {
-            try FileManager.default.removeItem(at: destURL)
-        }
-        try downloadedData.write(to: destURL, options: .atomic)
-        return destURL
+        throw CellmError.message(lastError)
     }
 
     static func fetchData(from rawURL: String) async throws -> Data {
@@ -166,7 +212,9 @@ enum RemoteAssets {
         var lastError = "Download failed"
         for url in urls {
             do {
-                let (data, response) = try await URLSession.shared.data(from: url)
+                let session = makeDownloadSession()
+                defer { session.invalidateAndCancel() }
+                let (data, response) = try await session.data(from: url)
                 if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
                     lastError = "Download failed: HTTP \(http.statusCode)"
                     continue

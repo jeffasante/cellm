@@ -131,6 +131,19 @@ int32_t cellm_vlm_describe_image(
     size_t buf_len
 );
 
+// Last VLM timing breakdown in milliseconds for current thread.
+// Returns 0 on success, -1 on error (see cellm_last_error_message).
+int32_t cellm_vlm_last_timings_ms(
+    double* out_patch_ms,
+    double* out_encoder_ms,
+    double* out_decode_ms,
+    double* out_total_ms
+);
+
+// Per-layer encoder timing for last VLM run in current thread.
+uint32_t cellm_vlm_last_encoder_layer_count(void);
+int32_t cellm_vlm_last_encoder_layer_time_ms(uint32_t layer_index, double* out_ms);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

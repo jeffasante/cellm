@@ -39,7 +39,7 @@ In `cellm`, this state is tracked per session id (the same id used by `PageTable
 
 ## Where the code lives
 
-- Qwen runner: `/Users/jeff/Desktop/cellm/crates/cellm-model/src/qwen.rs`
+- Qwen runner: `/Users/cellm/crates/cellm-model/src/qwen.rs`
 
 ## Why this matters
 

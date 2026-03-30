@@ -49,8 +49,8 @@ Example (SmolLM2-135M local HF folder):
 
 ```bash
 cargo run --bin convert -- \
-  --input  /Users/jeff/Desktop/cellm/models/hf/smollm2-135m \
-  --output /Users/jeff/Desktop/cellm/models/smollm2-135m.cellm \
+  --input  /Users/cellm/models/hf/smollm2-135m \
+  --output /Users/cellm/models/smollm2-135m.cellm \
   --dtype  f16
 ```
 

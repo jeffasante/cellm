@@ -124,6 +124,9 @@ struct LLMView: View {
             if let backendWarning {
                 Text(backendWarning).font(.footnote).foregroundStyle(.orange)
             }
+            Text("Note: current LLM math path is CPU in this phase; Metal selection verifies backend selection/fallback.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -144,7 +147,8 @@ struct LLMView: View {
     private var outputCard: some View {
         card("Output") {
             Text(output.isEmpty ? "No output yet." : output)
-                .font(.system(.body, design: .monospaced))
+                .font(.body)
+                .lineSpacing(4)
                 .foregroundStyle(output.isEmpty ? .secondary : .primary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -200,9 +204,9 @@ struct LLMView: View {
             do {
                 let tok = try CellmTokenizer(tokenizerURL: tokenizerURL)
                 let eng = try CellmEngine(modelURL: modelURL, tokenizer: tok, backend: backend)
-                let text = try eng.generate(prompt: promptText, maxNewTokens: 96)
+                let text = try eng.generate(prompt: promptText, maxNewTokens: 64)
                 await MainActor.run {
-                    self.output = text
+                    self.output = prettyOutput(text)
                     self.activeBackend = eng.activeBackend
                     if backend == .metal && !eng.activeBackend.lowercased().contains("metal") {
                         self.backendWarning = "Metal requested, fell back to \(eng.activeBackend)."
@@ -281,6 +285,26 @@ struct LLMView: View {
     private func forceRedownload() {
         clearLocalFiles()
         downloadSampleAssets()
+    }
+
+    private func prettyOutput(_ text: String) -> String {
+        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+        let lines = normalized.components(separatedBy: "\n")
+        var out: [String] = []
+        var previousBlank = false
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty {
+                if !previousBlank {
+                    out.append("")
+                    previousBlank = true
+                }
+                continue
+            }
+            previousBlank = false
+            out.append(trimmed)
+        }
+        return out.joined(separator: "\n")
     }
 }
 

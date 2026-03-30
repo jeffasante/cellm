@@ -1,10 +1,15 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use bytemuck::cast_slice;
 use cellm_cache::{KVCache, PageTable};
 use cellm_core::KvCacheLayout;
+use cellm_kernels::metal::MetalBuffer;
+use cellm_kernels::metal::MetalMatmul;
+use cellm_kernels::MetalKernels;
 use cellm_model::{llama::LlamaRunner, CellmFile};
 use half::f16;
 use image::RgbImage;
@@ -12,9 +17,11 @@ use ndarray::{Array2, Array4, Array5, Axis};
 use rand::prelude::*;
 use serde_json::Value;
 use tokenizers::Tokenizer;
+use crate::BackendKind;
 
 #[derive(Debug, Clone, Copy)]
 pub struct VlmRunConfig {
+    pub backend: BackendKind,
     pub tokens_per_block: usize,
     pub top_k: usize,
     pub temperature: f32,
@@ -28,6 +35,7 @@ pub struct VlmRunConfig {
 impl Default for VlmRunConfig {
     fn default() -> Self {
         Self {
+            backend: BackendKind::Cpu,
             tokens_per_block: 16,
             top_k: 40,
             temperature: 0.7,
@@ -40,8 +48,36 @@ impl Default for VlmRunConfig {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct VlmTimingBreakdown {
+    pub patch_ms: f64,
+    pub encoder_ms: f64,
+    pub decode_ms: f64,
+    pub total_ms: f64,
+    pub encoder_layer_ms: Vec<f64>,
+}
+
 struct PreparedImage {
     pixel_values: Array5<f32>,
+}
+
+struct VisionLayerWeights {
+    ln1_w: Vec<f32>,
+    ln1_b: Vec<f32>,
+    q_w: Vec<f32>,
+    q_b: Vec<f32>,
+    k_w: Vec<f32>,
+    k_b: Vec<f32>,
+    v_w: Vec<f32>,
+    v_b: Vec<f32>,
+    o_w: Vec<f32>,
+    o_b: Vec<f32>,
+    ln2_w: Vec<f32>,
+    ln2_b: Vec<f32>,
+    fc1_w: Vec<f32>,
+    fc1_b: Vec<f32>,
+    fc2_w: Vec<f32>,
+    fc2_b: Vec<f32>,
 }
 
 pub fn describe_image_with_cellm(
@@ -50,12 +86,24 @@ pub fn describe_image_with_cellm(
     user_prompt: &str,
     cfg: VlmRunConfig,
 ) -> Result<String> {
+    let (text, _) = describe_image_with_cellm_timed(model_path, image_bytes, user_prompt, cfg)?;
+    Ok(text)
+}
+
+pub fn describe_image_with_cellm_timed(
+    model_path: &Path,
+    image_bytes: &[u8],
+    user_prompt: &str,
+    cfg: VlmRunConfig,
+) -> Result<(String, VlmTimingBreakdown)> {
+    let total_start = Instant::now();
     let tokenizer_path = resolve_tokenizer_path(model_path)?;
     let tok = load_tokenizer(&tokenizer_path)?;
 
     let image_input = preprocess_image_idefics3(image_bytes, false)?;
     let file = CellmFile::load(model_path).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let (image_features, image_seq_len) = run_vision_cellm(&file, image_input.pixel_values)?;
+    let (image_features, image_seq_len, patch_ms, encoder_ms, encoder_layer_ms) =
+        run_vision_cellm(&file, image_input.pixel_values, cfg.backend)?;
     let image_token_id = tok
         .token_to_id("<image>")
         .context("tokenizer missing <image> token")? as i64;
@@ -81,7 +129,7 @@ pub fn describe_image_with_cellm(
         .map_err(|e| anyhow::anyhow!("tokenize failed: {e}"))?;
     let input_ids: Vec<i64> = enc.get_ids().iter().map(|&x| x as i64).collect();
 
-    let generated = run_decode_cellm(
+    let (generated, decode_ms) = run_decode_cellm(
         model_path,
         image_token_id,
         eos_token_id,
@@ -97,7 +145,14 @@ pub fn describe_image_with_cellm(
             true,
         )
         .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?;
-    Ok(text.trim().to_string())
+    let timing = VlmTimingBreakdown {
+        patch_ms,
+        encoder_ms,
+        decode_ms,
+        total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+        encoder_layer_ms,
+    };
+    Ok((text.trim().to_string(), timing))
 }
 
 fn run_decode_cellm(
@@ -109,7 +164,8 @@ fn run_decode_cellm(
     input_ids: Vec<i64>,
     image_features: &Array2<f32>,
     banned_token_ids: &[i64],
-) -> Result<Vec<i64>> {
+) -> Result<(Vec<i64>, f64)> {
+    let decode_start = Instant::now();
     let mut runner = LlamaRunner::load(model_path).map_err(|e| anyhow::anyhow!("{e}"))?;
     let hidden = runner.hidden_size();
     if image_features.shape()[1] != hidden {
@@ -177,9 +233,6 @@ fn run_decode_cellm(
     let mut generated = Vec::new();
     for step in 0..cfg.max_new_tokens {
         generated.push(next);
-        if should_stop_for_repetition(&generated) && (step + 1) >= cfg.min_new_tokens {
-            break;
-        }
         if (next == eos_token_id || end_of_utterance_id == Some(next))
             && (step + 1) >= cfg.min_new_tokens
         {
@@ -204,23 +257,7 @@ fn run_decode_cellm(
         recent.push(generated[generated.len() - 1] as u32);
     }
 
-    Ok(generated)
-}
-
-fn should_stop_for_repetition(generated: &[i64]) -> bool {
-    if generated.len() < 12 {
-        return false;
-    }
-    let tail = &generated[generated.len() - 12..];
-    let mut uniq = std::collections::BTreeSet::new();
-    for &tok in tail {
-        uniq.insert(tok);
-    }
-    if uniq.len() <= 2 {
-        return true;
-    }
-    let last = generated[generated.len() - 1];
-    generated[generated.len() - 8..].iter().all(|&t| t == last)
+    Ok((generated, decode_start.elapsed().as_secs_f64() * 1000.0))
 }
 
 fn sample_from_candidates(
@@ -284,7 +321,21 @@ fn sample_from_candidates(
     Ok(filtered.last().expect("filtered non-empty").0 as i64)
 }
 
-fn run_vision_cellm(file: &CellmFile, pixel_values: Array5<f32>) -> Result<(Array2<f32>, usize)> {
+fn run_vision_cellm(
+    file: &CellmFile,
+    pixel_values: Array5<f32>,
+    backend: BackendKind,
+) -> Result<(Array2<f32>, usize, f64, f64, Vec<f64>)> {
+    let mut linear_backend = match backend {
+        BackendKind::Metal => match MetalKernels::create_matmul() {
+            Ok(ctx) => LinearBackend::Metal {
+                ctx,
+                weight_t_cache: HashMap::new(),
+            },
+            Err(_) => LinearBackend::Cpu,
+        },
+        BackendKind::Cpu => LinearBackend::Cpu,
+    };
     let vision_prefix = file
         .header
         .vision_tensor_prefix
@@ -420,51 +471,85 @@ fn run_vision_cellm(file: &CellmFile, pixel_values: Array5<f32>) -> Result<(Arra
     let mut score_buf = vec![0.0f32; num_tokens];
     let mut prob_buf = vec![0.0f32; num_tokens];
 
+    let mut layers = Vec::with_capacity(num_layers);
+    for layer in 0..num_layers {
+        let prefix = format!("{vision_prefix}encoder.layers.{layer}.");
+        layers.push(VisionLayerWeights {
+            ln1_w: tensor_to_f32(file, &format!("{prefix}layer_norm1.weight"))?,
+            ln1_b: tensor_to_f32(file, &format!("{prefix}layer_norm1.bias"))?,
+            q_w: tensor_to_f32(file, &format!("{prefix}self_attn.q_proj.weight"))?,
+            q_b: tensor_to_f32(file, &format!("{prefix}self_attn.q_proj.bias"))?,
+            k_w: tensor_to_f32(file, &format!("{prefix}self_attn.k_proj.weight"))?,
+            k_b: tensor_to_f32(file, &format!("{prefix}self_attn.k_proj.bias"))?,
+            v_w: tensor_to_f32(file, &format!("{prefix}self_attn.v_proj.weight"))?,
+            v_b: tensor_to_f32(file, &format!("{prefix}self_attn.v_proj.bias"))?,
+            o_w: tensor_to_f32(file, &format!("{prefix}self_attn.out_proj.weight"))?,
+            o_b: tensor_to_f32(file, &format!("{prefix}self_attn.out_proj.bias"))?,
+            ln2_w: tensor_to_f32(file, &format!("{prefix}layer_norm2.weight"))?,
+            ln2_b: tensor_to_f32(file, &format!("{prefix}layer_norm2.bias"))?,
+            fc1_w: tensor_to_f32(file, &format!("{prefix}mlp.fc1.weight"))?,
+            fc1_b: tensor_to_f32(file, &format!("{prefix}mlp.fc1.bias"))?,
+            fc2_w: tensor_to_f32(file, &format!("{prefix}mlp.fc2.weight"))?,
+            fc2_b: tensor_to_f32(file, &format!("{prefix}mlp.fc2.bias"))?,
+        });
+    }
+
+    let mut patch_ms = 0.0f64;
+    let mut encoder_ms = 0.0f64;
+    let mut encoder_layer_ms = vec![0.0f64; num_layers];
+
     for img in 0..nimg {
-        for py in 0..grid {
-            for px in 0..grid {
-                let token_idx = py * grid + px;
-                for oc in 0..hidden {
-                    let mut acc = patch_b[oc];
-                    for ic in 0..3usize {
-                        for ky in 0..patch {
-                            for kx in 0..patch {
-                                let y = py * patch + ky;
-                                let x = px * patch + kx;
-                                let pv = pixel_values[[0, img, ic, y, x]];
-                                let wi = (((oc * 3 + ic) * patch + ky) * patch) + kx;
-                                acc += pv * patch_w[wi];
-                            }
-                        }
-                    }
-                    tokens[token_idx * hidden + oc] = acc + pos[token_idx * hidden + oc];
-                }
-            }
-        }
+        let patch_start = Instant::now();
+        patch_embed_rows(
+            &pixel_values,
+            img,
+            grid,
+            patch,
+            hidden,
+            &patch_w,
+            &patch_b,
+            &pos,
+            &mut tokens,
+            &mut linear_backend,
+        );
+        patch_ms += patch_start.elapsed().as_secs_f64() * 1000.0;
 
-        for layer in 0..num_layers {
-            let prefix = format!("{vision_prefix}encoder.layers.{layer}.");
-            let ln1_w = tensor_to_f32(file, &format!("{prefix}layer_norm1.weight"))?;
-            let ln1_b = tensor_to_f32(file, &format!("{prefix}layer_norm1.bias"))?;
-            let q_w = tensor_to_f32(file, &format!("{prefix}self_attn.q_proj.weight"))?;
-            let q_b = tensor_to_f32(file, &format!("{prefix}self_attn.q_proj.bias"))?;
-            let k_w = tensor_to_f32(file, &format!("{prefix}self_attn.k_proj.weight"))?;
-            let k_b = tensor_to_f32(file, &format!("{prefix}self_attn.k_proj.bias"))?;
-            let v_w = tensor_to_f32(file, &format!("{prefix}self_attn.v_proj.weight"))?;
-            let v_b = tensor_to_f32(file, &format!("{prefix}self_attn.v_proj.bias"))?;
-            let o_w = tensor_to_f32(file, &format!("{prefix}self_attn.out_proj.weight"))?;
-            let o_b = tensor_to_f32(file, &format!("{prefix}self_attn.out_proj.bias"))?;
-            let ln2_w = tensor_to_f32(file, &format!("{prefix}layer_norm2.weight"))?;
-            let ln2_b = tensor_to_f32(file, &format!("{prefix}layer_norm2.bias"))?;
-            let fc1_w = tensor_to_f32(file, &format!("{prefix}mlp.fc1.weight"))?;
-            let fc1_b = tensor_to_f32(file, &format!("{prefix}mlp.fc1.bias"))?;
-            let fc2_w = tensor_to_f32(file, &format!("{prefix}mlp.fc2.weight"))?;
-            let fc2_b = tensor_to_f32(file, &format!("{prefix}mlp.fc2.bias"))?;
-
-            layer_norm_rows(&tokens, num_tokens, hidden, &ln1_w, &ln1_b, eps, &mut norm1);
-            linear_rows(&norm1, num_tokens, hidden, &q_w, hidden, Some(&q_b), &mut q);
-            linear_rows(&norm1, num_tokens, hidden, &k_w, hidden, Some(&k_b), &mut k);
-            linear_rows(&norm1, num_tokens, hidden, &v_w, hidden, Some(&v_b), &mut v);
+        let encoder_start = Instant::now();
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            let layer_start = Instant::now();
+            layer_norm_rows(
+                &tokens, num_tokens, hidden, &layer.ln1_w, &layer.ln1_b, eps, &mut norm1,
+            );
+            linear_rows(
+                &norm1,
+                num_tokens,
+                hidden,
+                &layer.q_w,
+                hidden,
+                Some(&layer.q_b),
+                &mut q,
+                &mut linear_backend,
+            );
+            linear_rows(
+                &norm1,
+                num_tokens,
+                hidden,
+                &layer.k_w,
+                hidden,
+                Some(&layer.k_b),
+                &mut k,
+                &mut linear_backend,
+            );
+            linear_rows(
+                &norm1,
+                num_tokens,
+                hidden,
+                &layer.v_w,
+                hidden,
+                Some(&layer.v_b),
+                &mut v,
+                &mut linear_backend,
+            );
             self_attention_full(
                 &q,
                 &k,
@@ -475,39 +560,46 @@ fn run_vision_cellm(file: &CellmFile, pixel_values: Array5<f32>) -> Result<(Arra
                 &mut score_buf,
                 &mut prob_buf,
                 &mut attn,
+                &mut linear_backend,
             );
             linear_rows(
                 &attn,
                 num_tokens,
                 hidden,
-                &o_w,
+                &layer.o_w,
                 hidden,
-                Some(&o_b),
+                Some(&layer.o_b),
                 &mut proj_out,
+                &mut linear_backend,
             );
             add_inplace(&mut tokens, &proj_out);
 
-            layer_norm_rows(&tokens, num_tokens, hidden, &ln2_w, &ln2_b, eps, &mut norm2);
+            layer_norm_rows(
+                &tokens, num_tokens, hidden, &layer.ln2_w, &layer.ln2_b, eps, &mut norm2,
+            );
             linear_rows(
                 &norm2,
                 num_tokens,
                 hidden,
-                &fc1_w,
+                &layer.fc1_w,
                 intermediate,
-                Some(&fc1_b),
+                Some(&layer.fc1_b),
                 &mut mlp_up,
+                &mut linear_backend,
             );
             gelu_pytorch_tanh_inplace(&mut mlp_up);
             linear_rows(
                 &mlp_up,
                 num_tokens,
                 intermediate,
-                &fc2_w,
+                &layer.fc2_w,
                 hidden,
-                Some(&fc2_b),
+                Some(&layer.fc2_b),
                 &mut mlp_out,
+                &mut linear_backend,
             );
             add_inplace(&mut tokens, &mlp_out);
+            encoder_layer_ms[layer_idx] += layer_start.elapsed().as_secs_f64() * 1000.0;
         }
 
         layer_norm_rows(
@@ -544,9 +636,10 @@ fn run_vision_cellm(file: &CellmFile, pixel_values: Array5<f32>) -> Result<(Arra
                 }
             }
         }
+        encoder_ms += encoder_start.elapsed().as_secs_f64() * 1000.0;
     }
 
-    Ok((out, out_tokens_per_image))
+    Ok((out, out_tokens_per_image, patch_ms, encoder_ms, encoder_layer_ms))
 }
 
 fn infer_vision_num_layers(file: &CellmFile, vision_prefix: &str) -> usize {
@@ -682,6 +775,57 @@ fn layer_norm_rows(
     }
 }
 
+fn patch_embed_rows(
+    pixel_values: &Array5<f32>,
+    img: usize,
+    grid: usize,
+    patch: usize,
+    hidden: usize,
+    patch_w: &[f32],
+    patch_b: &[f32],
+    pos: &[f32],
+    tokens_out: &mut [f32],
+    backend: &mut LinearBackend,
+) {
+    let rows = grid * grid;
+    let in_dim = 3 * patch * patch;
+    let mut im2col = vec![0.0f32; rows * in_dim];
+    for py in 0..grid {
+        for px in 0..grid {
+            let token_idx = py * grid + px;
+            let mut col_i = 0usize;
+            for ic in 0..3usize {
+                for ky in 0..patch {
+                    for kx in 0..patch {
+                        let y = py * patch + ky;
+                        let x = px * patch + kx;
+                        im2col[token_idx * in_dim + col_i] = pixel_values[[0, img, ic, y, x]];
+                        col_i += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    linear_rows(
+        &im2col,
+        rows,
+        in_dim,
+        patch_w,
+        hidden,
+        Some(patch_b),
+        tokens_out,
+        backend,
+    );
+    for t in 0..rows {
+        let row = &mut tokens_out[t * hidden..(t + 1) * hidden];
+        let p = &pos[t * hidden..(t + 1) * hidden];
+        for i in 0..hidden {
+            row[i] += p[i];
+        }
+    }
+}
+
 fn linear_rows(
     input: &[f32],
     rows: usize,
@@ -690,7 +834,50 @@ fn linear_rows(
     out_dim: usize,
     bias: Option<&[f32]>,
     out: &mut [f32],
+    backend: &mut LinearBackend,
 ) {
+    if let LinearBackend::Metal {
+        ctx,
+        weight_t_cache,
+    } = backend
+    {
+        let key = (weight.as_ptr() as usize, in_dim, out_dim);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let maybe_ok = {
+            if !weight_t_cache.contains_key(&key) {
+                let mut wt = vec![0.0f32; in_dim * out_dim];
+                for o in 0..out_dim {
+                    for i in 0..in_dim {
+                        wt[i * out_dim + o] = weight[o * in_dim + i];
+                    }
+                }
+                if let Ok(buf) = ctx.upload_f32(&wt) {
+                    weight_t_cache.insert(key, buf);
+                }
+            }
+
+            if let Some(b_buf) = weight_t_cache.get(&key) {
+                if let Ok(a_buf) = ctx.upload_f32(input) {
+                    ctx.matmul_row_major_f32_with_b_buffer(&a_buf, rows, in_dim, b_buf, out_dim, out)
+                        .is_ok()
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let maybe_ok = false;
+
+        if maybe_ok {
+            if let Some(b) = bias {
+                add_bias_rows(out, rows, out_dim, b);
+            }
+            return;
+        }
+    }
     for r in 0..rows {
         let x = &input[r * in_dim..(r + 1) * in_dim];
         let y = &mut out[r * out_dim..(r + 1) * out_dim];
@@ -710,6 +897,23 @@ fn linear_rows(
     }
 }
 
+enum LinearBackend {
+    Cpu,
+    Metal {
+        ctx: MetalMatmul,
+        weight_t_cache: HashMap<(usize, usize, usize), MetalBuffer>,
+    },
+}
+
+fn add_bias_rows(out: &mut [f32], rows: usize, cols: usize, bias: &[f32]) {
+    for r in 0..rows {
+        let row = &mut out[r * cols..(r + 1) * cols];
+        for c in 0..cols {
+            row[c] += bias[c];
+        }
+    }
+}
+
 fn self_attention_full(
     q: &[f32],
     k: &[f32],
@@ -720,9 +924,21 @@ fn self_attention_full(
     score_buf: &mut [f32],
     prob_buf: &mut [f32],
     out: &mut [f32],
+    backend: &mut LinearBackend,
 ) {
     let hidden = num_heads * head_dim;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    if let LinearBackend::Metal { ctx, .. } = backend {
+        if self_attention_full_metal(
+            ctx, q, k, v, seq, num_heads, head_dim, scale, score_buf, prob_buf, out,
+        )
+        .is_ok()
+        {
+            return;
+        }
+    }
+
     for h in 0..num_heads {
         let offset = h * head_dim;
         for i in 0..seq {
@@ -759,6 +975,78 @@ fn self_attention_full(
             }
         }
     }
+}
+
+fn self_attention_full_metal(
+    ctx: &MetalMatmul,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq: usize,
+    num_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    score_buf: &mut [f32],
+    prob_buf: &mut [f32],
+    out: &mut [f32],
+) -> Result<()> {
+    let hidden = num_heads * head_dim;
+    let mut qh = vec![0.0f32; seq * head_dim];
+    let mut kh_t = vec![0.0f32; head_dim * seq];
+    let mut vh = vec![0.0f32; seq * head_dim];
+    let mut scores = vec![0.0f32; seq * seq];
+    let mut probs = vec![0.0f32; seq * seq];
+    let mut head_out = vec![0.0f32; seq * head_dim];
+
+    for h in 0..num_heads {
+        let offset = h * head_dim;
+        for t in 0..seq {
+            let q_src = &q[t * hidden + offset..t * hidden + offset + head_dim];
+            let k_src = &k[t * hidden + offset..t * hidden + offset + head_dim];
+            let v_src = &v[t * hidden + offset..t * hidden + offset + head_dim];
+            qh[t * head_dim..(t + 1) * head_dim].copy_from_slice(q_src);
+            vh[t * head_dim..(t + 1) * head_dim].copy_from_slice(v_src);
+            for d in 0..head_dim {
+                kh_t[d * seq + t] = k_src[d];
+            }
+        }
+
+        ctx.matmul_row_major_f32(&qh, seq, head_dim, &kh_t, seq, &mut scores)?;
+        for val in &mut scores {
+            *val *= scale;
+        }
+
+        for i in 0..seq {
+            let row = &scores[i * seq..(i + 1) * seq];
+            let mut maxv = f32::NEG_INFINITY;
+            for &x in row {
+                if x > maxv {
+                    maxv = x;
+                }
+            }
+            let mut sum = 0.0f32;
+            let dst = &mut probs[i * seq..(i + 1) * seq];
+            for j in 0..seq {
+                let p = (row[j] - maxv).exp();
+                dst[j] = p;
+                sum += p;
+            }
+            let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+            for p in dst.iter_mut() {
+                *p *= inv;
+            }
+        }
+
+        ctx.matmul_row_major_f32(&probs, seq, seq, &vh, head_dim, &mut head_out)?;
+
+        for t in 0..seq {
+            let dst = &mut out[t * hidden + offset..t * hidden + offset + head_dim];
+            let src = &head_out[t * head_dim..(t + 1) * head_dim];
+            dst.copy_from_slice(src);
+        }
+    }
+    let _ = (score_buf, prob_buf);
+    Ok(())
 }
 
 fn gelu_pytorch_tanh_inplace(x: &mut [f32]) {

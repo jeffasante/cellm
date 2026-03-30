@@ -9,6 +9,8 @@ use tokenizers::Tokenizer;
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+    static LAST_VLM_TIMINGS_MS: RefCell<Option<(f64, f64, f64, f64)>> = const { RefCell::new(None) };
+    static LAST_VLM_ENCODER_LAYER_MS: RefCell<Option<Vec<f64>>> = const { RefCell::new(None) };
 }
 
 fn set_last_error(msg: impl Into<String>) {
@@ -17,6 +19,27 @@ fn set_last_error(msg: impl Into<String>) {
 
 fn take_last_error() -> Option<String> {
     LAST_ERROR.with(|e| e.borrow_mut().take())
+}
+
+fn set_last_vlm_timings_ms(patch_ms: f64, encoder_ms: f64, decode_ms: f64, total_ms: f64) {
+    LAST_VLM_TIMINGS_MS.with(|t| *t.borrow_mut() = Some((patch_ms, encoder_ms, decode_ms, total_ms)));
+}
+
+fn set_last_vlm_encoder_layer_ms(layer_ms: Vec<f64>) {
+    LAST_VLM_ENCODER_LAYER_MS.with(|t| *t.borrow_mut() = Some(layer_ms));
+}
+
+fn clear_last_vlm_timings_ms() {
+    LAST_VLM_TIMINGS_MS.with(|t| *t.borrow_mut() = None);
+    LAST_VLM_ENCODER_LAYER_MS.with(|t| *t.borrow_mut() = None);
+}
+
+fn get_last_vlm_timings_ms() -> Option<(f64, f64, f64, f64)> {
+    LAST_VLM_TIMINGS_MS.with(|t| *t.borrow())
+}
+
+fn get_last_vlm_encoder_layer_ms() -> Option<Vec<f64>> {
+    LAST_VLM_ENCODER_LAYER_MS.with(|t| t.borrow().clone())
 }
 
 fn cstr_to_str<'a>(s: *const c_char) -> Result<&'a str, String> {
@@ -511,6 +534,7 @@ pub extern "C" fn cellm_vlm_describe_image(
     buf_len: usize,
 ) -> i32 {
     let result: Result<(), String> = (|| {
+        clear_last_vlm_timings_ms();
         if engine == 0 {
             return Err("vlm_describe_image: null engine".to_string());
         }
@@ -527,22 +551,30 @@ pub extern "C" fn cellm_vlm_describe_image(
             return Err(format!("vlm_describe_image: unknown session id {session}"));
         }
         let sampling = e.sampling_params();
-        let text = crate::vlm::describe_image_with_cellm(
+        let (text, timing) = crate::vlm::describe_image_with_cellm_timed(
             e.model_path(),
             img,
             prompt,
             VlmRunConfig {
+                backend: e.backend(),
                 tokens_per_block: 16,
                 top_k: sampling.top_k.max(1),
                 temperature: sampling.temperature as f32,
                 seed: sampling.seed,
                 repeat_penalty: sampling.repeat_penalty as f32,
                 repeat_window: sampling.repeat_window,
-                max_new_tokens: 48,
-                min_new_tokens: 4,
+                max_new_tokens: 128,
+                min_new_tokens: 1,
             },
         )
         .map_err(|err| format!("vlm_describe_image failed: {err}"))?;
+        set_last_vlm_timings_ms(
+            timing.patch_ms,
+            timing.encoder_ms,
+            timing.decode_ms,
+            timing.total_ms,
+        );
+        set_last_vlm_encoder_layer_ms(timing.encoder_layer_ms);
 
         if !out_buf.is_null() && buf_len > 0 {
             let bytes = text.as_bytes();
@@ -562,4 +594,69 @@ pub extern "C" fn cellm_vlm_describe_image(
             -1
         }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn cellm_vlm_last_timings_ms(
+    out_patch_ms: *mut f64,
+    out_encoder_ms: *mut f64,
+    out_decode_ms: *mut f64,
+    out_total_ms: *mut f64,
+) -> i32 {
+    if out_patch_ms.is_null()
+        || out_encoder_ms.is_null()
+        || out_decode_ms.is_null()
+        || out_total_ms.is_null()
+    {
+        set_last_error("vlm_last_timings_ms: null output pointer".to_string());
+        return -1;
+    }
+
+    let Some((patch_ms, encoder_ms, decode_ms, total_ms)) = get_last_vlm_timings_ms() else {
+        set_last_error("vlm_last_timings_ms: no timings available yet".to_string());
+        return -1;
+    };
+
+    unsafe {
+        *out_patch_ms = patch_ms;
+        *out_encoder_ms = encoder_ms;
+        *out_decode_ms = decode_ms;
+        *out_total_ms = total_ms;
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn cellm_vlm_last_encoder_layer_count() -> u32 {
+    get_last_vlm_encoder_layer_ms()
+        .map(|v| v.len() as u32)
+        .unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn cellm_vlm_last_encoder_layer_time_ms(
+    layer_index: u32,
+    out_ms: *mut f64,
+) -> i32 {
+    if out_ms.is_null() {
+        set_last_error("vlm_last_encoder_layer_time_ms: null output pointer".to_string());
+        return -1;
+    }
+    let Some(layer_ms) = get_last_vlm_encoder_layer_ms() else {
+        set_last_error("vlm_last_encoder_layer_time_ms: no timings available yet".to_string());
+        return -1;
+    };
+    let idx = layer_index as usize;
+    if idx >= layer_ms.len() {
+        set_last_error(format!(
+            "vlm_last_encoder_layer_time_ms: index {} out of range 0..{}",
+            idx,
+            layer_ms.len().saturating_sub(1)
+        ));
+        return -1;
+    }
+    unsafe {
+        *out_ms = layer_ms[idx];
+    }
+    0
 }

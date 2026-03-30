@@ -16,6 +16,7 @@ struct VLMView: View {
     @State private var downloadStatus: String = ""
     @State private var isDownloading: Bool = false
     @State private var backendWarning: String?
+    @State private var timingText: String?
     @State private var showModelPicker = false
 
     var body: some View {
@@ -110,6 +111,9 @@ struct VLMView: View {
                     if let backendWarning {
                         Text(backendWarning).font(.footnote).foregroundStyle(.orange)
                     }
+                    Text("Note: when Metal is available, VLM uses Metal matmul for linear layers; remaining ops are still CPU in this phase.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
 
                 Button(isRunning ? "Running…" : "Run VLM") { run() }
@@ -128,9 +132,18 @@ struct VLMView: View {
                     card("Error") { Text(errorText).foregroundStyle(.red) }
                 }
 
+                if let timingText {
+                    card("Timings") {
+                        Text(timingText)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 card("Output") {
                     Text(output.isEmpty ? "No output yet." : output)
-                        .font(.system(.body, design: .monospaced))
+                        .font(.body)
+                        .lineSpacing(4)
                         .foregroundStyle(output.isEmpty ? .secondary : .primary)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -204,6 +217,7 @@ struct VLMView: View {
 
         errorText = nil
         infoText = nil
+        timingText = nil
         output = ""
         backendWarning = nil
         guard let modelURL, let imageBytes else { return }
@@ -216,8 +230,26 @@ struct VLMView: View {
                 let eng = try CellmVLMEngine(modelURL: modelURL, backend: backend)
                 let text = try eng.describe(imageBytes: imageBytes, prompt: promptText)
                 await MainActor.run {
-                    self.output = text
+                    self.output = prettyOutput(text)
                     self.activeBackend = eng.activeBackend
+                    if let t = eng.lastTimings {
+                        var summary = String(
+                            format: "patch %.1f ms • encoder %.1f ms • decode %.1f ms • total %.1f ms",
+                            t.patchMs,
+                            t.encoderMs,
+                            t.decodeMs,
+                            t.totalMs
+                        )
+                        if let maxPair = t.encoderLayerMs.enumerated().max(by: { $0.element < $1.element }) {
+                            summary += String(
+                                format: "\nencoder layers: %d • hottest L%d %.1f ms",
+                                t.encoderLayerMs.count,
+                                maxPair.offset,
+                                maxPair.element
+                            )
+                        }
+                        self.timingText = summary
+                    }
                     if backend == .metal && !eng.activeBackend.lowercased().contains("metal") {
                         self.backendWarning = "Metal requested, fell back to \(eng.activeBackend)."
                     }
@@ -305,5 +337,25 @@ struct VLMView: View {
     private func forceRedownload() {
         clearLocalFiles()
         downloadSampleAssets()
+    }
+
+    private func prettyOutput(_ text: String) -> String {
+        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+        let lines = normalized.components(separatedBy: "\n")
+        var out: [String] = []
+        var previousBlank = false
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty {
+                if !previousBlank {
+                    out.append("")
+                    previousBlank = true
+                }
+                continue
+            }
+            previousBlank = false
+            out.append(trimmed)
+        }
+        return out.joined(separator: "\n")
     }
 }

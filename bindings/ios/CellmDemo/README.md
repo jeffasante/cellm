@@ -20,12 +20,12 @@ Note: requesting `Metal` currently verifies Metal availability and selects the M
 
 1) Build the XCFramework used by the app target:
    ```bash
-   cd /Users/jeff/Desktop/cellm
+   cd /Users/cellm
    zsh scripts/build_xcframework.sh
    ```
 
 2) Open the generated project:
-   - `/Users/jeff/Desktop/cellm/bindings/ios/CellmDemo.xcodeproj`
+   - `/Users/cellm/bindings/ios/CellmDemo.xcodeproj`
 
 3) Add the Swift files from this folder into your app target:
    - `CellmFFI.swift`

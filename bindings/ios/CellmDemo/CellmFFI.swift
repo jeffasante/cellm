@@ -24,6 +24,14 @@ enum CellmError: Error, CustomStringConvertible {
     }
 }
 
+struct VlmTimings {
+    let patchMs: Double
+    let encoderMs: Double
+    let decodeMs: Double
+    let totalMs: Double
+    let encoderLayerMs: [Double]
+}
+
 final class CellmTokenizer {
     private var handle: cellm_tokenizer_t = 0
     let tokenizerURL: URL
@@ -89,7 +97,7 @@ final class CellmEngine {
 
     let activeBackend: String
 
-    init(modelURL: URL, tokenizer: CellmTokenizer, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 512, topK: UInt32 = 40, temperature: Float = 0.7, repeatPenalty: Float = 1.05, repeatWindow: UInt32 = 64, seed: UInt64 = 1, backend: CellmBackend = .metal) throws {
+    init(modelURL: URL, tokenizer: CellmTokenizer, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 512, topK: UInt32 = 40, temperature: Float = 0.2, repeatPenalty: Float = 1.08, repeatWindow: UInt32 = 96, seed: UInt64 = 1, backend: CellmBackend = .metal) throws {
         self.tokenizer = tokenizer
         let path = modelURL.path
         let h = path.withCString { cstr in
@@ -123,7 +131,10 @@ final class CellmEngine {
         if rc != 0 { throw CellmError.message(CellmFFI.lastError()) }
 
         var out = ""
-        out += try tokenizer.decodeOne(next)
+        let firstPiece = try tokenizer.decodeOne(next)
+        if !Self.isStopPiece(firstPiece) {
+            out += firstPiece
+        }
 
         if maxNewTokens <= 1 {
             return out
@@ -135,28 +146,52 @@ final class CellmEngine {
             let r = cellm_step_decode(handle, &outSession, &tok)
             if r < 0 { throw CellmError.message(CellmFFI.lastError()) }
             if r == 0 { break }
-            out += try tokenizer.decodeOne(tok)
+            let piece = try tokenizer.decodeOne(tok)
+            if Self.isStopPiece(piece) { break }
+            out += piece
         }
         return out
     }
 
     private static func wrapPrompt(_ prompt: String, tokenizerURL: URL) -> String {
-        if usesChatML(tokenizerURL: tokenizerURL) {
-            return "<|im_start|>user\n\(prompt)<|im_end|>\n<|im_start|>assistant\n"
+        let cleanPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch promptStyle(tokenizerURL: tokenizerURL) {
+        case .smolChat:
+            return "<|im_start|>User: \(cleanPrompt)<end_of_utterance>\nAssistant:"
+        case .chatML:
+            return "<|im_start|>user\n\(cleanPrompt)<|im_end|>\n<|im_start|>assistant\n"
+        case .plain:
+            return "User: \(cleanPrompt)\nAssistant:"
         }
-        return "User: \(prompt)\nAssistant:"
     }
 
-    private static func usesChatML(tokenizerURL: URL) -> Bool {
+    private enum PromptStyle {
+        case smolChat
+        case chatML
+        case plain
+    }
+
+    private static func promptStyle(tokenizerURL: URL) -> PromptStyle {
         let cfgURL = tokenizerURL.deletingLastPathComponent().appendingPathComponent("tokenizer_config.json")
         guard
             let data = try? Data(contentsOf: cfgURL),
             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let tpl = obj["chat_template"] as? String
         else {
-            return false
+            return .plain
         }
-        return tpl.contains("<|im_start|>") && tpl.contains("<|im_end|>")
+        if tpl.contains("<end_of_utterance>") && tpl.contains("Assistant:") {
+            return .smolChat
+        }
+        if tpl.contains("<|im_start|>") && tpl.contains("<|im_end|>") {
+            return .chatML
+        }
+        return .plain
+    }
+
+    private static func isStopPiece(_ piece: String) -> Bool {
+        let p = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+        return p == "<|im_end|>" || p == "<end_of_utterance>" || p == "<|endoftext|>"
     }
 }
 
@@ -165,6 +200,7 @@ final class CellmVLMEngine {
     private let session: cellm_session_t
 
     let activeBackend: String
+    private(set) var lastTimings: VlmTimings?
 
     init(modelURL: URL, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 512, topK: UInt32 = 40, temperature: Float = 0.7, repeatPenalty: Float = 1.15, repeatWindow: UInt32 = 128, seed: UInt64 = 1, backend: CellmBackend = .metal) throws {
         let path = modelURL.path
@@ -189,6 +225,7 @@ final class CellmVLMEngine {
     }
 
     func describe(imageBytes: Data, prompt: String) throws -> String {
+        lastTimings = nil
         var out = [CChar](repeating: 0, count: 32 * 1024)
         let rc = prompt.withCString { cPrompt in
             imageBytes.withUnsafeBytes { raw in
@@ -208,6 +245,7 @@ final class CellmVLMEngine {
         if rc != 0 {
             throw CellmError.message(CellmFFI.lastError())
         }
+        lastTimings = try CellmFFI.vlmLastTimings()
         return String(cString: out)
     }
 }
@@ -225,5 +263,41 @@ enum CellmFFI {
         let n = cellm_engine_backend_name(handle, &buf, buf.count)
         if n == 0 { return "unknown" }
         return String(cString: buf)
+    }
+
+    static func vlmLastTimings() throws -> VlmTimings {
+        var patch = 0.0
+        var encoder = 0.0
+        var decode = 0.0
+        var total = 0.0
+        let rc = cellm_vlm_last_timings_ms(&patch, &encoder, &decode, &total)
+        if rc != 0 {
+            throw CellmError.message(lastError())
+        }
+        let layers = vlmLastEncoderLayerMs()
+        return VlmTimings(
+            patchMs: patch,
+            encoderMs: encoder,
+            decodeMs: decode,
+            totalMs: total,
+            encoderLayerMs: layers
+        )
+    }
+
+    static func vlmLastEncoderLayerMs() -> [Double] {
+        let count = Int(cellm_vlm_last_encoder_layer_count())
+        if count <= 0 { return [] }
+        var out: [Double] = []
+        out.reserveCapacity(count)
+        for i in 0..<count {
+            var value = 0.0
+            let rc = cellm_vlm_last_encoder_layer_time_ms(UInt32(i), &value)
+            if rc == 0 {
+                out.append(value)
+            } else {
+                break
+            }
+        }
+        return out
     }
 }

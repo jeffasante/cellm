@@ -12,167 +12,151 @@ struct LLMView: View {
     @State private var activeBackend: String = ""
     @State private var downloadStatus: String = ""
     @State private var isDownloading: Bool = false
+    @State private var backendWarning: String?
 
     @State private var showModelPicker = false
     @State private var showTokenizerPicker = false
 
     var body: some View {
-        NavigationStack {
-            ZStack {
-                LinearGradient(
-                    colors: [Color(.systemBackground), Color(.systemGray6)],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-                .ignoresSafeArea()
-
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("cellm LLM")
-                                .font(.system(size: 32, weight: .bold))
-                            Text("Run local text generation on-device")
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
-                        }
-
-                        sectionCard("Files") {
-                            actionRow(
-                                title: modelURL == nil ? "Pick .cellm model" : modelURL!.lastPathComponent,
-                                icon: "externaldrive",
-                                action: { showModelPicker = true }
-                            )
-                            actionRow(
-                                title: tokenizerURL == nil ? "Pick tokenizer.json" : tokenizerURL!.lastPathComponent,
-                                icon: "doc.text",
-                                action: { showTokenizerPicker = true }
-                            )
-                            actionRow(
-                                title: isDownloading ? "Downloading sample files…" : "Download sample model + tokenizer",
-                                icon: "arrow.down.circle",
-                                disabled: isDownloading || isRunning,
-                                action: downloadSampleAssets
-                            )
-                            if !downloadStatus.isEmpty {
-                                Text(downloadStatus)
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                                    .padding(.top, 6)
-                            }
-                        }
-
-                        sectionCard("Prompt") {
-                            TextEditor(text: $prompt)
-                                .frame(minHeight: 110)
-                                .padding(10)
-                                .background(Color(.secondarySystemBackground))
-                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        }
-
-                        sectionCard("Backend") {
-                            Picker("Requested", selection: $selectedBackend) {
-                                ForEach(CellmBackend.allCases) { backend in
-                                    Text(backend.label).tag(backend)
-                                }
-                            }
-                            .pickerStyle(.segmented)
-                            if !activeBackend.isEmpty {
-                                Text("Active: \(activeBackend)")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                                    .padding(.top, 4)
-                            }
-                        }
-
-                        Button {
-                            run()
-                        } label: {
-                            HStack {
-                                Spacer()
-                                Text(isRunning ? "Generating…" : "Generate")
-                                    .fontWeight(.semibold)
-                                Spacer()
-                            }
-                            .padding(.vertical, 14)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(isRunning || modelURL == nil || tokenizerURL == nil || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-                        if let errorText {
-                            sectionCard("Error") {
-                                Text(errorText)
-                                    .foregroundColor(.red)
-                            }
-                        }
-
-                        sectionCard("Output") {
-                            Text(output.isEmpty ? "No output yet." : output)
-                                .font(.system(.body, design: .monospaced))
-                                .foregroundColor(output.isEmpty ? .secondary : .primary)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(10)
-                                .background(Color(.secondarySystemBackground))
-                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        }
-                    }
-                    .padding(16)
-                }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                header
+                filesCard
+                promptCard
+                backendCard
+                generateButton
+                if let errorText { errorCard(errorText) }
+                outputCard
             }
-            .navigationBarTitleDisplayMode(.inline)
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 24)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(Color(.systemGroupedBackground).ignoresSafeArea())
         .sheet(isPresented: $showModelPicker) {
-            DocumentPicker(allowed: [.data]) { url in
-                modelURL = url
-            }
+            DocumentPicker(allowed: [.data]) { modelURL = $0 }
         }
         .sheet(isPresented: $showTokenizerPicker) {
-            DocumentPicker(allowed: [.json]) { url in
-                tokenizerURL = url
+            DocumentPicker(allowed: [.json]) { tokenizerURL = $0 }
+        }
+        .onAppear {
+            restoreAssets()
+        }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("cellm LLM")
+                .font(.system(size: 38, weight: .bold))
+            Text("Run local text generation on-device")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.top, 4)
+    }
+
+    private var filesCard: some View {
+        card("Files") {
+            actionButton(modelURL == nil ? "Pick .cellm model" : modelURL!.lastPathComponent, icon: "externaldrive") { showModelPicker = true }
+            actionButton(tokenizerURL == nil ? "Pick tokenizer.json" : tokenizerURL!.lastPathComponent, icon: "doc.text") { showTokenizerPicker = true }
+            actionButton(isDownloading ? "Downloading sample files…" : "Download sample model + tokenizer", icon: "arrow.down.circle", disabled: isDownloading || isRunning) {
+                downloadSampleAssets()
+            }
+            if !downloadStatus.isEmpty {
+                Text(downloadStatus).font(.footnote).foregroundStyle(.secondary)
             }
         }
     }
 
-    private func sectionCard<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+    private var promptCard: some View {
+        card("Prompt") {
+            TextEditor(text: $prompt)
+                .frame(minHeight: 110)
+                .padding(8)
+                .background(Color(.systemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+        }
+    }
+
+    private var backendCard: some View {
+        card("Backend") {
+            Picker("Requested", selection: $selectedBackend) {
+                ForEach(CellmBackend.allCases) { backend in
+                    Text(backend.label).tag(backend)
+                }
+            }
+            .pickerStyle(.segmented)
+            if !activeBackend.isEmpty {
+                Text("Active: \(activeBackend)").font(.footnote).foregroundStyle(.secondary)
+            }
+            if let backendWarning {
+                Text(backendWarning).font(.footnote).foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private var generateButton: some View {
+        Button(isRunning ? "Generating…" : "Generate") { run() }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .frame(maxWidth: .infinity)
+            .disabled(isRunning || modelURL == nil || tokenizerURL == nil || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+
+    private func errorCard(_ text: String) -> some View {
+        card("Error") {
+            Text(text).foregroundStyle(.red)
+        }
+    }
+
+    private var outputCard: some View {
+        card("Output") {
+            Text(output.isEmpty ? "No output yet." : output)
+                .font(.system(.body, design: .monospaced))
+                .foregroundStyle(output.isEmpty ? .secondary : .primary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+                .background(Color(.systemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+        }
+    }
+
+    private func card<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(title.uppercased())
                 .font(.caption)
+                .foregroundStyle(.secondary)
                 .fontWeight(.semibold)
-                .foregroundColor(.secondary)
             content()
         }
         .padding(14)
-        .background(Color(.systemBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Color(.separator).opacity(0.25), lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(0.03), radius: 8, x: 0, y: 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 16))
     }
 
-    private func actionRow(title: String, icon: String, disabled: Bool = false, action: @escaping () -> Void) -> some View {
+    private func actionButton(_ title: String, icon: String, disabled: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 10) {
-                Image(systemName: icon)
-                    .foregroundColor(.accentColor)
+                Image(systemName: icon).foregroundStyle(.blue)
                 Text(title)
-                    .multilineTextAlignment(.leading)
-                Spacer()
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.vertical, 12)
-            .padding(.horizontal, 10)
-            .background(Color(.secondarySystemBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .padding(12)
+            .background(Color(.systemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
         }
         .buttonStyle(.plain)
         .disabled(disabled)
-        .opacity(disabled ? 0.6 : 1)
+        .opacity(disabled ? 0.6 : 1.0)
     }
 
     private func run() {
         errorText = nil
         output = ""
+        backendWarning = nil
         guard let modelURL, let tokenizerURL else { return }
         let promptText = prompt
         let backend = selectedBackend
@@ -186,6 +170,9 @@ struct LLMView: View {
                 await MainActor.run {
                     self.output = text
                     self.activeBackend = eng.activeBackend
+                    if backend == .metal && !eng.activeBackend.lowercased().contains("metal") {
+                        self.backendWarning = "Metal requested, fell back to \(eng.activeBackend)."
+                    }
                     self.isRunning = false
                 }
             } catch {
@@ -199,19 +186,20 @@ struct LLMView: View {
 
     private func downloadSampleAssets() {
         errorText = nil
+        if let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2FileName),
+           let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerFileName) {
+            modelURL = model
+            tokenizerURL = tok
+            downloadStatus = "Using existing files in Documents."
+            return
+        }
+
         downloadStatus = "Downloading sample files..."
         isDownloading = true
-
         Task {
             do {
-                async let model = RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.smollm2Int8,
-                    fileName: "smollm2-135m-int8.cellm"
-                )
-                async let tok = RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.smollm2Tokenizer,
-                    fileName: "tokenizer-smollm2-135m.json"
-                )
+                async let model = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.smollm2Int8, fileName: DemoAssetLinks.smollm2FileName)
+                async let tok = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.smollm2Tokenizer, fileName: DemoAssetLinks.smollm2TokenizerFileName)
                 let (modelPath, tokPath) = try await (model, tok)
                 await MainActor.run {
                     self.modelURL = modelPath
@@ -228,6 +216,18 @@ struct LLMView: View {
             }
         }
     }
+
+    private func restoreAssets() {
+        if modelURL == nil, let url = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2FileName) {
+            modelURL = url
+        }
+        if tokenizerURL == nil, let url = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerFileName) {
+            tokenizerURL = url
+        }
+        if modelURL != nil && tokenizerURL != nil && downloadStatus.isEmpty {
+            downloadStatus = "Loaded local sample files."
+        }
+    }
 }
 
 struct DocumentPicker: UIViewControllerRepresentable {
@@ -241,15 +241,11 @@ struct DocumentPicker: UIViewControllerRepresentable {
     }
 
     func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onPick: onPick)
-    }
+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
 
     final class Coordinator: NSObject, UIDocumentPickerDelegate {
         let onPick: (URL) -> Void
         init(onPick: @escaping (URL) -> Void) { self.onPick = onPick }
-
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
             guard let u = urls.first else { return }
             onPick(u)

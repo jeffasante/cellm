@@ -15,10 +15,8 @@ targets:
         SWIFT_VERSION: 5.9
         CURRENT_PROJECT_VERSION: 1
         MARKETING_VERSION: 0.1.0
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
-        INFOPLIST_KEY_UILaunchScreen: {}
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: CellmDemo/Info.plist
         CODE_SIGN_STYLE: Automatic
         EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
     dependencies:

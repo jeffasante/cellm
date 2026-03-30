@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		1FE390EF93C06279DF216350 /* VLMView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C41C6ACC67DB89688E2DD75C /* VLMView.swift */; };
 		5822954A4AE68BD3B99C4153 /* CellmDemoApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C06F9AA20D6B94DC93953B0 /* CellmDemoApp.swift */; };
+		59989EC4628E2164944064EE /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 55CD44D025518BE135578DC4 /* LaunchScreen.storyboard */; };
 		7AEA529617090703D7E290F3 /* CellmFFI.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9B903FB69C7D80C5F0591819 /* CellmFFI.xcframework */; };
 		9FE1EA23FE6475D0D610BBD4 /* CellmFFI.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3F2F7738B8978FD418C1ADB /* CellmFFI.swift */; };
 		A10009244AD41A2F9570318C /* RemoteAssets.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCEC5DC5BFAE13E76FCCD771 /* RemoteAssets.swift */; };
@@ -32,7 +33,9 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		01D85AA09B04048C83767567 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		2ACCC6A3F50B75CBA1584E38 /* CellmDemo.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = CellmDemo.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		55CD44D025518BE135578DC4 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 		6C06F9AA20D6B94DC93953B0 /* CellmDemoApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CellmDemoApp.swift; sourceTree = "<group>"; };
 		8B7D734A1A2006E827AB2D78 /* LLMView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LLMView.swift; sourceTree = "<group>"; };
 		9B903FB69C7D80C5F0591819 /* CellmFFI.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = CellmFFI.xcframework; path = ../swift/CellmFFI.xcframework; sourceTree = "<group>"; };
@@ -68,6 +71,8 @@
 			children = (
 				6C06F9AA20D6B94DC93953B0 /* CellmDemoApp.swift */,
 				B3F2F7738B8978FD418C1ADB /* CellmFFI.swift */,
+				01D85AA09B04048C83767567 /* Info.plist */,
+				55CD44D025518BE135578DC4 /* LaunchScreen.storyboard */,
 				8B7D734A1A2006E827AB2D78 /* LLMView.swift */,
 				C36BB1B851CF5C450D6A4B32 /* README.md */,
 				DCEC5DC5BFAE13E76FCCD771 /* RemoteAssets.swift */,
@@ -153,6 +158,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				59989EC4628E2164944064EE /* LaunchScreen.storyboard in Resources */,
 				D5D7EDF0C68AB9D40EB605C2 /* README.md in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -242,11 +248,8 @@
 					"$(inherited)",
 					"\"../swift\"",
 				);
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
-				INFOPLIST_KEY_UILaunchScreen = {
-				};
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = CellmDemo/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -273,11 +276,8 @@
 					"$(inherited)",
 					"\"../swift\"",
 				);
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
-				INFOPLIST_KEY_UILaunchScreen = {
-				};
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = CellmDemo/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

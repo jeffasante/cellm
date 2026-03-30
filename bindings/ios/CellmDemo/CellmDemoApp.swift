@@ -4,13 +4,19 @@ import SwiftUI
 struct CellmDemoApp: App {
     var body: some Scene {
         WindowGroup {
-            TabView {
-                LLMView()
-                    .tabItem { Text("LLM") }
-                VLMView()
-                    .tabItem { Text("VLM") }
+            ZStack {
+                Color(.systemGroupedBackground).ignoresSafeArea()
+                TabView {
+                    LLMView()
+                        .tabItem {
+                            Label("LLM", systemImage: "text.bubble")
+                        }
+                    VLMView()
+                        .tabItem {
+                            Label("VLM", systemImage: "photo.on.rectangle")
+                        }
+                }
             }
         }
     }
 }
-

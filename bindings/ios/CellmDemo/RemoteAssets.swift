@@ -5,9 +5,23 @@ enum DemoAssetLinks {
     static let smolvlmInt8 = "https://github.com/jeffasante/cellm/blob/main/models/smolvlm-256m-int8.cellm"
     static let rococoImage = "https://github.com/jeffasante/cellm/blob/main/models/test_images/rococo_1.jpg"
     static let smollm2Tokenizer = "https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/main/tokenizer.json"
+    static let smollm2FileName = "smollm2-135m-int8.cellm"
+    static let smollm2TokenizerFileName = "tokenizer-smollm2-135m.json"
+    static let smolvlmFileName = "smolvlm-256m-int8.cellm"
+    static let rococoFileName = "rococo_1.jpg"
 }
 
 enum RemoteAssets {
+    static func documentsURL(fileName: String) -> URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        return docs.appendingPathComponent(fileName)
+    }
+
+    static func existingDocumentsFile(fileName: String) -> URL? {
+        let url = documentsURL(fileName: fileName)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
     static func normalizeGitHubBlobURL(_ raw: String) throws -> URL {
         guard let url = URL(string: raw) else {
             throw CellmError.message("Invalid URL: \(raw)")
@@ -88,8 +102,7 @@ enum RemoteAssets {
             throw CellmError.message(lastError)
         }
 
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let destURL = docs.appendingPathComponent(targetName)
+        let destURL = documentsURL(fileName: targetName)
 
         if FileManager.default.fileExists(atPath: destURL.path) {
             try FileManager.default.removeItem(at: destURL)

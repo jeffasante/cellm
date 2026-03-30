@@ -96,7 +96,7 @@ enum RemoteAssets {
         return [url]
     }
 
-    static func downloadToDocuments(from rawURL: String, fileName: String? = nil) async throws -> URL {
+    static func downloadToDocuments(from rawURL: String, fileName: String? = nil, progress: ((Double) -> Void)? = nil) async throws -> URL {
         let urls = try candidateURLs(from: rawURL)
         let targetName = fileName ?? urls[0].lastPathComponent
 
@@ -104,10 +104,27 @@ enum RemoteAssets {
         var lastError = "Download failed"
         for url in urls {
             do {
-                let (data, response) = try await URLSession.shared.data(from: url)
+                let (bytes, response) = try await URLSession.shared.bytes(from: url)
                 if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
                     lastError = "Download failed: HTTP \(http.statusCode)"
                     continue
+                }
+                let expected = response.expectedContentLength
+                var data = Data()
+                if expected > 0, expected < Int64(Int.max) {
+                    data.reserveCapacity(Int(expected))
+                }
+                var received: Int64 = 0
+                for try await byte in bytes {
+                    data.append(byte)
+                    received += 1
+                    if expected > 0 {
+                        let fraction = min(1.0, Double(received) / Double(expected))
+                        progress?(fraction)
+                    }
+                }
+                if expected <= 0 {
+                    progress?(1.0)
                 }
                 if isLikelyHTML(data) {
                     lastError = "Download returned HTML instead of model data"

@@ -4,6 +4,7 @@ use std::path::Path;
 use std::slice;
 
 use crate::{vlm::VlmRunConfig, BackendKind, Engine, EngineConfig, SessionId};
+use cellm_scheduler::ThermalLevel;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
@@ -404,6 +405,60 @@ pub extern "C" fn cellm_session_cancel(engine: cellm_engine_t, session: SessionI
             -1
         }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn cellm_session_suspend(engine: cellm_engine_t, session: SessionId) -> i32 {
+    if engine == 0 {
+        set_last_error("session_suspend: null engine".to_string());
+        return -1;
+    }
+    let e = unsafe { &mut *(engine as *mut Engine) };
+    match e.suspend_session(session) {
+        Ok(_) => 0,
+        Err(err) => {
+            set_last_error(format!("session_suspend failed: {err}"));
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cellm_session_resume(engine: cellm_engine_t, session: SessionId) -> i32 {
+    if engine == 0 {
+        set_last_error("session_resume: null engine".to_string());
+        return -1;
+    }
+    let e = unsafe { &mut *(engine as *mut Engine) };
+    match e.resume_session(session) {
+        Ok(_) => 0,
+        Err(err) => {
+            set_last_error(format!("session_resume failed: {err}"));
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cellm_engine_set_thermal_level(engine: cellm_engine_t, level: u32) -> i32 {
+    if engine == 0 {
+        set_last_error("set_thermal_level: null engine".to_string());
+        return -1;
+    }
+    let thermal = match level {
+        0 => ThermalLevel::Nominal,
+        1 => ThermalLevel::Elevated,
+        2 => ThermalLevel::Critical,
+        3 => ThermalLevel::Emergency,
+        _ => {
+            set_last_error(format!("set_thermal_level: invalid level {level} (expected 0..3)"));
+            return -1;
+        }
+    };
+
+    let e = unsafe { &mut *(engine as *mut Engine) };
+    e.set_thermal_level(thermal);
+    0
 }
 
 #[no_mangle]

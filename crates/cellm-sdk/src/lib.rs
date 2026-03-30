@@ -6,7 +6,7 @@ use cellm_cache::{KVCache, PageTable};
 use cellm_core::KvCacheLayout;
 use cellm_kernels::MetalKernels;
 use cellm_model::{llama::LlamaRunner, qwen::QwenRunner, CellmFile, ModelConfig};
-use cellm_scheduler::RoundRobinScheduler;
+use cellm_scheduler::{RoundRobinScheduler, Session as SchedSession, SessionState, ThermalLevel, ThermalPolicy};
 use serde_json::Value;
 
 pub type SessionId = u64;
@@ -48,7 +48,7 @@ impl Default for EngineConfig {
 }
 
 #[derive(Debug)]
-struct Session {
+struct EngineSession {
     page_table: PageTable,
     next_pos: usize,
     last_token: Option<u32>,
@@ -71,9 +71,11 @@ pub struct Engine {
     runner: Runner,
     backend: BackendKind,
     kv_cache: KVCache,
-    sessions: HashMap<SessionId, Session>,
+    sessions: HashMap<SessionId, EngineSession>,
+    session_meta: HashMap<SessionId, SchedSession>,
     next_session_id: SessionId,
     rr: RoundRobinScheduler,
+    thermal: ThermalPolicy,
     top_k: usize,
     temperature: f64,
     repeat_penalty: f64,
@@ -123,8 +125,10 @@ impl Engine {
             backend: selected_backend,
             kv_cache,
             sessions: HashMap::new(),
+            session_meta: HashMap::new(),
             next_session_id: 1,
             rr: RoundRobinScheduler::new(),
+            thermal: ThermalPolicy::default(),
             top_k: engine_cfg.top_k,
             temperature: engine_cfg.temperature,
             repeat_penalty: engine_cfg.repeat_penalty,
@@ -153,7 +157,7 @@ impl Engine {
 
         self.sessions.insert(
             id,
-            Session {
+            EngineSession {
                 page_table,
                 next_pos: 0,
                 last_token: None,
@@ -161,7 +165,7 @@ impl Engine {
                 rng: XorShift64::seeded(self.seed_for_session(id)),
             },
         );
-        self.rr.add(id);
+        self.session_meta.insert(id, SchedSession::new(id));
         id
     }
 
@@ -175,6 +179,12 @@ impl Engine {
             .sessions
             .get_mut(&id)
             .ok_or_else(|| anyhow::anyhow!("unknown session id: {id}"))?;
+        let meta = self
+            .session_meta
+            .get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("missing session metadata for session id: {id}"))?;
+        meta.transition(SessionState::Prefill)
+            .map_err(|e| anyhow::anyhow!("session transition failed: {e:?}"))?;
 
         let mut next = 0u32;
         for (i, &tok) in tokens.iter().enumerate() {
@@ -200,6 +210,10 @@ impl Engine {
 
         s.next_pos += tokens.len();
         s.last_token = Some(next);
+        meta.add_prompt_tokens(tokens.len());
+        meta.transition(SessionState::Decoding)
+            .map_err(|e| anyhow::anyhow!("session transition failed: {e:?}"))?;
+        self.rr.add(id);
         Ok(next)
     }
 
@@ -209,7 +223,7 @@ impl Engine {
         let repeat_penalty = self.repeat_penalty;
         let repeat_window = self.repeat_window;
 
-        if self.rr.is_empty() {
+        if self.thermal.should_pause_decode() || self.rr.is_empty() {
             return Ok(None);
         }
 
@@ -224,6 +238,13 @@ impl Engine {
                 Some(s) => s,
                 None => continue,
             };
+            let meta = match self.session_meta.get_mut(&id) {
+                Some(m) => m,
+                None => continue,
+            };
+            if meta.state() == SessionState::Suspended || meta.state() == SessionState::Terminal {
+                continue;
+            }
 
             let Some(cur) = s.last_token else {
                 continue;
@@ -249,6 +270,7 @@ impl Engine {
             s.recent.push(cur);
             s.last_token = Some(next);
             s.next_pos += 1;
+            meta.add_generated_token();
             return Ok(Some((id, next)));
         }
 
@@ -267,7 +289,53 @@ impl Engine {
         if let Runner::Qwen(r) = &mut self.runner {
             r.cancel_session(id);
         }
+        if let Some(meta) = self.session_meta.get_mut(&id) {
+            let _ = meta.transition(SessionState::Terminal);
+        }
+        self.session_meta.remove(&id);
         Ok(())
+    }
+
+    pub fn suspend_session(&mut self, id: SessionId) -> Result<()> {
+        let meta = self
+            .session_meta
+            .get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("unknown session id: {id}"))?;
+        meta.transition(SessionState::Suspended)
+            .map_err(|e| anyhow::anyhow!("session transition failed: {e:?}"))?;
+        self.rr.remove(id);
+        Ok(())
+    }
+
+    pub fn resume_session(&mut self, id: SessionId) -> Result<()> {
+        let s = self
+            .sessions
+            .get(&id)
+            .ok_or_else(|| anyhow::anyhow!("unknown session id: {id}"))?;
+        let meta = self
+            .session_meta
+            .get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("missing session metadata for session id: {id}"))?;
+
+        let target = if s.last_token.is_some() {
+            SessionState::Decoding
+        } else {
+            SessionState::Queued
+        };
+        meta.transition(target)
+            .map_err(|e| anyhow::anyhow!("session transition failed: {e:?}"))?;
+        if s.last_token.is_some() {
+            self.rr.add(id);
+        }
+        Ok(())
+    }
+
+    pub fn set_thermal_level(&mut self, level: ThermalLevel) {
+        self.thermal.set_level(level);
+    }
+
+    pub fn thermal_level(&self) -> ThermalLevel {
+        self.thermal.level()
     }
 
     pub fn stats(&self) -> EngineStats {
@@ -275,6 +343,7 @@ impl Engine {
             active_sessions: self.sessions.len(),
             used_kv_blocks: self.kv_cache.allocator().in_use_count(),
             free_kv_blocks: self.kv_cache.allocator().free_count(),
+            thermal_level: self.thermal.level(),
         }
     }
 
@@ -431,6 +500,7 @@ pub struct EngineStats {
     pub active_sessions: usize,
     pub used_kv_blocks: usize,
     pub free_kv_blocks: usize,
+    pub thermal_level: ThermalLevel,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -89,6 +89,12 @@ size_t cellm_tokenizer_decode(
 // Sessions.
 cellm_session_t cellm_session_create(cellm_engine_t engine);
 int32_t cellm_session_cancel(cellm_engine_t engine, cellm_session_t session);
+int32_t cellm_session_suspend(cellm_engine_t engine, cellm_session_t session);
+int32_t cellm_session_resume(cellm_engine_t engine, cellm_session_t session);
+
+// Thermal level for scheduler behavior:
+// 0=Nominal, 1=Elevated, 2=Critical, 3=Emergency
+int32_t cellm_engine_set_thermal_level(cellm_engine_t engine, uint32_t level);
 
 // Prompt/turn input (token ids only, for now).
 int32_t cellm_submit_tokens(

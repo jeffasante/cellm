@@ -58,8 +58,10 @@ struct LLMView: View {
     @State private var isRunning: Bool = false
     @State private var errorText: String?
     @State private var selectedBackend: CellmBackend = .metal
+    @State private var selectedThermalLevel: CellmThermalLevel = .nominal
     @State private var activeBackend: String = ""
     @State private var downloadStatus: String = ""
+    @State private var downloadProgress: Double = 0.0
     @State private var isDownloading: Bool = false
     @State private var backendWarning: String?
     @State private var selectedPreset: GenerationPreset = .chat
@@ -126,8 +128,18 @@ struct LLMView: View {
             actionButton("Run Qwen Smoke Test", icon: "bolt.circle", disabled: isRunning || modelURL == nil || tokenizerURL == nil) {
                 runQwenSmokeTest()
             }
+            actionButton("Run Scheduler Smoke (Suspend/Resume)", icon: "pause.circle", disabled: isRunning || modelURL == nil || tokenizerURL == nil) {
+                runSchedulerSmokeTest()
+            }
             if !downloadStatus.isEmpty {
                 Text(downloadStatus).font(.footnote).foregroundStyle(.secondary)
+            }
+            if isDownloading {
+                ProgressView(value: downloadProgress)
+                    .progressViewStyle(.linear)
+                Text("\(Int((downloadProgress * 100.0).rounded()))%")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
             if !selectedSampleLabel.isEmpty {
                 Text("Selected sample: \(selectedSampleLabel)")
@@ -178,6 +190,12 @@ struct LLMView: View {
             Picker("Requested", selection: $selectedBackend) {
                 ForEach(CellmBackend.allCases) { backend in
                     Text(backend.label).tag(backend)
+                }
+            }
+            .pickerStyle(.segmented)
+            Picker("Thermal", selection: $selectedThermalLevel) {
+                ForEach(CellmThermalLevel.allCases) { level in
+                    Text(level.label).tag(level)
                 }
             }
             .pickerStyle(.segmented)
@@ -272,7 +290,7 @@ struct LLMView: View {
         .opacity(disabled ? 0.6 : 1.0)
     }
 
-    private func run() {
+    private func run(exerciseSuspendResume: Bool = false) {
         // Dismiss keyboard
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
 
@@ -283,6 +301,7 @@ struct LLMView: View {
         guard let modelURL, let tokenizerURL else { return }
         let promptText = prompt
         let backend = selectedBackend
+        let thermal = selectedThermalLevel
         let preset = selectedPreset
 
         isRunning = true
@@ -299,7 +318,12 @@ struct LLMView: View {
                     seed: 1,
                     backend: backend
                 )
-                let text = try eng.generate(prompt: promptText, maxNewTokens: preset.maxTokens)
+                let text = try eng.generate(
+                    prompt: promptText,
+                    maxNewTokens: preset.maxTokens,
+                    thermalLevel: thermal,
+                    exerciseSuspendResume: exerciseSuspendResume
+                )
                 await MainActor.run {
                     self.output = prettyOutput(text)
                     if let stats = eng.lastGenerationStats {
@@ -329,23 +353,50 @@ struct LLMView: View {
             modelURL = model
             tokenizerURL = tok
             downloadStatus = "Using existing files in Documents."
+            downloadProgress = 0
             return
         }
 
         downloadStatus = "Downloading Qwen sample files..."
+        downloadProgress = 0
         isDownloading = true
         Task {
             do {
-                async let model = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.qwen35Int4TextOnly, fileName: DemoAssetLinks.qwen35FileName)
-                async let tok = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.qwen35Tokenizer, fileName: DemoAssetLinks.qwen35TokenizerFileName)
-                async let tokCfg = RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.qwen35TokenizerConfig,
-                    fileName: DemoAssetLinks.qwen35TokenizerConfigFileName
+                let totalFiles = 3.0
+                let modelPath = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.qwen35Int4TextOnly,
+                    fileName: DemoAssetLinks.qwen35FileName,
+                    progress: { p in
+                        Task { @MainActor in
+                            self.downloadProgress = min(1.0, (0.0 + p) / totalFiles)
+                            self.downloadStatus = "Downloading Qwen sample files... \(Int((self.downloadProgress * 100).rounded()))%"
+                        }
+                    }
                 )
-                let (modelPath, tokPath, _) = try await (model, tok, tokCfg)
+                let tokPath = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.qwen35Tokenizer,
+                    fileName: DemoAssetLinks.qwen35TokenizerFileName,
+                    progress: { p in
+                        Task { @MainActor in
+                            self.downloadProgress = min(1.0, (1.0 + p) / totalFiles)
+                            self.downloadStatus = "Downloading Qwen sample files... \(Int((self.downloadProgress * 100).rounded()))%"
+                        }
+                    }
+                )
+                _ = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.qwen35TokenizerConfig,
+                    fileName: DemoAssetLinks.qwen35TokenizerConfigFileName,
+                    progress: { p in
+                        Task { @MainActor in
+                            self.downloadProgress = min(1.0, (2.0 + p) / totalFiles)
+                            self.downloadStatus = "Downloading Qwen sample files... \(Int((self.downloadProgress * 100).rounded()))%"
+                        }
+                    }
+                )
                 await MainActor.run {
                     self.modelURL = modelPath
                     self.tokenizerURL = tokPath
+                    self.downloadProgress = 1.0
                     self.downloadStatus = "Saved: \(modelPath.lastPathComponent), \(tokPath.lastPathComponent)"
                     self.isDownloading = false
                 }
@@ -368,23 +419,50 @@ struct LLMView: View {
             modelURL = model
             tokenizerURL = tok
             downloadStatus = "Using existing files in Documents."
+            downloadProgress = 0
             return
         }
 
         downloadStatus = "Downloading SmolLM sample files..."
+        downloadProgress = 0
         isDownloading = true
         Task {
             do {
-                async let model = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.smollm2Int8, fileName: DemoAssetLinks.smollm2FileName)
-                async let tok = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.smollm2Tokenizer, fileName: DemoAssetLinks.smollm2TokenizerFileName)
-                async let tokCfg = RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.smollm2TokenizerConfig,
-                    fileName: DemoAssetLinks.smollm2TokenizerConfigFileName
+                let totalFiles = 3.0
+                let modelPath = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.smollm2Int8,
+                    fileName: DemoAssetLinks.smollm2FileName,
+                    progress: { p in
+                        Task { @MainActor in
+                            self.downloadProgress = min(1.0, (0.0 + p) / totalFiles)
+                            self.downloadStatus = "Downloading SmolLM sample files... \(Int((self.downloadProgress * 100).rounded()))%"
+                        }
+                    }
                 )
-                let (modelPath, tokPath, _) = try await (model, tok, tokCfg)
+                let tokPath = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.smollm2Tokenizer,
+                    fileName: DemoAssetLinks.smollm2TokenizerFileName,
+                    progress: { p in
+                        Task { @MainActor in
+                            self.downloadProgress = min(1.0, (1.0 + p) / totalFiles)
+                            self.downloadStatus = "Downloading SmolLM sample files... \(Int((self.downloadProgress * 100).rounded()))%"
+                        }
+                    }
+                )
+                _ = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.smollm2TokenizerConfig,
+                    fileName: DemoAssetLinks.smollm2TokenizerConfigFileName,
+                    progress: { p in
+                        Task { @MainActor in
+                            self.downloadProgress = min(1.0, (2.0 + p) / totalFiles)
+                            self.downloadStatus = "Downloading SmolLM sample files... \(Int((self.downloadProgress * 100).rounded()))%"
+                        }
+                    }
+                )
                 await MainActor.run {
                     self.modelURL = modelPath
                     self.tokenizerURL = tokPath
+                    self.downloadProgress = 1.0
                     self.downloadStatus = "Saved: \(modelPath.lastPathComponent), \(tokPath.lastPathComponent)"
                     self.isDownloading = false
                 }
@@ -443,6 +521,7 @@ struct LLMView: View {
         tokenizerURL = nil
         selectedSampleLabel = ""
         downloadStatus = "Local sample files deleted."
+        downloadProgress = 0
     }
 
     private func forceRedownload() {
@@ -488,6 +567,12 @@ struct LLMView: View {
         prompt = "Return exactly one uppercase letter: R"
         selectedPreset = .strict
         run()
+    }
+
+    private func runSchedulerSmokeTest() {
+        prompt = "Return exactly one uppercase letter: R"
+        selectedPreset = .strict
+        run(exerciseSuspendResume: true)
     }
 
     private func formatDiagnostics(stats: LlmGenerationStats) -> String {

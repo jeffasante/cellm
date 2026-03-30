@@ -14,6 +14,23 @@ enum CellmBackend: UInt32, CaseIterable, Identifiable {
     }
 }
 
+enum CellmThermalLevel: UInt32, CaseIterable, Identifiable {
+    case nominal = 0
+    case elevated = 1
+    case critical = 2
+    case emergency = 3
+
+    var id: UInt32 { rawValue }
+    var label: String {
+        switch self {
+        case .nominal: return "Nominal"
+        case .elevated: return "Elevated"
+        case .critical: return "Critical"
+        case .emergency: return "Emergency"
+        }
+    }
+}
+
 enum CellmError: Error, CustomStringConvertible {
     case message(String)
 
@@ -130,18 +147,24 @@ final class CellmEngine {
         }
     }
 
-    func generate(prompt: String, maxNewTokens: Int) throws -> String {
+    func generate(prompt: String, maxNewTokens: Int, thermalLevel: CellmThermalLevel = .nominal, exerciseSuspendResume: Bool = false) throws -> String {
         lastGenerationStats = nil
         let promptText = Self.wrapPrompt(prompt, tokenizerURL: tokenizer.tokenizerURL)
         let promptTokens = try tokenizer.encode(promptText)
 
         let tStart = Date()
+        try setThermalLevel(thermalLevel)
         var next: UInt32 = 0
         let rc = promptTokens.withUnsafeBufferPointer { buf in
             cellm_submit_tokens(handle, session, buf.baseAddress, buf.count, &next)
         }
         if rc != 0 { throw CellmError.message(CellmFFI.lastError()) }
         let tAfterPrefill = Date()
+
+        if exerciseSuspendResume {
+            try suspendSession()
+            try resumeSession()
+        }
 
         var out = ""
         let firstPiece = try tokenizer.decodeOne(next)
@@ -187,6 +210,21 @@ final class CellmEngine {
             firstPiece: firstPiece
         )
         return out
+    }
+
+    func setThermalLevel(_ level: CellmThermalLevel) throws {
+        let rc = cellm_engine_set_thermal_level(handle, level.rawValue)
+        if rc != 0 { throw CellmError.message(CellmFFI.lastError()) }
+    }
+
+    func suspendSession() throws {
+        let rc = cellm_session_suspend(handle, session)
+        if rc != 0 { throw CellmError.message(CellmFFI.lastError()) }
+    }
+
+    func resumeSession() throws {
+        let rc = cellm_session_resume(handle, session)
+        if rc != 0 { throw CellmError.message(CellmFFI.lastError()) }
     }
 
     private static func wrapPrompt(_ prompt: String, tokenizerURL: URL) -> String {

@@ -113,6 +113,23 @@ Sample output:
 Rust programming serves as a concise and concise language that simplifies the creation of programs, making it easier to understand the
 ```
 
+Qwen int4 Metal run note:
+- `--backend metal` currently reports: `Backend: metal (smoke ok). Forward path currently uses CPU math kernels.`
+- This means Metal device/kernel smoke passes, but Qwen forward execution in `infer` is still CPU-path today.
+
+Repro command:
+```bash
+./target/release/infer \
+  --model models/qwen3.5-0.8b-int4-textonly.cellm \
+  --tokenizer models/hf/qwen3.5-0.8b/tokenizer.json \
+  --prompt "Return exactly one uppercase letter: R" \
+  --chat \
+  --chat-format chatml \
+  --gen 4 \
+  --temperature 0 \
+  --backend metal
+```
+
 Run prompt test on `qwen3.5-0.8b-int4-textonly.cellm`:
 ```bash
 ./target/release/infer \
@@ -342,6 +359,13 @@ Quantized checkpoints:
 - Some HF folders (e.g. 4-bit affine: `uint32` packed weights + `*.scales`/`*.biases`) require expanding weights to f16 during conversion: add `--dequant-4bit-affine`. This increases output size.
 
 **Recommended Model**: [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M/tree/main)
+
+### Sample Models
+Sample `.cellm` checkpoints are included in the repository (tracked via Git LFS) and can be used for immediate testing:
+- `models/smollm2-135m-int8.cellm`
+- `models/smolvlm-256m-int8.cellm`
+- `models/qwen3.5-0.8b-int4-textonly.cellm`
+
 
 ---
 

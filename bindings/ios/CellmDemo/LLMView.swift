@@ -268,7 +268,7 @@ struct LLMView: View {
             if let backendWarning {
                 Text(backendWarning).font(.footnote).foregroundStyle(.orange)
             }
-            Text("Note: on Qwen, Metal now accelerates linear layers; attention/KV paths still use CPU fallbacks in this phase.")
+            Text("Note: Qwen+Metal runs in strict mode in this build (no CPU fallback in runner math).")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
             if isQwenSelected {
@@ -391,6 +391,7 @@ struct LLMView: View {
         let shouldForceStrictForExperimentalQwen = (qwenVariant == .experimental && selectedPreset != .strict)
         let preset = shouldForceStrictForExperimentalQwen ? GenerationPreset.strict : selectedPreset
         let isExperimentalQwen = (qwenVariant == .experimental)
+        let isQwenSelectedForRun = isQwenSelected
         let requestedMaxTokens = maxTokensOverride ?? preset.maxTokens
         let effectiveMaxTokens = isExperimentalQwen ? min(requestedMaxTokens, 4) : requestedMaxTokens
         let tokensPerBlock: UInt32 = 8
@@ -402,6 +403,9 @@ struct LLMView: View {
                 var effectiveBackend = backend
                 var preflightWarning: String?
                 if backend == .metal, let metalErr = CellmFFI.metalSmokeError() {
+                    if isQwenSelectedForRun {
+                        throw CellmError.message("Qwen full-metal requested but Metal is unavailable: \(metalErr)")
+                    }
                     effectiveBackend = .cpu
                     preflightWarning = "Metal unavailable (\(metalErr)). Using CPU fallback for this run."
                 }
@@ -416,7 +420,8 @@ struct LLMView: View {
                     repeatPenalty: preset.repeatPenalty,
                     repeatWindow: preset.repeatWindow,
                     seed: 1,
-                    backend: effectiveBackend
+                    backend: effectiveBackend,
+                    allowBackendFallback: !(isQwenSelectedForRun && backend == .metal)
                 )
                 let text = try eng.generate(
                     prompt: promptText,

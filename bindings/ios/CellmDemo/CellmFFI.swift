@@ -125,7 +125,7 @@ final class CellmEngine {
     let activeBackend: String
     private(set) var lastGenerationStats: LlmGenerationStats?
 
-    init(modelURL: URL, tokenizer: CellmTokenizer, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 256, topK: UInt32 = 40, temperature: Float = 0.2, repeatPenalty: Float = 1.08, repeatWindow: UInt32 = 96, seed: UInt64 = 1, backend: CellmBackend = .metal) throws {
+    init(modelURL: URL, tokenizer: CellmTokenizer, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 256, topK: UInt32 = 40, temperature: Float = 0.2, repeatPenalty: Float = 1.08, repeatWindow: UInt32 = 96, seed: UInt64 = 1, backend: CellmBackend = .metal, allowBackendFallback: Bool = true) throws {
         self.tokenizer = tokenizer
         let path = modelURL.path
         let requestedBackend: CellmBackend = backend
@@ -136,7 +136,7 @@ final class CellmEngine {
 
         // On some devices/SDK states, Metal init can fail without a useful FFI error detail.
         // Retry with CPU to keep generation usable and surface fallback via activeBackend.
-        if h == 0 && requestedBackend == .metal {
+        if h == 0 && requestedBackend == .metal && allowBackendFallback {
             h = path.withCString { cstr in
                 cellm_engine_create_v3(cstr, tokensPerBlock, totalBlocks, topK, temperature, repeatPenalty, repeatWindow, seed, CellmBackend.cpu.rawValue)
             }

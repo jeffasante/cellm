@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use cellm_cache::{KVCache, PageTable};
+use cellm_cache::{KVCache, KvStorageKind, PageTable};
 use cellm_core::KvCacheLayout;
 use cellm_kernels::MetalKernels;
 use cellm_model::{llama::LlamaRunner, qwen::QwenRunner, CellmFile, ModelConfig};
@@ -85,7 +85,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(model_path: &Path, engine_cfg: EngineConfig) -> Result<Self> {
-        let mut selected_backend = resolve_backend(engine_cfg.backend);
+        let selected_backend = resolve_backend(engine_cfg.backend);
         let file = CellmFile::load(model_path)?;
         let header = file.header.clone();
 
@@ -100,8 +100,8 @@ impl Engine {
         };
         if selected_backend == BackendKind::Metal {
             if let Runner::Qwen(r) = &mut runner {
-                if !r.enable_metal_linear_backend() {
-                    selected_backend = BackendKind::Cpu;
+                if !r.enable_metal_full_backend() {
+                    anyhow::bail!("Qwen full-metal backend requested but unavailable");
                 }
             }
         }
@@ -123,7 +123,11 @@ impl Engine {
             num_kv_heads: cfg.num_key_value_heads,
             head_dim,
         };
-        let kv_cache = KVCache::new(layout)?;
+        let storage_kind = match selected_backend {
+            BackendKind::Cpu => KvStorageKind::Cpu,
+            BackendKind::Metal => KvStorageKind::Metal,
+        };
+        let kv_cache = KVCache::new_with_kind(layout, storage_kind)?;
 
         Ok(Self {
             model_path: model_path.to_path_buf(),

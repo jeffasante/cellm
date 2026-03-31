@@ -3,7 +3,7 @@ use std::path::Path;
 use bytemuck::cast_slice;
 use cellm_cache::{KVCache, PageTable};
 use cellm_core::CoreError;
-use cellm_kernels::cpu_kernels::{attention_single_token_f32_gqa, rms_norm_f32, rope_inplace_f32};
+use cellm_kernels::cpu_kernels::{rms_norm_f32, rope_inplace_f32};
 use half::f16;
 
 use crate::{CellmFile, ModelConfig};
@@ -143,11 +143,7 @@ impl LlamaRunner {
         let mut up = vec![0.0f32; cfg.intermediate_size];
         let mut down = vec![0.0f32; hidden];
 
-        // Gather buffers (resized per layer).
-        let mut k_seq: Vec<f32> = Vec::new();
-        let mut v_seq: Vec<f32> = Vec::new();
-        let mut k_tok = vec![0.0f32; kv_dim];
-        let mut v_tok = vec![0.0f32; kv_dim];
+        let mut gather_bases: Vec<usize> = Vec::new();
 
         for layer in 0..self.max_layers {
             // Attention input norm.
@@ -191,9 +187,9 @@ impl LlamaRunner {
 
             // Gather historical K/V and run attention for this token.
             let seq = page_table.token_count();
-            k_seq.resize(seq * kv_dim, 0.0);
-            v_seq.resize(seq * kv_dim, 0.0);
             let cr = kv_cache.view();
+            gather_bases.clear();
+            gather_bases.reserve(seq);
             for tpos in 0..seq {
                 let b = page_table.block_for_token(tpos).map_err(|e| {
                     CoreError::Backend(format!("llama: block_for_token failed: {e}"))
@@ -201,21 +197,16 @@ impl LlamaRunner {
                 let o = page_table.offset_in_block(tpos).map_err(|e| {
                     CoreError::Backend(format!("llama: offset_in_block failed: {e}"))
                 })?;
-                cr.read_token(b, layer, o, &mut k_tok, &mut v_tok)?;
-                k_seq[tpos * kv_dim..(tpos + 1) * kv_dim].copy_from_slice(&k_tok);
-                v_seq[tpos * kv_dim..(tpos + 1) * kv_dim].copy_from_slice(&v_tok);
+                gather_bases.push(cr.layout.token_base_elem(b, layer, o)?);
             }
-
-            attention_single_token_f32_gqa(
+            cr.attention_single_token_gqa_from_bases(
+                &gather_bases,
                 &q,
-                &k_seq,
-                &v_seq,
-                seq,
                 n_heads,
                 n_kv_heads,
                 head_dim,
                 &mut attn_out,
-            );
+            )?;
 
             // o_proj: hidden <- hidden
             self.linear_f16_out_in(

@@ -4,7 +4,7 @@ use std::path::Path;
 use bytemuck::cast_slice;
 use cellm_cache::{KVCache, PageTable};
 use cellm_core::CoreError;
-use cellm_kernels::cpu_kernels::{attention_single_token_f32_gqa, rms_norm_f32};
+use cellm_kernels::cpu_kernels::rms_norm_f32;
 use cellm_kernels::metal::MetalMatmul;
 use cellm_kernels::MetalKernels;
 use half::f16;
@@ -38,6 +38,7 @@ pub struct QwenRunner {
     disable_full_attn_gate: bool,
     debug_pos: Option<usize>,
     linear_backend: QwenLinearBackend,
+    metal_strict: bool,
 }
 
 enum QwenLinearBackend {
@@ -103,6 +104,7 @@ impl QwenRunner {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok()),
             linear_backend: QwenLinearBackend::Cpu,
+            metal_strict: false,
         })
     }
 
@@ -126,11 +128,29 @@ impl QwenRunner {
         match MetalKernels::create_matmul() {
             Ok(ctx) => {
                 self.linear_backend = QwenLinearBackend::Metal { ctx };
+                self.metal_strict = false;
                 true
             }
             Err(e) => {
                 eprintln!("qwen: failed to enable metal linear backend: {e}");
                 self.linear_backend = QwenLinearBackend::Cpu;
+                self.metal_strict = false;
+                false
+            }
+        }
+    }
+
+    pub fn enable_metal_full_backend(&mut self) -> bool {
+        match MetalKernels::create_matmul() {
+            Ok(ctx) => {
+                self.linear_backend = QwenLinearBackend::Metal { ctx };
+                self.metal_strict = true;
+                true
+            }
+            Err(e) => {
+                eprintln!("qwen: failed to enable full metal backend: {e}");
+                self.linear_backend = QwenLinearBackend::Cpu;
+                self.metal_strict = false;
                 false
             }
         }
@@ -219,11 +239,7 @@ impl QwenRunner {
         let mut lin_tmp_kv: Vec<f32> = Vec::new();
         let mut lin_tmp_delta: Vec<f32> = Vec::new();
 
-        // Gather buffers.
-        let mut k_seq: Vec<f32> = Vec::new();
-        let mut v_seq: Vec<f32> = Vec::new();
-        let mut k_tok: Vec<f32> = Vec::new();
-        let mut v_tok: Vec<f32> = Vec::new();
+        let mut gather_bases: Vec<usize> = Vec::new();
 
         for layer in 0..self.max_layers {
             let layer_in_norm = l2norm_value(&x);
@@ -384,13 +400,11 @@ impl QwenRunner {
                     cv.write_token(block_id, layer, token_off, &k, &v)?;
                 }
 
-                // Gather historical K/V and run attention for this token.
+                // Gather historical token bases and run attention for this token.
                 let seq = page_table.token_count();
-                k_seq.resize(seq * kv_dim, 0.0);
-                v_seq.resize(seq * kv_dim, 0.0);
-                k_tok.resize(kv_dim, 0.0);
-                v_tok.resize(kv_dim, 0.0);
                 let cr = kv_cache.view();
+                gather_bases.clear();
+                gather_bases.reserve(seq);
                 for tpos in 0..seq {
                     let b = page_table.block_for_token(tpos).map_err(|e| {
                         CoreError::Backend(format!("qwen: block_for_token failed: {e}"))
@@ -398,22 +412,17 @@ impl QwenRunner {
                     let o = page_table.offset_in_block(tpos).map_err(|e| {
                         CoreError::Backend(format!("qwen: offset_in_block failed: {e}"))
                     })?;
-                    cr.read_token(b, layer, o, &mut k_tok, &mut v_tok)?;
-                    k_seq[tpos * kv_dim..(tpos + 1) * kv_dim].copy_from_slice(&k_tok);
-                    v_seq[tpos * kv_dim..(tpos + 1) * kv_dim].copy_from_slice(&v_tok);
+                    gather_bases.push(cr.layout.token_base_elem(b, layer, o)?);
                 }
-
                 attn_out.resize(q_main_dim, 0.0);
-                attention_single_token_f32_gqa(
+                cr.attention_single_token_gqa_from_bases(
+                    &gather_bases,
                     &q,
-                    &k_seq,
-                    &v_seq,
-                    seq,
                     n_heads,
                     n_kv_heads,
                     head_dim,
                     &mut attn_out,
-                );
+                )?;
 
                 // Optional output gate.
                 if !q_gate.is_empty() && !self.disable_full_attn_gate {
@@ -963,6 +972,11 @@ impl QwenRunner {
             }
             if metal_ok {
                 return Ok(());
+            }
+            if self.metal_strict {
+                return Err(CoreError::Backend(format!(
+                    "qwen full-metal: linear kernel failed for {weight_name}; CPU fallback disabled"
+                )));
             }
         }
 

@@ -72,10 +72,91 @@ impl KvCacheLayout {
     }
 }
 
+pub trait DeviceKvStorage: Send + Sync + std::fmt::Debug {
+    fn write_token_f16(
+        &mut self,
+        base: usize,
+        k_src: &[f16],
+        v_src: &[f16],
+    ) -> Result<(), CoreError>;
+
+    fn write_token_f32(
+        &mut self,
+        base: usize,
+        k_src: &[f32],
+        v_src: &[f32],
+    ) -> Result<(), CoreError>;
+
+    fn read_token_f16(
+        &self,
+        base: usize,
+        k_out: &mut [f16],
+        v_out: &mut [f16],
+    ) -> Result<(), CoreError>;
+
+    fn read_token_f32(
+        &self,
+        base: usize,
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> Result<(), CoreError>;
+
+    fn gather_tokens_f32(
+        &self,
+        bases: &[usize],
+        kv_dim: usize,
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> Result<(), CoreError>;
+
+    fn attention_single_token_gqa_f32(
+        &self,
+        bases: &[usize],
+        q: &[f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        out: &mut [f32],
+    ) -> Result<(), CoreError> {
+        let seq = bases.len();
+        let kv_dim = n_kv_heads.saturating_mul(head_dim);
+        if q.len() != n_heads.saturating_mul(head_dim) {
+            return Err(CoreError::Backend(format!(
+                "kv cache: attention q len mismatch {} expected {}",
+                q.len(),
+                n_heads.saturating_mul(head_dim)
+            )));
+        }
+        if out.len() != n_heads.saturating_mul(head_dim) {
+            return Err(CoreError::Backend(format!(
+                "kv cache: attention out len mismatch {} expected {}",
+                out.len(),
+                n_heads.saturating_mul(head_dim)
+            )));
+        }
+        if seq == 0 {
+            out.fill(0.0);
+            return Ok(());
+        }
+        let mut k_seq = vec![0.0f32; seq.saturating_mul(kv_dim)];
+        let mut v_seq = vec![0.0f32; seq.saturating_mul(kv_dim)];
+        self.gather_tokens_f32(bases, kv_dim, &mut k_seq, &mut v_seq)?;
+        attention_single_token_f32_gqa_local(
+            q,
+            &k_seq,
+            &v_seq,
+            seq,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            out,
+        )
+    }
+}
+
 pub struct KvCacheView<'a> {
     pub layout: KvCacheLayout,
-    pub k: &'a mut [f16],
-    pub v: &'a mut [f16],
+    pub storage: &'a mut dyn DeviceKvStorage,
 }
 
 impl<'a> KvCacheView<'a> {
@@ -97,9 +178,7 @@ impl<'a> KvCacheView<'a> {
         }
 
         let base = self.layout.token_base_elem(block_id, layer, token_offset)?;
-        self.k[base..base + kv_dim].copy_from_slice(k_src);
-        self.v[base..base + kv_dim].copy_from_slice(v_src);
-        Ok(())
+        self.storage.write_token_f16(base, k_src, v_src)
     }
 
     pub fn write_token(
@@ -120,11 +199,7 @@ impl<'a> KvCacheView<'a> {
         }
 
         let base = self.layout.token_base_elem(block_id, layer, token_offset)?;
-        for i in 0..kv_dim {
-            self.k[base + i] = f16::from_f32(k_src[i]);
-            self.v[base + i] = f16::from_f32(v_src[i]);
-        }
-        Ok(())
+        self.storage.write_token_f32(base, k_src, v_src)
     }
 
     pub fn read_token(
@@ -145,11 +220,7 @@ impl<'a> KvCacheView<'a> {
         }
 
         let base = self.layout.token_base_elem(block_id, layer, token_offset)?;
-        for i in 0..kv_dim {
-            k_out[i] = self.k[base + i].to_f32();
-            v_out[i] = self.v[base + i].to_f32();
-        }
-        Ok(())
+        self.storage.read_token_f32(base, k_out, v_out)
     }
 
     pub fn read_token_f16(
@@ -170,16 +241,13 @@ impl<'a> KvCacheView<'a> {
         }
 
         let base = self.layout.token_base_elem(block_id, layer, token_offset)?;
-        k_out.copy_from_slice(&self.k[base..base + kv_dim]);
-        v_out.copy_from_slice(&self.v[base..base + kv_dim]);
-        Ok(())
+        self.storage.read_token_f16(base, k_out, v_out)
     }
 }
 
 pub struct KvCacheReadView<'a> {
     pub layout: KvCacheLayout,
-    pub k: &'a [f16],
-    pub v: &'a [f16],
+    pub storage: &'a dyn DeviceKvStorage,
 }
 
 impl<'a> KvCacheReadView<'a> {
@@ -201,9 +269,7 @@ impl<'a> KvCacheReadView<'a> {
         }
 
         let base = self.layout.token_base_elem(block_id, layer, token_offset)?;
-        k_out.copy_from_slice(&self.k[base..base + kv_dim]);
-        v_out.copy_from_slice(&self.v[base..base + kv_dim]);
-        Ok(())
+        self.storage.read_token_f16(base, k_out, v_out)
     }
 
     pub fn read_token(
@@ -224,10 +290,139 @@ impl<'a> KvCacheReadView<'a> {
         }
 
         let base = self.layout.token_base_elem(block_id, layer, token_offset)?;
-        for i in 0..kv_dim {
-            k_out[i] = self.k[base + i].to_f32();
-            v_out[i] = self.v[base + i].to_f32();
-        }
-        Ok(())
+        self.storage.read_token_f32(base, k_out, v_out)
     }
+
+    pub fn gather_by_bases_f32(
+        &self,
+        bases: &[usize],
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> Result<(), CoreError> {
+        if k_out.len() != v_out.len() {
+            return Err(CoreError::Backend(format!(
+                "kv cache: gather output len mismatch k={} v={}",
+                k_out.len(),
+                v_out.len()
+            )));
+        }
+        let kv_dim = self.layout.kv_dim();
+        if bases.is_empty() {
+            if !k_out.is_empty() || !v_out.is_empty() {
+                return Err(CoreError::Backend(
+                    "kv cache: gather with empty bases requires empty outputs".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let need = bases.len() * kv_dim;
+        if k_out.len() != need {
+            return Err(CoreError::Backend(format!(
+                "kv cache: gather output len {} mismatch expected {} (bases={} kv_dim={})",
+                k_out.len(),
+                need,
+                bases.len(),
+                kv_dim
+            )));
+        }
+        self.storage.gather_tokens_f32(bases, kv_dim, k_out, v_out)
+    }
+
+    pub fn attention_single_token_gqa_from_bases(
+        &self,
+        bases: &[usize],
+        q: &[f32],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        out: &mut [f32],
+    ) -> Result<(), CoreError> {
+        self.storage.attention_single_token_gqa_f32(
+            bases,
+            q,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            out,
+        )
+    }
+}
+
+fn softmax_f32_inplace_local(x: &mut [f32]) {
+    if x.is_empty() {
+        return;
+    }
+    let mut max = f32::NEG_INFINITY;
+    for &v in x.iter() {
+        if v > max {
+            max = v;
+        }
+    }
+    let mut sum = 0.0f32;
+    for v in x.iter_mut() {
+        *v = (*v - max).exp();
+        sum += *v;
+    }
+    if sum > 0.0 {
+        for v in x.iter_mut() {
+            *v /= sum;
+        }
+    }
+}
+
+fn attention_single_token_f32_gqa_local(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    out: &mut [f32],
+) -> Result<(), CoreError> {
+    if q.len() != n_heads.saturating_mul(head_dim) {
+        return Err(CoreError::Backend("kv cache: local attention q shape mismatch".into()));
+    }
+    if k.len() != seq.saturating_mul(n_kv_heads).saturating_mul(head_dim) {
+        return Err(CoreError::Backend("kv cache: local attention k shape mismatch".into()));
+    }
+    if v.len() != seq.saturating_mul(n_kv_heads).saturating_mul(head_dim) {
+        return Err(CoreError::Backend("kv cache: local attention v shape mismatch".into()));
+    }
+    if out.len() != n_heads.saturating_mul(head_dim) {
+        return Err(CoreError::Backend("kv cache: local attention out shape mismatch".into()));
+    }
+    out.fill(0.0);
+    if seq == 0 {
+        return Ok(());
+    }
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let group_size = (n_heads / n_kv_heads).max(1);
+    let mut scores = vec![0.0f32; seq];
+
+    for h in 0..n_heads {
+        let kv_h = (h / group_size).min(n_kv_heads.saturating_sub(1));
+        let qh = &q[h * head_dim..(h + 1) * head_dim];
+        for t in 0..seq {
+            let kt_base = (t * n_kv_heads + kv_h) * head_dim;
+            let kt = &k[kt_base..kt_base + head_dim];
+            let mut dot = 0.0f32;
+            for i in 0..head_dim {
+                dot += qh[i] * kt[i];
+            }
+            scores[t] = dot * scale;
+        }
+        softmax_f32_inplace_local(&mut scores);
+
+        let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
+        for t in 0..seq {
+            let vt_base = (t * n_kv_heads + kv_h) * head_dim;
+            let vt = &v[vt_base..vt_base + head_dim];
+            let w = scores[t];
+            for i in 0..head_dim {
+                out_h[i] += w * vt[i];
+            }
+        }
+    }
+    Ok(())
 }

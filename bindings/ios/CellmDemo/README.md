@@ -71,3 +71,34 @@ The app normalizes GitHub `blob` URLs to raw-download URLs before fetching.
 - Keep `tokenizer.json` next to the `.cellm` model when you manage files on disk; the app lets you pick both explicitly.
 - For Qwen in this phase, requesting `Metal` verifies backend selection and reports active backend, but forward math remains CPU-path.
 - Qwen compact int4 can still be degenerate; use the stable Qwen model when validating response quality on-device.
+
+## Latest Metal KV optimization patch (what was changed)
+
+To reduce long decode stalls and memory churn on iPhone when using Qwen with Metal selected, we patched the KV cache Metal path in:
+
+- `/Users/jeff/Desktop/cellm/crates/cellm-cache/src/kvcache.rs`
+
+### What we changed
+
+1) Added reusable scratch buffers inside `MetalKvStorage`:
+- `k_f16`, `v_f16`, `k_f32`, `v_f32`, `q_f32`, `out_f32`, `bases_u32`
+- these are kept and grown as needed, instead of allocating every token step.
+
+2) Replaced tiny scalar Metal buffers with inline constants:
+- switched `base/len/seq/head_dim/...` kernel args to `set_bytes(...)`
+- removes many tiny per-dispatch buffer allocations.
+
+3) Wrapped command submission in `autoreleasepool`:
+- dispatch path now uses an autorelease pool around command buffer + encoder work
+- helps prevent memory buildup during long generation loops on iOS.
+
+### Why this helps
+
+- Lower allocation pressure in decode hot path.
+- Lower risk of iOS memory kill (`IDEDebugSessionErrorDomain Code 11`) during long runs.
+- Better baseline for the next phase (full attention/math parity and full Metal path).
+
+### Validation run
+
+- `cargo check --workspace` passed.
+- `xcodebuild ... CellmDemo ...` simulator build passed (`BUILD SUCCEEDED`).

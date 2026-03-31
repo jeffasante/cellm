@@ -46,3 +46,12 @@ In `cellm`, this state is tracked per session id (the same id used by `PageTable
 If you skip the `linear_attention` layers, Qwen3.5 quality collapses because most layers are not “normal attention” layers.
 Getting DeltaNet working is what turns “it runs” into “it behaves like a real Qwen checkpoint”.
 
+## Latest runner patch note (Metal KV plumbing)
+
+We also added a backend-focused optimization pass in the KV cache Metal storage:
+
+- Reused scratch Metal buffers for token read/write, gather, and single-token GQA attention calls.
+- Switched small scalar kernel args to `set_bytes(...)` instead of creating temporary 1-value buffers.
+- Wrapped Metal dispatch in `autoreleasepool` to reduce memory growth in long decode loops on iOS.
+
+This patch improves runtime stability and memory behavior, but it is not yet the final “100% full-Metal Qwen math parity” endpoint by itself.

@@ -99,7 +99,8 @@ final class CellmTokenizer {
         let needed = tokens.withUnsafeBufferPointer { buf in
             cellm_tokenizer_decode(handle, buf.baseAddress, buf.count, nil, 0)
         }
-        if needed == 0 { throw CellmError.message(CellmFFI.lastError()) }
+        // Some tokens can legitimately decode to an empty piece.
+        if needed == 0 { return "" }
 
         var bytes = [CChar](repeating: 0, count: needed + 1)
         let written = tokens.withUnsafeBufferPointer { buf in
@@ -107,7 +108,7 @@ final class CellmTokenizer {
                 cellm_tokenizer_decode(handle, buf.baseAddress, buf.count, out.baseAddress, out.count)
             }
         }
-        if written == 0 { throw CellmError.message(CellmFFI.lastError()) }
+        if written == 0 { return "" }
         return String(cString: bytes)
     }
 
@@ -124,7 +125,7 @@ final class CellmEngine {
     let activeBackend: String
     private(set) var lastGenerationStats: LlmGenerationStats?
 
-    init(modelURL: URL, tokenizer: CellmTokenizer, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 512, topK: UInt32 = 40, temperature: Float = 0.2, repeatPenalty: Float = 1.08, repeatWindow: UInt32 = 96, seed: UInt64 = 1, backend: CellmBackend = .metal) throws {
+    init(modelURL: URL, tokenizer: CellmTokenizer, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 256, topK: UInt32 = 40, temperature: Float = 0.2, repeatPenalty: Float = 1.08, repeatWindow: UInt32 = 96, seed: UInt64 = 1, backend: CellmBackend = .metal) throws {
         self.tokenizer = tokenizer
         let path = modelURL.path
         let requestedBackend: CellmBackend = backend
@@ -193,6 +194,8 @@ final class CellmEngine {
         if !Self.isStopPiece(firstPiece) {
             out += firstPiece
         }
+        var lastPiece = firstPiece
+        var samePieceRun = firstPiece.isEmpty ? 0 : 1
         var generated = 1
 
         if maxNewTokens <= 1 {
@@ -218,6 +221,13 @@ final class CellmEngine {
             let piece = try tokenizer.decodeOne(tok)
             if Self.isStopPiece(piece) { break }
             if Self.hasLongDigitRun(piece, threshold: 10) { break }
+            if piece == lastPiece && !piece.isEmpty {
+                samePieceRun += 1
+            } else {
+                samePieceRun = piece.isEmpty ? 0 : 1
+                lastPiece = piece
+            }
+            if samePieceRun >= 4 { break }
             out += piece
             generated += 1
         }
@@ -370,7 +380,7 @@ enum CellmFFI {
     static func lastError() -> String {
         var buf = [CChar](repeating: 0, count: 4096)
         let n = cellm_last_error_message(&buf, buf.count)
-        if n == 0 { return "unknown error" }
+        if n == 0 { return "ffi_error_empty" }
         return String(cString: buf)
     }
 

@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::{CellmFile, ModelConfig};
 
-const QWEN_METAL_LINEAR_MAX_ELEMS: usize = 1_500_000;
+const QWEN_METAL_LINEAR_MAX_ELEMS: usize = 262_144;
 
 /// Minimal text-only runner for Qwen3.5 checkpoints that contain both
 /// `linear_attention` and `full_attention` layers.

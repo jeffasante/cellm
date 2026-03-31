@@ -36,6 +36,19 @@ fn take_last_error() -> Option<String> {
     g.take()
 }
 
+fn ensure_last_error(msg: &str) {
+    let mut g = last_error_cell()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let empty = g
+        .as_ref()
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true);
+    if empty {
+        *g = Some(msg.to_string());
+    }
+}
+
 fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         return (*s).to_string();
@@ -346,6 +359,7 @@ pub extern "C" fn cellm_engine_create_v3(
     seed: u64,
     backend: u32, // 0=cpu, 1=metal
 ) -> cellm_engine_t {
+    ensure_last_error("engine_create_v3 failed: no detail");
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         (|| {
             let model_path = cstr_to_str(model_path)?;
@@ -370,6 +384,7 @@ pub extern "C" fn cellm_engine_create_v3(
         Ok(Ok(h)) => h,
         Ok(Err(e)) => {
             set_last_error(e);
+            ensure_last_error("engine_create_v3 failed: empty error");
             0
         }
         Err(panic_payload) => {
@@ -377,6 +392,7 @@ pub extern "C" fn cellm_engine_create_v3(
                 "engine_create_v3 panicked: {}",
                 panic_payload_to_string(panic_payload)
             ));
+            ensure_last_error("engine_create_v3 panicked without payload detail");
             0
         }
     }
@@ -533,8 +549,20 @@ pub extern "C" fn cellm_session_create(engine: cellm_engine_t) -> SessionId {
         set_last_error("session_create: null engine".to_string());
         return 0;
     }
-    let e = unsafe { &mut *(engine as *mut Engine) };
-    e.create_session()
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let e = unsafe { &mut *(engine as *mut Engine) };
+        e.create_session()
+    }));
+    match result {
+        Ok(sid) => sid,
+        Err(panic_payload) => {
+            set_last_error(format!(
+                "session_create panicked: {}",
+                panic_payload_to_string(panic_payload)
+            ));
+            0
+        }
+    }
 }
 
 #[no_mangle]
@@ -628,17 +656,27 @@ pub extern "C" fn cellm_submit_tokens(
         return -1;
     }
 
-    let e = unsafe { &mut *(engine as *mut Engine) };
-    let slice = unsafe { std::slice::from_raw_parts(tokens, token_count) };
-    match e.submit_tokens(session, slice) {
-        Ok(next) => {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let e = unsafe { &mut *(engine as *mut Engine) };
+        let slice = unsafe { std::slice::from_raw_parts(tokens, token_count) };
+        e.submit_tokens(session, slice)
+    }));
+    match result {
+        Ok(Ok(next)) => {
             unsafe {
                 *out_next_token = next;
             }
             0
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             set_last_error(format!("submit_tokens failed: {err}"));
+            -1
+        }
+        Err(panic_payload) => {
+            set_last_error(format!(
+                "submit_tokens panicked: {}",
+                panic_payload_to_string(panic_payload)
+            ));
             -1
         }
     }
@@ -658,18 +696,28 @@ pub extern "C" fn cellm_step_decode(
         set_last_error("step_decode: null outputs".to_string());
         return -1;
     }
-    let e = unsafe { &mut *(engine as *mut Engine) };
-    match e.step_decode() {
-        Ok(Some((sid, tok))) => {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let e = unsafe { &mut *(engine as *mut Engine) };
+        e.step_decode()
+    }));
+    match result {
+        Ok(Ok(Some((sid, tok)))) => {
             unsafe {
                 *out_session = sid;
                 *out_token = tok;
             }
             1
         }
-        Ok(None) => 0,
-        Err(err) => {
+        Ok(Ok(None)) => 0,
+        Ok(Err(err)) => {
             set_last_error(format!("step_decode failed: {err}"));
+            -1
+        }
+        Err(panic_payload) => {
+            set_last_error(format!(
+                "step_decode panicked: {}",
+                panic_payload_to_string(panic_payload)
+            ));
             -1
         }
     }

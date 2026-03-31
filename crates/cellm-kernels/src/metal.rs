@@ -1,5 +1,7 @@
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use metal::{Buffer, CommandQueue, ComputePipelineState, Device, Library, MTLResourceOptions};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use objc::rc::autoreleasepool;
 
 pub struct MetalKernels;
 
@@ -142,10 +144,12 @@ impl MetalMatmul {
         if a.len() != m * k || b.len() != k * n || out.len() != m * n {
             anyhow::bail!("Metal matmul shape mismatch");
         }
-        let device = self.queue.device();
-        let a_buf = make_buf_from_f32(device, a)?;
-        let b_buf = make_buf_from_f32(device, b)?;
-        self.matmul_row_major_f32_with_b_buffer(&a_buf, m, k, &b_buf, n, out)
+        autoreleasepool(|| {
+            let device = self.queue.device();
+            let a_buf = make_buf_from_f32(device, a)?;
+            let b_buf = make_buf_from_f32(device, b)?;
+            self.matmul_row_major_f32_with_b_buffer(&a_buf, m, k, &b_buf, n, out)
+        })
     }
 
     pub fn matmul_row_major_f32_with_b_buffer(
@@ -160,29 +164,31 @@ impl MetalMatmul {
         if out.len() != m * n {
             anyhow::bail!("Metal matmul shape mismatch for output");
         }
-        let out_bytes = (out.len() * std::mem::size_of::<f32>()) as u64;
-        let device = self.queue.device();
-        let out_buf = device.new_buffer(out_bytes, MTLResourceOptions::StorageModeShared);
-        let m_u32 = m as u32;
-        let n_u32 = n as u32;
-        let k_u32 = k as u32;
-        let m_buf = make_buf_from_u32(device, &[m_u32])?;
-        let n_buf = make_buf_from_u32(device, &[n_u32])?;
-        let k_buf = make_buf_from_u32(device, &[k_u32])?;
+        autoreleasepool(|| {
+            let out_bytes = (out.len() * std::mem::size_of::<f32>()) as u64;
+            let device = self.queue.device();
+            let out_buf = device.new_buffer(out_bytes, MTLResourceOptions::StorageModeShared);
+            let m_u32 = m as u32;
+            let n_u32 = n as u32;
+            let k_u32 = k as u32;
+            let m_buf = make_buf_from_u32(device, &[m_u32])?;
+            let n_buf = make_buf_from_u32(device, &[n_u32])?;
+            let k_buf = make_buf_from_u32(device, &[k_u32])?;
 
-        dispatch_2d(&self.queue, &self.pso, n as u64, m as u64, |enc| {
-            enc.set_buffer(0, Some(a_buf), 0);
-            enc.set_buffer(1, Some(b_buf), 0);
-            enc.set_buffer(2, Some(&out_buf), 0);
-            enc.set_buffer(3, Some(&m_buf), 0);
-            enc.set_buffer(4, Some(&n_buf), 0);
-            enc.set_buffer(5, Some(&k_buf), 0);
-        })?;
+            dispatch_2d(&self.queue, &self.pso, n as u64, m as u64, |enc| {
+                enc.set_buffer(0, Some(a_buf), 0);
+                enc.set_buffer(1, Some(b_buf), 0);
+                enc.set_buffer(2, Some(&out_buf), 0);
+                enc.set_buffer(3, Some(&m_buf), 0);
+                enc.set_buffer(4, Some(&n_buf), 0);
+                enc.set_buffer(5, Some(&k_buf), 0);
+            })?;
 
-        let out_ptr = out_buf.contents() as *const f32;
-        let out_slice = unsafe { std::slice::from_raw_parts(out_ptr, out.len()) };
-        out.copy_from_slice(out_slice);
-        Ok(())
+            let out_ptr = out_buf.contents() as *const f32;
+            let out_slice = unsafe { std::slice::from_raw_parts(out_ptr, out.len()) };
+            out.copy_from_slice(out_slice);
+            Ok(())
+        })
     }
 }
 

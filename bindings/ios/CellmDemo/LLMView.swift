@@ -390,6 +390,11 @@ struct LLMView: View {
         let thermal = selectedThermalLevel
         let shouldForceStrictForExperimentalQwen = (qwenVariant == .experimental && selectedPreset != .strict)
         let preset = shouldForceStrictForExperimentalQwen ? GenerationPreset.strict : selectedPreset
+        let isExperimentalQwen = (qwenVariant == .experimental)
+        let requestedMaxTokens = maxTokensOverride ?? preset.maxTokens
+        let effectiveMaxTokens = isExperimentalQwen ? min(requestedMaxTokens, 4) : requestedMaxTokens
+        let tokensPerBlock: UInt32 = 8
+        let totalBlocks: UInt32 = isExperimentalQwen ? 24 : 48
 
         isRunning = true
         Task.detached(priority: .userInitiated) {
@@ -404,6 +409,8 @@ struct LLMView: View {
                 let eng = try CellmEngine(
                     modelURL: modelURL,
                     tokenizer: tok,
+                    tokensPerBlock: tokensPerBlock,
+                    totalBlocks: totalBlocks,
                     topK: preset.topK,
                     temperature: preset.temperature,
                     repeatPenalty: preset.repeatPenalty,
@@ -413,7 +420,7 @@ struct LLMView: View {
                 )
                 let text = try eng.generate(
                     prompt: promptText,
-                    maxNewTokens: maxTokensOverride ?? preset.maxTokens,
+                    maxNewTokens: effectiveMaxTokens,
                     thermalLevel: thermal,
                     exerciseSuspendResume: exerciseSuspendResume
                 )
@@ -434,26 +441,26 @@ struct LLMView: View {
                     if shouldForceStrictForExperimentalQwen {
                         warnings.append("Strict preset auto-applied because selected Qwen variant is experimental.")
                     }
+                    if isExperimentalQwen && effectiveMaxTokens < requestedMaxTokens {
+                        warnings.append("Experimental Qwen token cap applied (\(effectiveMaxTokens) max) to avoid long looped runs.")
+                    }
+                    warnings.append("Mobile KV cache tuned for latency (block=\(tokensPerBlock), total=\(totalBlocks)).")
                     self.backendWarning = warnings.isEmpty ? nil : warnings.joined(separator: " ")
                     self.isRunning = false
                 }
             } catch {
                 await MainActor.run {
-                    var message = String(describing: error)
-                    if message.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "unknown error"
-                        || message.lowercased().contains(": unknown error")
-                    {
-                        let modelExists = FileManager.default.fileExists(atPath: modelURL.path)
-                        let tokExists = FileManager.default.fileExists(atPath: tokenizerURL.path)
-                        message = """
-                        unknown error (no FFI detail)
-                        model=\(modelURL.lastPathComponent) exists=\(modelExists)
-                        tokenizer=\(tokenizerURL.lastPathComponent) exists=\(tokExists)
-                        requested_backend=\(backend.label.lowercased()) active_backend=\(self.activeBackend.isEmpty ? "n/a" : self.activeBackend)
-                        preset=\(preset.rawValue)
-                        """
-                    }
-                    self.errorText = message
+                    let modelExists = FileManager.default.fileExists(atPath: modelURL.path)
+                    let tokExists = FileManager.default.fileExists(atPath: tokenizerURL.path)
+                    let raw = String(describing: error)
+                    self.errorText = """
+                    \(raw)
+                    model=\(modelURL.lastPathComponent) exists=\(modelExists)
+                    tokenizer=\(tokenizerURL.lastPathComponent) exists=\(tokExists)
+                    requested_backend=\(backend.label.lowercased()) active_backend=\(self.activeBackend.isEmpty ? "n/a" : self.activeBackend)
+                    preset=\(preset.rawValue)
+                    max_tokens=\(effectiveMaxTokens)
+                    """
                     self.isRunning = false
                 }
             }

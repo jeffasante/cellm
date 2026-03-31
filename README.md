@@ -345,6 +345,7 @@ Quantized validation status:
 - Text (quantized `.cellm`): tested and working.
 - `smollm2-135m-int8.cellm` runs in `infer` and generates output.
 - `smolvlm-256m-int8.cellm` also runs through the text path (`infer`).
+- Qwen3.5 int8 parity note: for `qwen3.5-0.8b-int8.cellm`, keep `linear_attn.*` projection weights in f16 during quantization (do not int8 those tensors) to avoid degenerate output.
 - Vision (quantized): tested with ONNX VLM path (`vlm-infer --onnx-variant quantized`) and produces image-relevant captions.
 - Native `.cellm` vision execution is implemented in `vlm-infer` (`--vision-backend cellm`) and tested with both ONNX and native decoders.
 - Native `.cellm` vision currently prioritizes correctness over speed (CPU-only Rust math, no fused kernels yet).

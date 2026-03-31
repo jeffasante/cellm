@@ -5,10 +5,14 @@ use bytemuck::cast_slice;
 use cellm_cache::{KVCache, PageTable};
 use cellm_core::CoreError;
 use cellm_kernels::cpu_kernels::{attention_single_token_f32_gqa, rms_norm_f32};
+use cellm_kernels::metal::MetalMatmul;
+use cellm_kernels::MetalKernels;
 use half::f16;
 use serde_json::Value;
 
 use crate::{CellmFile, ModelConfig};
+
+const QWEN_METAL_LINEAR_MAX_ELEMS: usize = 1_500_000;
 
 /// Minimal text-only runner for Qwen3.5 checkpoints that contain both
 /// `linear_attention` and `full_attention` layers.
@@ -33,6 +37,12 @@ pub struct QwenRunner {
     disable_full_attention: bool,
     disable_full_attn_gate: bool,
     debug_pos: Option<usize>,
+    linear_backend: QwenLinearBackend,
+}
+
+enum QwenLinearBackend {
+    Cpu,
+    Metal { ctx: MetalMatmul },
 }
 
 impl QwenRunner {
@@ -92,6 +102,7 @@ impl QwenRunner {
             debug_pos: std::env::var("CELLM_QWEN_DEBUG_POS")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok()),
+            linear_backend: QwenLinearBackend::Cpu,
         })
     }
 
@@ -111,6 +122,20 @@ impl QwenRunner {
         self.eos_token_id
     }
 
+    pub fn enable_metal_linear_backend(&mut self) -> bool {
+        match MetalKernels::create_matmul() {
+            Ok(ctx) => {
+                self.linear_backend = QwenLinearBackend::Metal { ctx };
+                true
+            }
+            Err(e) => {
+                eprintln!("qwen: failed to enable metal linear backend: {e}");
+                self.linear_backend = QwenLinearBackend::Cpu;
+                false
+            }
+        }
+    }
+
     pub fn cancel_session(&mut self, session_id: u64) {
         self.sessions.remove(&session_id);
     }
@@ -123,7 +148,7 @@ impl QwenRunner {
         kv_cache: &mut KVCache,
         top_k: usize,
     ) -> Result<Vec<(u32, f32)>, CoreError> {
-        let cfg = &self.cfg;
+        let cfg = self.cfg.clone();
         let hidden = cfg.hidden_size;
         let n_kv_heads = cfg.num_key_value_heads;
         let session_id = page_table.session_id();
@@ -641,13 +666,15 @@ impl QwenRunner {
             )));
         }
         let resolved = self.resolve_tensor_name(weight_name);
-        let meta = self
+        let dtype = self
             .file
             .tensor_index(&resolved)
-            .ok_or_else(|| CoreError::Backend(format!("unknown tensor {weight_name}")))?;
+            .ok_or_else(|| CoreError::Backend(format!("unknown tensor {weight_name}")))?
+            .dtype
+            .clone();
         let vocab = self.cfg.vocab_size;
         let t = (token as usize) % vocab;
-        match meta.dtype.as_str() {
+        match dtype.as_str() {
             "f16" => {
                 let embed = self.tensor_f16(weight_name)?;
                 let row = &embed[t * hidden..(t + 1) * hidden];
@@ -704,11 +731,13 @@ impl QwenRunner {
             )));
         }
         let resolved = self.resolve_tensor_name(weight_name);
-        let meta = self
+        let dtype = self
             .file
             .tensor_index(&resolved)
-            .ok_or_else(|| CoreError::Backend(format!("unknown tensor {weight_name}")))?;
-        match meta.dtype.as_str() {
+            .ok_or_else(|| CoreError::Backend(format!("unknown tensor {weight_name}")))?
+            .dtype
+            .clone();
+        match dtype.as_str() {
             "f16" => {
                 let w = self.tensor_f16(weight_name)?;
                 let row = &w[row_idx * in_dim..(row_idx + 1) * in_dim];
@@ -763,7 +792,7 @@ impl QwenRunner {
     }
 
     fn linear_f16_out_in(
-        &self,
+        &mut self,
         x: &[f32],
         weight_name: &str,
         out_dim: usize,
@@ -780,10 +809,12 @@ impl QwenRunner {
 
         let shape = self.tensor_shape(weight_name)?;
         let resolved = self.resolve_tensor_name(weight_name);
-        let meta = self
+        let dtype = self
             .file
             .tensor_index(&resolved)
-            .ok_or_else(|| CoreError::Backend(format!("unknown tensor {weight_name}")))?;
+            .ok_or_else(|| CoreError::Backend(format!("unknown tensor {weight_name}")))?
+            .dtype
+            .clone();
         if shape.len() != 2 {
             return Err(CoreError::Backend(format!(
                 "weight {weight_name} expected 2D, got {:?}",
@@ -797,16 +828,147 @@ impl QwenRunner {
                 shape
             )));
         }
-        match meta.dtype.as_str() {
+        if let QwenLinearBackend::Metal { ctx } = &self.linear_backend {
+            let chunk_cols = (QWEN_METAL_LINEAR_MAX_ELEMS / in_dim.max(1)).max(1).min(out_dim);
+            let mut weight_t_chunk = vec![0.0f32; in_dim * chunk_cols];
+            let mut out_chunk = vec![0.0f32; chunk_cols];
+            let mut metal_ok = true;
+            match dtype.as_str() {
+                "f16" => {
+                    let w = self.tensor_f16(weight_name)?;
+                    if w.len() != out_dim * in_dim {
+                        return Err(CoreError::Backend(format!(
+                            "weight {weight_name} len mismatch: {} expected {}",
+                            w.len(),
+                            out_dim * in_dim
+                        )));
+                    }
+                    let mut row_start = 0usize;
+                    while row_start < out_dim {
+                        let cols_n = (out_dim - row_start).min(chunk_cols);
+                        for i in 0..in_dim {
+                            for c in 0..cols_n {
+                                let row_idx = row_start + c;
+                                weight_t_chunk[i * cols_n + c] =
+                                    f16::from_bits(w[row_idx * in_dim + i]).to_f32();
+                            }
+                        }
+                        let out_slice = &mut out_chunk[..cols_n];
+                        if ctx
+                            .matmul_row_major_f32(
+                                x,
+                                1,
+                                in_dim,
+                                &weight_t_chunk[..in_dim * cols_n],
+                                cols_n,
+                                out_slice,
+                            )
+                            .is_err()
+                        {
+                            metal_ok = false;
+                            break;
+                        }
+                        out[row_start..row_start + cols_n].copy_from_slice(out_slice);
+                        row_start += cols_n;
+                    }
+                }
+                "i8" => {
+                    let w = self.tensor_i8(weight_name)?;
+                    let scales = self.tensor_f16(&format!("{weight_name}.qscale"))?;
+                    if w.len() != out_dim * in_dim || scales.len() != out_dim {
+                        return Err(CoreError::Backend(format!(
+                            "weight {weight_name} i8/qscale len mismatch: w={} scales={} expected w={} scales={}",
+                            w.len(),
+                            scales.len(),
+                            out_dim * in_dim,
+                            out_dim
+                        )));
+                    }
+                    let mut row_start = 0usize;
+                    while row_start < out_dim {
+                        let cols_n = (out_dim - row_start).min(chunk_cols);
+                        for i in 0..in_dim {
+                            for c in 0..cols_n {
+                                let row_idx = row_start + c;
+                                let scale = f16::from_bits(scales[row_idx]).to_f32();
+                                weight_t_chunk[i * cols_n + c] =
+                                    (w[row_idx * in_dim + i] as f32) * scale;
+                            }
+                        }
+                        let out_slice = &mut out_chunk[..cols_n];
+                        if ctx
+                            .matmul_row_major_f32(
+                                x,
+                                1,
+                                in_dim,
+                                &weight_t_chunk[..in_dim * cols_n],
+                                cols_n,
+                                out_slice,
+                            )
+                            .is_err()
+                        {
+                            metal_ok = false;
+                            break;
+                        }
+                        out[row_start..row_start + cols_n].copy_from_slice(out_slice);
+                        row_start += cols_n;
+                    }
+                }
+                "i4" => {
+                    let w = self.tensor_u8(weight_name)?;
+                    let scales = self.tensor_f16(&format!("{weight_name}.qscale"))?;
+                    let row_stride = in_dim.div_ceil(2);
+                    if w.len() != out_dim * row_stride || scales.len() != out_dim {
+                        return Err(CoreError::Backend(format!(
+                            "weight {weight_name} i4/qscale len mismatch: w={} scales={} expected w={} scales={}",
+                            w.len(),
+                            scales.len(),
+                            out_dim * row_stride,
+                            out_dim
+                        )));
+                    }
+                    let mut row_start = 0usize;
+                    while row_start < out_dim {
+                        let cols_n = (out_dim - row_start).min(chunk_cols);
+                        for i in 0..in_dim {
+                            for c in 0..cols_n {
+                                let row_idx = row_start + c;
+                                let row = &w[row_idx * row_stride..(row_idx + 1) * row_stride];
+                                let scale = f16::from_bits(scales[row_idx]).to_f32();
+                                weight_t_chunk[i * cols_n + c] = unpack_i4(row, i) * scale;
+                            }
+                        }
+                        let out_slice = &mut out_chunk[..cols_n];
+                        if ctx
+                            .matmul_row_major_f32(
+                                x,
+                                1,
+                                in_dim,
+                                &weight_t_chunk[..in_dim * cols_n],
+                                cols_n,
+                                out_slice,
+                            )
+                            .is_err()
+                        {
+                            metal_ok = false;
+                            break;
+                        }
+                        out[row_start..row_start + cols_n].copy_from_slice(out_slice);
+                        row_start += cols_n;
+                    }
+                }
+                _ => {
+                    metal_ok = false;
+                }
+            }
+            if metal_ok {
+                return Ok(());
+            }
+        }
+
+        match dtype.as_str() {
             "f16" => {
                 let w = self.tensor_f16(weight_name)?;
-                if w.len() != out_dim * in_dim {
-                    return Err(CoreError::Backend(format!(
-                        "weight {weight_name} len mismatch: {} expected {}",
-                        w.len(),
-                        out_dim * in_dim
-                    )));
-                }
                 for j in 0..out_dim {
                     let row = &w[j * in_dim..(j + 1) * in_dim];
                     let mut acc = 0.0f32;
@@ -818,22 +980,8 @@ impl QwenRunner {
             }
             "i8" => {
                 let w = self.tensor_i8(weight_name)?;
-                if w.len() != out_dim * in_dim {
-                    return Err(CoreError::Backend(format!(
-                        "weight {weight_name} len mismatch: {} expected {}",
-                        w.len(),
-                        out_dim * in_dim
-                    )));
-                }
                 let scales_name = format!("{weight_name}.qscale");
                 let scales = self.tensor_f16(&scales_name)?;
-                if scales.len() != out_dim {
-                    return Err(CoreError::Backend(format!(
-                        "weight {weight_name} qscale len mismatch: {} expected {}",
-                        scales.len(),
-                        out_dim
-                    )));
-                }
                 for j in 0..out_dim {
                     let row = &w[j * in_dim..(j + 1) * in_dim];
                     let scale = f16::from_bits(scales[j]).to_f32();
@@ -847,22 +995,8 @@ impl QwenRunner {
             "i4" => {
                 let w = self.tensor_u8(weight_name)?;
                 let row_stride = in_dim.div_ceil(2);
-                if w.len() != out_dim * row_stride {
-                    return Err(CoreError::Backend(format!(
-                        "weight {weight_name} len mismatch: {} expected {}",
-                        w.len(),
-                        out_dim * row_stride
-                    )));
-                }
                 let scales_name = format!("{weight_name}.qscale");
                 let scales = self.tensor_f16(&scales_name)?;
-                if scales.len() != out_dim {
-                    return Err(CoreError::Backend(format!(
-                        "weight {weight_name} qscale len mismatch: {} expected {}",
-                        scales.len(),
-                        out_dim
-                    )));
-                }
                 for j in 0..out_dim {
                     let row = &w[j * row_stride..(j + 1) * row_stride];
                     let scale = f16::from_bits(scales[j]).to_f32();

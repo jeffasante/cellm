@@ -20,6 +20,10 @@ typedef enum cellm_backend_kind_t {
 // Returns number of bytes written (excluding null terminator).
 size_t cellm_last_error_message(char* out_buf, size_t buf_len);
 
+// Metal preflight smoke test.
+// Returns 0 on success, -1 on failure (see cellm_last_error_message).
+int32_t cellm_metal_smoke_test(void);
+
 // Engine lifecycle.
 cellm_engine_t cellm_engine_create(
     const char* model_path,

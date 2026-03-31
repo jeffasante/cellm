@@ -85,12 +85,12 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(model_path: &Path, engine_cfg: EngineConfig) -> Result<Self> {
-        let selected_backend = resolve_backend(engine_cfg.backend);
+        let mut selected_backend = resolve_backend(engine_cfg.backend);
         let file = CellmFile::load(model_path)?;
         let header = file.header.clone();
 
         let text_model_type = effective_text_model_type(&header);
-        let runner = match text_model_type.as_str() {
+        let mut runner = match text_model_type.as_str() {
             "llama" => Runner::Llama(LlamaRunner::load(model_path)?),
             t if t.starts_with("qwen") => Runner::Qwen(QwenRunner::load(model_path)?),
             other => anyhow::bail!(
@@ -98,6 +98,13 @@ impl Engine {
                 header.model_type
             ),
         };
+        if selected_backend == BackendKind::Metal {
+            if let Runner::Qwen(r) = &mut runner {
+                if !r.enable_metal_linear_backend() {
+                    selected_backend = BackendKind::Cpu;
+                }
+            }
+        }
 
         let cfg = match &runner {
             Runner::Llama(r) => r.config().clone(),

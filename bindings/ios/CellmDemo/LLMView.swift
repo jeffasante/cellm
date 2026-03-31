@@ -73,9 +73,27 @@ struct LLMView: View {
     @State private var showModelPicker = false
     @State private var showTokenizerPicker = false
 
+    private enum QwenVariant {
+        case none
+        case stable
+        case experimental
+    }
+
     private var isQwenSelected: Bool {
         (modelURL?.lastPathComponent.lowercased().contains("qwen") ?? false) ||
         (tokenizerURL?.lastPathComponent.lowercased().contains("qwen") ?? false)
+    }
+
+    private var qwenVariant: QwenVariant {
+        guard isQwenSelected else { return .none }
+        let modelName = modelURL?.lastPathComponent.lowercased() ?? ""
+        if modelName == "qwen3.5-0.8b.cellm" || modelName == "qwen3.5-0.8b-int8.cellm" {
+            return .stable
+        }
+        if modelName.contains("qwen") {
+            return .experimental
+        }
+        return .experimental
     }
 
     var body: some View {
@@ -250,18 +268,21 @@ struct LLMView: View {
             if let backendWarning {
                 Text(backendWarning).font(.footnote).foregroundStyle(.orange)
             }
-            Text("Note: current LLM math path is CPU in this phase; Metal selection verifies backend selection/fallback.")
+            Text("Note: on Qwen, Metal now accelerates linear layers; attention/KV paths still use CPU fallbacks in this phase.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
             if isQwenSelected {
-                if modelURL?.lastPathComponent.contains("int4") == true {
-                    Text("Qwen compact int4 is experimental and may produce degraded output. Use Qwen stable model for best quality.")
-                        .font(.footnote)
-                        .foregroundStyle(.orange)
-                } else {
-                    Text("Qwen stable model selected. This is the recommended Qwen path for mobile quality testing.")
+                switch qwenVariant {
+                case .stable:
+                    Text("Qwen parity-fixed model selected. Recommended: qwen3.5-0.8b.cellm or qwen3.5-0.8b-int8.cellm.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                case .experimental:
+                    Text("This Qwen model is experimental on current mobile runner (for example int8/int4) and may produce degraded output. Use qwen3.5-0.8b.cellm for best quality.")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                case .none:
+                    EmptyView()
                 }
             }
         }
@@ -367,11 +388,18 @@ struct LLMView: View {
         let promptText = prompt
         let backend = selectedBackend
         let thermal = selectedThermalLevel
-        let preset = selectedPreset
+        let shouldForceStrictForExperimentalQwen = (qwenVariant == .experimental && selectedPreset != .strict)
+        let preset = shouldForceStrictForExperimentalQwen ? GenerationPreset.strict : selectedPreset
 
         isRunning = true
         Task.detached(priority: .userInitiated) {
             do {
+                var effectiveBackend = backend
+                var preflightWarning: String?
+                if backend == .metal, let metalErr = CellmFFI.metalSmokeError() {
+                    effectiveBackend = .cpu
+                    preflightWarning = "Metal unavailable (\(metalErr)). Using CPU fallback for this run."
+                }
                 let tok = try CellmTokenizer(tokenizerURL: tokenizerURL)
                 let eng = try CellmEngine(
                     modelURL: modelURL,
@@ -381,7 +409,7 @@ struct LLMView: View {
                     repeatPenalty: preset.repeatPenalty,
                     repeatWindow: preset.repeatWindow,
                     seed: 1,
-                    backend: backend
+                    backend: effectiveBackend
                 )
                 let text = try eng.generate(
                     prompt: promptText,
@@ -389,20 +417,43 @@ struct LLMView: View {
                     thermalLevel: thermal,
                     exerciseSuspendResume: exerciseSuspendResume
                 )
+                let preflightWarningMessage = preflightWarning
                 await MainActor.run {
                     self.output = prettyOutput(text)
                     if let stats = eng.lastGenerationStats {
                         self.runDiagnostics = formatDiagnostics(stats: stats)
                     }
                     self.activeBackend = eng.activeBackend
-                    if backend == .metal && !eng.activeBackend.lowercased().contains("metal") {
-                        self.backendWarning = "Metal requested, fell back to \(eng.activeBackend)."
+                    var warnings: [String] = []
+                    if let preflightWarningMessage {
+                        warnings.append(preflightWarningMessage)
                     }
+                    if backend == .metal && !eng.activeBackend.lowercased().contains("metal") {
+                        warnings.append("Metal requested, fell back to \(eng.activeBackend).")
+                    }
+                    if shouldForceStrictForExperimentalQwen {
+                        warnings.append("Strict preset auto-applied because selected Qwen variant is experimental.")
+                    }
+                    self.backendWarning = warnings.isEmpty ? nil : warnings.joined(separator: " ")
                     self.isRunning = false
                 }
             } catch {
                 await MainActor.run {
-                    self.errorText = String(describing: error)
+                    var message = String(describing: error)
+                    if message.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "unknown error"
+                        || message.lowercased().contains(": unknown error")
+                    {
+                        let modelExists = FileManager.default.fileExists(atPath: modelURL.path)
+                        let tokExists = FileManager.default.fileExists(atPath: tokenizerURL.path)
+                        message = """
+                        unknown error (no FFI detail)
+                        model=\(modelURL.lastPathComponent) exists=\(modelExists)
+                        tokenizer=\(tokenizerURL.lastPathComponent) exists=\(tokExists)
+                        requested_backend=\(backend.label.lowercased()) active_backend=\(self.activeBackend.isEmpty ? "n/a" : self.activeBackend)
+                        preset=\(preset.rawValue)
+                        """
+                    }
+                    self.errorText = message
                     self.isRunning = false
                 }
             }
@@ -748,7 +799,10 @@ struct LLMView: View {
         if let qwenModel, let qwenTok, qwenCfg {
             modelURL = qwenModel
             tokenizerURL = qwenTok
-            selectedSampleLabel = qwenModel.lastPathComponent.contains("int4") ? "Qwen3.5 (compact/experimental)" : "Qwen3.5 (stable)"
+            let n = qwenModel.lastPathComponent.lowercased()
+            selectedSampleLabel = (n == "qwen3.5-0.8b.cellm" || n == "qwen3.5-0.8b-int8.cellm")
+                ? "Qwen3.5 (parity-fixed)"
+                : "Qwen3.5 (experimental)"
             if downloadStatus.isEmpty { downloadStatus = "Loaded local sample files." }
             return
         }

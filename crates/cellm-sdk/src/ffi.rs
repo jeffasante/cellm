@@ -1,26 +1,49 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr};
+use std::sync::{Mutex, OnceLock};
 use std::path::Path;
 use std::slice;
 
 use crate::{vlm::VlmRunConfig, BackendKind, Engine, EngineConfig, SessionId};
+use cellm_kernels::MetalKernels;
 use cellm_scheduler::ThermalLevel;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
 thread_local! {
-    static LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
     static LAST_VLM_TIMINGS_MS: RefCell<Option<(f64, f64, f64, f64)>> = const { RefCell::new(None) };
     static LAST_VLM_ENCODER_LAYER_MS: RefCell<Option<Vec<f64>>> = const { RefCell::new(None) };
 }
 
+static LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn last_error_cell() -> &'static Mutex<Option<String>> {
+    LAST_ERROR.get_or_init(|| Mutex::new(None))
+}
+
 fn set_last_error(msg: impl Into<String>) {
-    LAST_ERROR.with(|e| *e.borrow_mut() = Some(msg.into()));
+    let mut g = last_error_cell()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *g = Some(msg.into());
 }
 
 fn take_last_error() -> Option<String> {
-    LAST_ERROR.with(|e| e.borrow_mut().take())
+    let mut g = last_error_cell()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    g.take()
+}
+
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "panic with non-string payload".to_string()
 }
 
 fn set_last_vlm_timings_ms(patch_ms: f64, encoder_ms: f64, decode_ms: f64, total_ms: f64) {
@@ -87,6 +110,29 @@ pub extern "C" fn cellm_last_error_message(out_buf: *mut c_char, buf_len: usize)
         *out_buf.add(n) = 0;
     }
     n
+}
+
+#[no_mangle]
+pub extern "C" fn cellm_metal_smoke_test() -> i32 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        MetalKernels::smoke_test_add_f32()
+            .map_err(|e| format!("metal_smoke_test failed: {e}"))
+    }));
+
+    match result {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) => {
+            set_last_error(e);
+            -1
+        }
+        Err(panic_payload) => {
+            set_last_error(format!(
+                "metal_smoke_test panicked: {}",
+                panic_payload_to_string(panic_payload)
+            ));
+            -1
+        }
+    }
 }
 
 #[no_mangle]
@@ -300,28 +346,37 @@ pub extern "C" fn cellm_engine_create_v3(
     seed: u64,
     backend: u32, // 0=cpu, 1=metal
 ) -> cellm_engine_t {
-    let result = (|| {
-        let model_path = cstr_to_str(model_path)?;
-        let backend = backend_from_ffi(backend)?;
-        let cfg = EngineConfig {
-            tokens_per_block: tokens_per_block as usize,
-            total_blocks: total_blocks as usize,
-            top_k: top_k as usize,
-            temperature: temperature as f64,
-            repeat_penalty: repeat_penalty as f64,
-            repeat_window: repeat_window as usize,
-            seed,
-            backend,
-        };
-        let engine = Engine::new(Path::new(model_path), cfg)
-            .map_err(|e| format!("engine_create_v3 failed: {e}"))?;
-        Ok::<cellm_engine_t, String>(Box::into_raw(Box::new(engine)) as u64)
-    })();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (|| {
+            let model_path = cstr_to_str(model_path)?;
+            let backend = backend_from_ffi(backend)?;
+            let cfg = EngineConfig {
+                tokens_per_block: tokens_per_block as usize,
+                total_blocks: total_blocks as usize,
+                top_k: top_k as usize,
+                temperature: temperature as f64,
+                repeat_penalty: repeat_penalty as f64,
+                repeat_window: repeat_window as usize,
+                seed,
+                backend,
+            };
+            let engine = Engine::new(Path::new(model_path), cfg)
+                .map_err(|e| format!("engine_create_v3 failed: {e}"))?;
+            Ok::<cellm_engine_t, String>(Box::into_raw(Box::new(engine)) as u64)
+        })()
+    }));
 
     match result {
-        Ok(h) => h,
-        Err(e) => {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => {
             set_last_error(e);
+            0
+        }
+        Err(panic_payload) => {
+            set_last_error(format!(
+                "engine_create_v3 panicked: {}",
+                panic_payload_to_string(panic_payload)
+            ));
             0
         }
     }

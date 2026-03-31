@@ -127,10 +127,32 @@ final class CellmEngine {
     init(modelURL: URL, tokenizer: CellmTokenizer, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 512, topK: UInt32 = 40, temperature: Float = 0.2, repeatPenalty: Float = 1.08, repeatWindow: UInt32 = 96, seed: UInt64 = 1, backend: CellmBackend = .metal) throws {
         self.tokenizer = tokenizer
         let path = modelURL.path
-        let h = path.withCString { cstr in
-            cellm_engine_create_v3(cstr, tokensPerBlock, totalBlocks, topK, temperature, repeatPenalty, repeatWindow, seed, backend.rawValue)
+        let requestedBackend: CellmBackend = backend
+        var h = path.withCString { cstr in
+            cellm_engine_create_v3(cstr, tokensPerBlock, totalBlocks, topK, temperature, repeatPenalty, repeatWindow, seed, requestedBackend.rawValue)
         }
-        guard h != 0 else { throw CellmError.message(CellmFFI.lastError()) }
+        var firstError = CellmFFI.lastError()
+
+        // On some devices/SDK states, Metal init can fail without a useful FFI error detail.
+        // Retry with CPU to keep generation usable and surface fallback via activeBackend.
+        if h == 0 && requestedBackend == .metal {
+            h = path.withCString { cstr in
+                cellm_engine_create_v3(cstr, tokensPerBlock, totalBlocks, topK, temperature, repeatPenalty, repeatWindow, seed, CellmBackend.cpu.rawValue)
+            }
+            if h == 0 {
+                let retryError = CellmFFI.lastError()
+                if firstError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || firstError == "unknown error" {
+                    firstError = retryError
+                }
+                let fallbackDetail = retryError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "unknown" : retryError
+                throw CellmError.message("engine_create_v3 failed (metal->cpu retry). first=\(firstError) retry=\(fallbackDetail) model=\(modelURL.lastPathComponent)")
+            }
+        }
+
+        guard h != 0 else {
+            let detail = firstError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "unknown error (ffi returned empty last_error)" : firstError
+            throw CellmError.message("engine_create_v3 failed: \(detail) model=\(modelURL.lastPathComponent) backend=\(requestedBackend.label.lowercased())")
+        }
         self.handle = h
 
         let sid = cellm_session_create(h)
@@ -357,6 +379,13 @@ enum CellmFFI {
         let n = cellm_engine_backend_name(handle, &buf, buf.count)
         if n == 0 { return "unknown" }
         return String(cString: buf)
+    }
+
+    static func metalSmokeError() -> String? {
+        let rc = cellm_metal_smoke_test()
+        if rc == 0 { return nil }
+        let msg = lastError()
+        return msg.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "metal smoke test failed" : msg
     }
 
     static func vlmLastTimings() throws -> VlmTimings {

@@ -144,6 +144,21 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
         }
     };
 
+    if args.backend == BackendKind::Metal {
+        match &mut runner {
+            Runner::Qwen(r) => {
+                if r.enable_metal_linear_backend() {
+                    println!("LLM linear backend: metal (Qwen linear layers)");
+                } else {
+                    println!("LLM linear backend: cpu (metal init failed)");
+                }
+            }
+            Runner::Llama(_) => {
+                println!("LLM linear backend: cpu (metal path not wired for this model yet)");
+            }
+        }
+    }
+
     if let Some(n) = args.max_layers {
         match &mut runner {
             Runner::Llama(r) => r.set_max_layers(n),
@@ -410,7 +425,7 @@ fn select_backend(backend: BackendKind) -> Result<()> {
         BackendKind::Metal => {
             match cellm_kernels::MetalKernels::smoke_test_add_f32() {
                 Ok(_) => {
-                    log::info!("Backend: metal (smoke ok). Forward path currently uses CPU math kernels.");
+                    log::info!("Backend: metal (smoke ok). Qwen uses Metal for linear layers; other math still has CPU fallbacks.");
                     Ok(())
                 }
                 Err(e) => {

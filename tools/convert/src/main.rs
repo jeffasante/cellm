@@ -895,6 +895,11 @@ fn should_quantize_i8_qwen_weight(name: &str, shape: &[usize]) -> bool {
     {
         return false;
     }
+    // Qwen3.5 linear-attention projections are highly sensitive to quantization
+    // in the current runner. Keep them in f16 for parity; quantize the rest.
+    if name.contains(".linear_attn.") {
+        return false;
+    }
     true
 }
 

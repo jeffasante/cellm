@@ -243,10 +243,12 @@ fn main() -> Result<()> {
         );
     }
     if args.quantize_int8_symmetric
-        && !(selected.model_type == "llama" || selected.model_type.starts_with("qwen"))
+        && !(selected.model_type == "llama"
+            || selected.model_type.starts_with("qwen")
+            || selected.model_type.starts_with("gemma"))
     {
         anyhow::bail!(
-            "--quantize-int8-symmetric is currently supported for llama/qwen text stacks only (detected model_type={}).",
+            "--quantize-int8-symmetric is currently supported for llama/qwen/gemma text stacks only (detected model_type={}).",
             selected.model_type
         );
     }
@@ -555,6 +557,8 @@ if hasattr(obj, 'state_dict'):
     obj = obj.state_dict()
 elif isinstance(obj, dict) and 'state_dict' in obj and isinstance(obj['state_dict'], dict):
     obj = obj['state_dict']
+elif isinstance(obj, dict) and 'model_state_dict' in obj and isinstance(obj['model_state_dict'], dict):
+    obj = obj['model_state_dict']
 if not isinstance(obj, dict):
     raise RuntimeError(f'expected state_dict dict, got {type(obj)}')
 
@@ -903,6 +907,25 @@ fn should_quantize_i8_qwen_weight(name: &str, shape: &[usize]) -> bool {
     true
 }
 
+fn should_quantize_i8_gemma_weight(name: &str, shape: &[usize]) -> bool {
+    if shape.len() != 2 || !name.ends_with(".weight") {
+        return false;
+    }
+    let in_gemma_layer = name.contains("model.layers.") || name.contains("model.text_model.layers.");
+    if !in_gemma_layer {
+        return false;
+    }
+    if name.contains("embed_tokens")
+        || name.contains("lm_head")
+        || name.contains("norm")
+        || name.contains("q_norm")
+        || name.contains("k_norm")
+    {
+        return false;
+    }
+    name.contains(".self_attn.") || name.contains(".mlp.")
+}
+
 fn should_quantize_i4_qwen_weight(name: &str, shape: &[usize]) -> bool {
     if shape.len() != 2 || !name.ends_with(".weight") {
         return false;
@@ -920,6 +943,9 @@ fn should_quantize_i8_weight(model_type: &str, name: &str, shape: &[usize]) -> b
     }
     if model_type.starts_with("qwen") {
         return should_quantize_i8_qwen_weight(name, shape);
+    }
+    if model_type.starts_with("gemma") {
+        return should_quantize_i8_gemma_weight(name, shape);
     }
     false
 }

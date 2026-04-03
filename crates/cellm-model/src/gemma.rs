@@ -4,34 +4,36 @@ use bytemuck::cast_slice;
 use cellm_cache::{KVCache, PageTable};
 use cellm_core::CoreError;
 use cellm_kernels::cpu_kernels::{rms_norm_f32, rope_inplace_f32};
+use cellm_kernels::MetalOps;
 use cellm_kernels::metal::MetalMatmul;
-use cellm_kernels::{MetalKernels, MetalOps};
+use cellm_kernels::MetalKernels;
 use half::f16;
 
 use crate::{CellmFile, ModelConfig};
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-use crate::llama_graph::LlamaGraphState;
 
-pub struct LlamaRunner {
+const GEMMA_METAL_LINEAR_MAX_ELEMS: usize = 262_144;
+
+pub struct GemmaRunner {
     file: CellmFile,
     cfg: ModelConfig,
     max_layers: usize,
     eos_token_id: Option<u32>,
     tensor_prefix: String,
-    linear_backend: LlamaLinearBackend,
-    metal_ops: Option<MetalOps>,
+    head_dim: usize,
+    kv_head_dim: usize,
+    rmsnorm_weight_is_offset: bool,
+    linear_backend: GemmaLinearBackend,
     metal_strict: bool,
-    use_metal_mv: bool,
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    graph_state: Option<LlamaGraphState>,
+    /// Present when a Metal backend is active; drives rms_norm / rope / logits on GPU.
+    metal_ops: Option<MetalOps>,
 }
 
-enum LlamaLinearBackend {
+enum GemmaLinearBackend {
     Cpu,
     Metal { ctx: MetalMatmul },
 }
 
-impl LlamaRunner {
+impl GemmaRunner {
     pub fn load(path: &Path) -> Result<Self, CoreError> {
         let file = CellmFile::load(path)?;
         let h = file.header.clone();
@@ -47,7 +49,14 @@ impl LlamaRunner {
             rope_theta: h.rope_theta,
         };
 
-        let tensor_prefix = detect_llama_prefix(&file)?;
+        let tensor_prefix = detect_gemma_prefix(&file)?;
+        let (head_dim, kv_head_dim) = infer_gemma_head_dims(
+            &file,
+            &tensor_prefix,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+        )?;
+        let rmsnorm_weight_is_offset = true;
 
         Ok(Self {
             file,
@@ -55,14 +64,12 @@ impl LlamaRunner {
             max_layers: cfg.num_hidden_layers,
             eos_token_id: h.eos_token_id,
             tensor_prefix,
-            linear_backend: LlamaLinearBackend::Cpu,
-            metal_ops: None,
+            head_dim,
+            kv_head_dim,
+            rmsnorm_weight_is_offset,
+            linear_backend: GemmaLinearBackend::Cpu,
             metal_strict: false,
-            use_metal_mv: std::env::var("CELLM_LLAMA_USE_MV")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            graph_state: None,
+            metal_ops: None,
         })
     }
 
@@ -82,20 +89,18 @@ impl LlamaRunner {
         self.eos_token_id
     }
 
-    pub fn hidden_size(&self) -> usize {
-        self.cfg.hidden_size
-    }
-
     pub fn enable_metal_linear_backend(&mut self) -> bool {
-        match MetalKernels::create_matmul() {
-            Ok(ctx) => {
-                self.linear_backend = LlamaLinearBackend::Metal { ctx };
+        match (MetalKernels::create_matmul(), MetalOps::create()) {
+            (Ok(ctx), Ok(ops)) => {
+                self.linear_backend = GemmaLinearBackend::Metal { ctx };
+                self.metal_ops = Some(ops);
                 self.metal_strict = false;
                 true
             }
-            Err(e) => {
-                eprintln!("llama: failed to enable metal linear backend: {e}");
-                self.linear_backend = LlamaLinearBackend::Cpu;
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("gemma: failed to enable metal linear backend: {e}");
+                self.linear_backend = GemmaLinearBackend::Cpu;
+                self.metal_ops = None;
                 self.metal_strict = false;
                 false
             }
@@ -103,63 +108,25 @@ impl LlamaRunner {
     }
 
     pub fn enable_metal_full_backend(&mut self) -> bool {
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            // The fused graph path can regress latency for short prompts and is still
-            // experimental. Keep it opt-in so default Metal runs stay fast/stable.
-            let graph_enabled = std::env::var("CELLM_LLAMA_ENABLE_GRAPH")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if graph_enabled {
-                let gs_res = LlamaGraphState::new(
-                    self.cfg.hidden_size,
-                    self.cfg.num_attention_heads,
-                    self.cfg.num_key_value_heads,
-                    self.cfg.vocab_size,
-                    self.cfg.intermediate_size,
-                );
-                match gs_res {
-                    Ok(mut gs) => {
-                        println!("llama: detected tensor prefix: '{}'", self.tensor_prefix);
-                        println!("llama: preloading weights into metal graph...");
-                        for (name, data) in self.file.all_tensors() {
-                            gs.preload_weight_f16(name.to_string(), data);
-                        }
-                        self.graph_state = Some(gs);
-                        // Use the existing MetalKernels factory
-                        if let Ok(ctx) = cellm_kernels::metal::MetalKernels::create_matmul() {
-                            self.linear_backend = LlamaLinearBackend::Metal { ctx };
-                        }
-                        if let Ok(mo) = MetalOps::create() {
-                            self.metal_ops = Some(mo);
-                        }
-                        self.metal_strict = true;
-                        return true;
-                    }
-                    Err(e) => {
-                        eprintln!("llama: failed to enable metal graph backend: {e}");
-                    }
-                }
-            }
-        }
-
-        let mk_res = MetalKernels::create_matmul();
-        let mo_res = MetalOps::create();
-        match (mk_res, mo_res) {
-            (Ok(ctx), Ok(mo)) => {
-                self.linear_backend = LlamaLinearBackend::Metal { ctx };
-                self.metal_ops = Some(mo);
+        match (MetalKernels::create_matmul(), MetalOps::create()) {
+            (Ok(ctx), Ok(ops)) => {
+                self.linear_backend = GemmaLinearBackend::Metal { ctx };
+                self.metal_ops = Some(ops);
                 self.metal_strict = true;
                 true
             }
             (Err(e), _) | (_, Err(e)) => {
-                eprintln!("llama: failed to enable full metal backend: {e}");
-                self.linear_backend = LlamaLinearBackend::Cpu;
+                eprintln!("gemma: failed to enable full metal backend: {e}");
+                self.linear_backend = GemmaLinearBackend::Cpu;
                 self.metal_ops = None;
                 self.metal_strict = false;
                 false
             }
         }
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        self.cfg.hidden_size
     }
 
     pub fn embed_token_hidden(&self, token: u32, out: &mut [f32]) -> Result<(), CoreError> {
@@ -187,72 +154,48 @@ impl LlamaRunner {
         kv_cache: &mut KVCache,
         top_k: usize,
     ) -> Result<Vec<(u32, f32)>, CoreError> {
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            let mut disable_graph = false;
-            if let Some(gs) = &mut self.graph_state {
-                // Ensure pagetable covers this token position.
-                if pos == page_table.token_count() {
-                    page_table.append_token(kv_cache.allocator_mut()).map_err(|e| {
-                        CoreError::Backend(format!("llama step: page_table append_token failed: {e}"))
-                    })?;
-                }
-                let block_id = page_table.block_for_token(pos).map_err(|e| {
-                    CoreError::Backend(format!("llama step: page_table block_for_token failed: {e}"))
-                })?;
-                let token_off = page_table.offset_in_block(pos).map_err(|e| {
-                    CoreError::Backend(format!("llama step: page_table offset_in_block failed: {e}"))
-                })?;
-
-                if let Ok(logits) = gs.step_fused(x0, &self.cfg, &self.tensor_prefix, kv_cache, page_table, pos, token_off, block_id as u32) {
-                    let has_non_finite = logits.iter().any(|v| !v.is_finite());
-                    if has_non_finite {
-                        eprintln!("llama fused graph: non-finite logits detected; disabling fused graph and continuing with non-fused Metal path");
-                        disable_graph = true;
-                    } else {
-                        return self.topk_from_logits(&logits, top_k);
-                    }
-                }
-            }
-            if disable_graph {
-                self.graph_state = None;
-            }
-        }
         let cfg = self.cfg.clone();
         let hidden = cfg.hidden_size;
-        // ... (rest of the function continues below)
         let n_heads = cfg.num_attention_heads;
         let n_kv_heads = cfg.num_key_value_heads;
-        let head_dim = hidden / n_heads;
-        if head_dim * n_heads != hidden {
+        let head_dim = self.head_dim;
+        let kv_head_dim = self.kv_head_dim;
+        if n_heads * head_dim == 0 || n_kv_heads * kv_head_dim == 0 {
             return Err(CoreError::Backend(
-                "llama: hidden_size must be divisible by num_attention_heads".into(),
+                "gemma: invalid attention head geometry".into(),
             ));
         }
-        let kv_dim = n_kv_heads * head_dim;
+        if head_dim != kv_head_dim {
+            return Err(CoreError::Backend(format!(
+                "gemma: head_dim mismatch q={} kv={} (mixed dims not supported yet)",
+                head_dim, kv_head_dim
+            )));
+        }
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * kv_head_dim;
 
         // Ensure pagetable covers this token position.
         if pos == page_table.token_count() {
             page_table.append_token(kv_cache.allocator_mut()).map_err(|e| {
-                CoreError::Backend(format!("llama step: page_table append_token failed: {e}"))
+                CoreError::Backend(format!("gemma step: page_table append_token failed: {e}"))
             })?;
         } else if pos > page_table.token_count() {
             return Err(CoreError::Backend(format!(
-                "llama step: non-contiguous pos {pos} (token_count={})",
+                "gemma step: non-contiguous pos {pos} (token_count={})",
                 page_table.token_count()
             )));
         }
 
         let block_id = page_table.block_for_token(pos).map_err(|e| {
-            CoreError::Backend(format!("llama step: page_table block_for_token failed: {e}"))
+            CoreError::Backend(format!("gemma step: page_table block_for_token failed: {e}"))
         })?;
         let token_off = page_table.offset_in_block(pos).map_err(|e| {
-            CoreError::Backend(format!("llama step: page_table offset_in_block failed: {e}"))
+            CoreError::Backend(format!("gemma step: page_table offset_in_block failed: {e}"))
         })?;
 
         if x0.len() != hidden {
             return Err(CoreError::Backend(format!(
-                "llama step_from_hidden: hidden len mismatch {} != {}",
+                "gemma step_from_hidden: hidden len mismatch {} != {}",
                 x0.len(),
                 hidden
             )));
@@ -262,31 +205,28 @@ impl LlamaRunner {
         // Per-layer scratch.
         let mut attn_norm_w = vec![0.0f32; hidden];
         let mut x_norm = vec![0.0f32; hidden];
-        let mut q = vec![0.0f32; hidden];
+        let mut q = vec![0.0f32; q_dim];
         let mut k = vec![0.0f32; kv_dim];
         let mut v = vec![0.0f32; kv_dim];
-        let mut attn_out = vec![0.0f32; hidden];
+        let mut attn_out = vec![0.0f32; q_dim];
         let mut attn_proj = vec![0.0f32; hidden];
 
-        let mut post_norm_w = vec![0.0f32; hidden];
+        let mut q_norm_w = vec![0.0f32; head_dim];
+        let mut k_norm_w = vec![0.0f32; kv_head_dim];
+        let mut post_attn_norm_w = vec![0.0f32; hidden];
+        let mut pre_ffn_norm_w = vec![0.0f32; hidden];
+        let mut post_ffn_norm_w = vec![0.0f32; hidden];
         let mut mlp_in = vec![0.0f32; hidden];
         let mut gate = vec![0.0f32; cfg.intermediate_size];
         let mut up = vec![0.0f32; cfg.intermediate_size];
+        let mut ffn_out = vec![0.0f32; cfg.intermediate_size];
         let mut down = vec![0.0f32; hidden];
 
         let mut gather_bases: Vec<usize> = Vec::new();
 
         for layer in 0..self.max_layers {
-            let use_metal_norm = self.metal_ops.is_some();
-            let use_metal_rope = self.metal_ops.is_some();
-
-            // Attention input norm.
-            if use_metal_norm {
-                let w = self.tensor_f16(&format!("model.layers.{layer}.input_layernorm.weight"))?.to_vec();
-                self.metal_ops.as_mut().unwrap()
-                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, false, &mut x_norm)
-                    .map_err(|e| CoreError::Backend(e.to_string()))?;
-            } else {
+            // ── Attention input norm (always CPU for now, Metal for rope/logits) ──
+            {
                 self.rmsnorm_weight(
                     &format!("model.layers.{layer}.input_layernorm.weight"),
                     &mut attn_norm_w,
@@ -294,11 +234,14 @@ impl LlamaRunner {
                 rms_norm_f32(&x, &attn_norm_w, cfg.rms_norm_eps, &mut x_norm);
             }
 
+            let use_metal_norm = self.metal_ops.is_some();
+            let use_metal_rope = self.metal_ops.is_some();
+
             // QKV projections (HF weights are [out, in]).
             self.linear_f16_out_in(
                 &x_norm,
                 &format!("model.layers.{layer}.self_attn.q_proj.weight"),
-                hidden,
+                q_dim,
                 hidden,
                 &mut q,
             )?;
@@ -317,15 +260,56 @@ impl LlamaRunner {
                 &mut v,
             )?;
 
+            // ── Gemma per-head Q/K RMSNorm before RoPE ────────────────────────
+            if use_metal_norm {
+                let qw = self.tensor_f16(
+                    &format!("model.layers.{layer}.self_attn.q_norm.weight"))?.to_vec();
+                let kw = self.tensor_f16(
+                    &format!("model.layers.{layer}.self_attn.k_norm.weight"))?.to_vec();
+                let ops = self.metal_ops.as_mut().unwrap();
+                for hidx in 0..n_heads {
+                    let seg = &mut q[hidx * head_dim..(hidx + 1) * head_dim];
+                    let inp = seg.to_vec();
+                    ops.rms_norm_f16w(&inp, &qw, cfg.rms_norm_eps, false, seg)
+                        .map_err(|e| CoreError::Backend(e.to_string()))?;
+                }
+                for hidx in 0..n_kv_heads {
+                    let seg = &mut k[hidx * kv_head_dim..(hidx + 1) * kv_head_dim];
+                    let inp = seg.to_vec();
+                    ops.rms_norm_f16w(&inp, &kw, cfg.rms_norm_eps, false, seg)
+                        .map_err(|e| CoreError::Backend(e.to_string()))?;
+                }
+            } else {
+                self.rmsnorm_weight(
+                    &format!("model.layers.{layer}.self_attn.q_norm.weight"),
+                    &mut q_norm_w,
+                )?;
+                self.rmsnorm_weight(
+                    &format!("model.layers.{layer}.self_attn.k_norm.weight"),
+                    &mut k_norm_w,
+                )?;
+                for hidx in 0..n_heads {
+                    let start = hidx * head_dim;
+                    let end = start + head_dim;
+                    self.rms_norm_inplace_segment(&mut q[start..end], &q_norm_w, cfg.rms_norm_eps);
+                }
+                for hidx in 0..n_kv_heads {
+                    let start = hidx * kv_head_dim;
+                    let end = start + kv_head_dim;
+                    self.rms_norm_inplace_segment(&mut k[start..end], &k_norm_w, cfg.rms_norm_eps);
+                }
+            }
+
+            // ── RoPE ──────────────
             if use_metal_rope {
                 let ops = self.metal_ops.as_mut().unwrap();
                 ops.rope_adj_f32(&mut q, n_heads, head_dim, pos, cfg.rope_theta)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
-                ops.rope_adj_f32(&mut k, n_kv_heads, head_dim, pos, cfg.rope_theta)
+                ops.rope_adj_f32(&mut k, n_kv_heads, kv_head_dim, pos, cfg.rope_theta)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
             } else {
                 rope_inplace_f32(&mut q, n_heads, head_dim, pos, cfg.rope_theta);
-                rope_inplace_f32(&mut k, n_kv_heads, head_dim, pos, cfg.rope_theta);
+                rope_inplace_f32(&mut k, n_kv_heads, kv_head_dim, pos, cfg.rope_theta);
             }
 
             // Write new token K/V into paged cache.
@@ -341,10 +325,10 @@ impl LlamaRunner {
             gather_bases.reserve(seq);
             for tpos in 0..seq {
                 let b = page_table.block_for_token(tpos).map_err(|e| {
-                    CoreError::Backend(format!("llama: block_for_token failed: {e}"))
+                    CoreError::Backend(format!("gemma: block_for_token failed: {e}"))
                 })?;
                 let o = page_table.offset_in_block(tpos).map_err(|e| {
-                    CoreError::Backend(format!("llama: offset_in_block failed: {e}"))
+                    CoreError::Backend(format!("gemma: offset_in_block failed: {e}"))
                 })?;
                 gather_bases.push(cr.layout.token_base_elem(b, layer, o)?);
             }
@@ -362,29 +346,48 @@ impl LlamaRunner {
                 &attn_out,
                 &format!("model.layers.{layer}.self_attn.o_proj.weight"),
                 hidden,
-                hidden,
+                q_dim,
                 &mut attn_proj,
             )?;
 
-            for i in 0..hidden {
-                x[i] += attn_proj[i];
-            }
+            let x_residual = x.clone();
+            for i in 0..hidden { x[i] += attn_proj[i]; }
 
-            // Post-attn norm.
+            // ── Post-attention norm 
             if use_metal_norm {
-                let w = self.tensor_f16(&format!("model.layers.{layer}.post_attention_layernorm.weight"))?.to_vec();
+                let w = self.tensor_f16(
+                    &format!("model.layers.{layer}.post_attention_layernorm.weight"))?.to_vec();
+                let add_one = self.rmsnorm_weight_is_offset;
+                let mut x_out = vec![0.0f32; hidden];
                 self.metal_ops.as_mut().unwrap()
-                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, false, &mut mlp_in)
+                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &mut x_out)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
+                for i in 0..hidden { x[i] = x_out[i] + x_residual[i]; }
             } else {
                 self.rmsnorm_weight(
                     &format!("model.layers.{layer}.post_attention_layernorm.weight"),
-                    &mut post_norm_w,
+                    &mut post_attn_norm_w,
                 )?;
-                rms_norm_f32(&x, &post_norm_w, cfg.rms_norm_eps, &mut mlp_in);
+                rms_norm_f32(&x, &post_attn_norm_w, cfg.rms_norm_eps, &mut x_norm);
+                for i in 0..hidden { x[i] = x_norm[i] + x_residual[i]; }
             }
 
-            // MLP: gate_proj + up_proj -> silu(gate)*up -> down_proj
+            // ── Pre-FFN norm ───────
+            if use_metal_norm {
+                let w = self.tensor_f16(
+                    &format!("model.layers.{layer}.pre_feedforward_layernorm.weight"))?.to_vec();
+                let add_one = self.rmsnorm_weight_is_offset;
+                self.metal_ops.as_mut().unwrap()
+                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &mut mlp_in)
+                    .map_err(|e| CoreError::Backend(e.to_string()))?;
+            } else {
+                self.rmsnorm_weight(
+                    &format!("model.layers.{layer}.pre_feedforward_layernorm.weight"),
+                    &mut pre_ffn_norm_w,
+                )?;
+                rms_norm_f32(&x, &pre_ffn_norm_w, cfg.rms_norm_eps, &mut mlp_in);
+            }
+
             self.linear_f16_out_in(
                 &mlp_in,
                 &format!("model.layers.{layer}.mlp.gate_proj.weight"),
@@ -399,36 +402,47 @@ impl LlamaRunner {
                 hidden,
                 &mut up,
             )?;
-
-            // silu(gate) in-place: x * sigmoid(x)
-            for g in gate.iter_mut() {
-                let s = 1.0 / (1.0 + (-*g).exp());
-                *g = *g * s;
-            }
             for i in 0..gate.len() {
-                gate[i] *= up[i];
+                ffn_out[i] = gelu_tanh_f32(gate[i]) * up[i];
             }
-
             self.linear_f16_out_in(
-                &gate,
+                &ffn_out,
                 &format!("model.layers.{layer}.mlp.down_proj.weight"),
                 hidden,
                 cfg.intermediate_size,
                 &mut down,
             )?;
-            for i in 0..hidden {
-                x[i] += down[i];
+            let x_residual = x.clone();
+            for i in 0..hidden { x[i] += down[i]; }
+
+            // ── Post-FFN norm ──────
+            if use_metal_norm {
+                let wffn = self.tensor_f16(
+                    &format!("model.layers.{layer}.post_feedforward_layernorm.weight"))?.to_vec();
+                let add_one = self.rmsnorm_weight_is_offset;
+                let mut x_out = vec![0.0f32; hidden];
+                self.metal_ops.as_mut().unwrap()
+                    .rms_norm_f16w(&x, &wffn, cfg.rms_norm_eps, add_one, &mut x_out)
+                    .map_err(|e| CoreError::Backend(e.to_string()))?;
+                for i in 0..hidden { x[i] = x_out[i] + x_residual[i]; }
+            } else {
+                self.rmsnorm_weight(
+                    &format!("model.layers.{layer}.post_feedforward_layernorm.weight"),
+                    &mut post_ffn_norm_w,
+                )?;
+                rms_norm_f32(&x, &post_ffn_norm_w, cfg.rms_norm_eps, &mut x_norm);
+                for i in 0..hidden { x[i] = x_norm[i] + x_residual[i]; }
             }
         }
 
         // Final norm.
         let use_metal_norm = self.metal_ops.is_some();
-        let use_metal_logits = self.metal_ops.is_some();
         let mut x_final = vec![0.0f32; hidden];
         if use_metal_norm {
             let w = self.tensor_f16("model.norm.weight")?.to_vec();
+            let add_one = self.rmsnorm_weight_is_offset;
             self.metal_ops.as_mut().unwrap()
-                .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, false, &mut x_final)
+                .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &mut x_final)
                 .map_err(|e| CoreError::Backend(e.to_string()))?;
         } else {
             let mut norm_w = vec![0.0f32; hidden];
@@ -436,12 +450,11 @@ impl LlamaRunner {
             rms_norm_f32(&x, &norm_w, cfg.rms_norm_eps, &mut x_final);
         }
 
-        // Logits via tied embeddings: logits[v] = dot(x_final, embed[v])
+        // Logits via tied embeddings / lm_head.
         let vocab = cfg.vocab_size;
         let k = top_k.max(1).min(vocab);
-        let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
-        let mut min_idx = 0usize;
-        let mut min_val = f32::INFINITY;
+
+        let use_metal_logits = self.metal_ops.is_some();
 
         let lm_head_name = self.resolve_name("lm_head.weight");
         let maybe_lm_head = lm_head_name
@@ -455,9 +468,13 @@ impl LlamaRunner {
         let lm_meta = self
             .tensor_meta_by_exact_name(&lm_src_resolved)
             .ok_or_else(|| CoreError::Backend(format!("unknown tensor {}", lm_src_resolved)))?;
+        let lm_dtype = lm_meta.dtype.clone();
+
+        // Compute all vocab logits on GPU when Metal is active, otherwise CPU.
+        let all_logits: Vec<f32>;
         if use_metal_logits {
             let mut buf = vec![0.0f32; vocab];
-            match lm_meta.dtype.as_str() {
+            match lm_dtype.as_str() {
                 "f16" => {
                     let w = self.tensor_f16_by_exact_name(&lm_src_resolved)?.to_vec();
                     self.metal_ops.as_mut().unwrap()
@@ -471,74 +488,57 @@ impl LlamaRunner {
                         .logits_i8(&x_final, &w, &s, vocab, hidden, &lm_src_resolved, &mut buf)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                 }
-                other => return Err(CoreError::Backend(format!("unsupported lm dtype {other} for {lm_src_resolved}"))),
+                other => return Err(CoreError::Backend(format!(
+                    "unsupported lm dtype {other} for {lm_src_resolved}"))),
             }
-            sanitize_logits_non_finite(&mut buf, "llama metal logits");
-            return self.topk_from_logits(&buf, top_k);
+            all_logits = buf;
+        } else {
+            // CPU path.
+            let lm_src_f16 = if lm_dtype == "f16" {
+                Some(self.tensor_f16_by_exact_name(&lm_src_resolved)?)
+            } else { None };
+            let lm_src_i8 = if lm_dtype == "i8" {
+                Some(self.tensor_i8_by_exact_name(&lm_src_resolved)?)
+            } else { None };
+            let lm_src_scales = if lm_dtype == "i8" {
+                Some(self.tensor_f16_by_exact_name(&format!("{lm_src_resolved}.qscale"))?)
+            } else { None };
+            let mut buf = vec![0.0f32; vocab];
+            for vid in 0..vocab {
+                let mut dot = 0.0f32;
+                if let Some(wf16) = lm_src_f16 {
+                    let row = &wf16[vid * hidden..(vid + 1) * hidden];
+                    for i in 0..hidden { dot += x_final[i] * f16::from_bits(row[i]).to_f32(); }
+                } else if let (Some(wi8), Some(scales)) = (lm_src_i8, lm_src_scales) {
+                    let row = &wi8[vid * hidden..(vid + 1) * hidden];
+                    let scale = f16::from_bits(scales[vid]).to_f32();
+                    for i in 0..hidden { dot += x_final[i] * (row[i] as f32) * scale; }
+                } else {
+                    return Err(CoreError::Backend(format!(
+                        "unsupported lm dtype {lm_dtype} for {lm_src_resolved}")));
+                }
+                buf[vid] = dot;
+            }
+            all_logits = buf;
         }
 
-        let lm_src_f16 = if lm_meta.dtype == "f16" {
-            Some(self.tensor_f16_by_exact_name(&lm_src_resolved)?)
-        } else {
-            None
-        };
-        let lm_src_i8 = if lm_meta.dtype == "i8" {
-            Some(self.tensor_i8_by_exact_name(&lm_src_resolved)?)
-        } else {
-            None
-        };
-        let lm_i8_scales = if lm_meta.dtype == "i8" {
-            Some(self.tensor_f16_by_exact_name(&format!("{lm_src_resolved}.qscale"))?)
-        } else {
-            None
-        };
-
-        for vid in 0..vocab {
-            let mut dot = if let Some(w) = lm_src_f16 {
-                let row = &w[vid * hidden..(vid + 1) * hidden];
-                let mut acc = 0.0f32;
-                for i in 0..hidden {
-                    acc += x_final[i] * f16::from_bits(row[i]).to_f32();
-                }
-                acc
-            } else if let Some(w) = lm_src_i8 {
-                let scales = lm_i8_scales.unwrap();
-                let row = &w[vid * hidden..(vid + 1) * hidden];
-                let scale = f16::from_bits(scales[vid]).to_f32();
-                let mut acc = 0.0f32;
-                for i in 0..hidden {
-                    acc += x_final[i] * ((row[i] as f32) * scale);
-                }
-                acc
-            } else {
-                return Err(CoreError::Backend(format!(
-                    "unsupported lm dtype {}",
-                    lm_meta.dtype
-                )));
-            };
-            if !dot.is_finite() {
-                dot = f32::NEG_INFINITY;
-            }
-
+        // Top-k selection from flat logits (always on CPU – tiny work).
+        let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
+        let mut min_idx = 0usize;
+        let mut min_val = f32::INFINITY;
+        for (vid, &dot) in all_logits.iter().enumerate() {
             if top.len() < k {
                 top.push((vid as u32, dot));
-                if dot < min_val {
-                    min_val = dot;
-                    min_idx = top.len() - 1;
-                }
+                if dot < min_val { min_val = dot; min_idx = top.len() - 1; }
             } else if dot > min_val {
                 top[min_idx] = (vid as u32, dot);
-                min_val = top[0].1;
-                min_idx = 0;
+                min_val = top[0].1; min_idx = 0;
                 for (i, &(_, s)) in top.iter().enumerate().skip(1) {
-                    if s < min_val {
-                        min_val = s;
-                        min_idx = i;
-                    }
+                    if s < min_val { min_val = s; min_idx = i; }
                 }
             }
         }
-        top.sort_by(|a, b| b.1.total_cmp(&a.1));
+        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         Ok(top)
     }
 
@@ -586,7 +586,12 @@ impl LlamaRunner {
             )));
         }
         for i in 0..out.len() {
-            out[i] = f16::from_bits(w[i]).to_f32();
+            let base = f16::from_bits(w[i]).to_f32();
+            out[i] = if self.rmsnorm_weight_is_offset {
+                base + 1.0
+            } else {
+                base
+            };
         }
         Ok(())
     }
@@ -627,10 +632,8 @@ impl LlamaRunner {
         }
         let dtype = meta.dtype.clone();
 
-        // Optional path: use MetalOps matrix-vector kernels with internal GPU-side cache.
-        // Disabled by default for Llama because small-model prefill can regress.
-        let need_metal_mv = dtype == "i8" || self.use_metal_mv;
-        if need_metal_mv && self.metal_ops.is_some() {
+        // Fast path: use MetalOps matrix-vector kernels with internal GPU-side caching.
+        if self.metal_ops.is_some() {
             match dtype.as_str() {
                 "f16" => {
                     let w = self.tensor_f16_by_exact_name(&resolved)?;
@@ -664,11 +667,11 @@ impl LlamaRunner {
             }
         }
 
-        if let LlamaLinearBackend::Metal { ctx } = &self.linear_backend {
+        if let GemmaLinearBackend::Metal { ctx } = &self.linear_backend {
             let max_cols = if in_dim == 0 {
                 1
             } else {
-                (262_144 / in_dim).max(1)
+                (GEMMA_METAL_LINEAR_MAX_ELEMS / in_dim).max(1)
             };
             let chunk_cols = max_cols.min(out_dim.max(1));
             let mut weight_t_chunk = vec![0.0f32; in_dim * chunk_cols];
@@ -714,6 +717,48 @@ impl LlamaRunner {
                         row_start += cols_n;
                     }
                 }
+                "i8" => {
+                    let w = self.tensor_i8_by_exact_name(&resolved)?;
+                    let scales = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
+                    if w.len() != out_dim * in_dim || scales.len() != out_dim {
+                        return Err(CoreError::Backend(format!(
+                            "weight {weight_name} i8/qscale len mismatch: w={} scales={} expected w={} scales={}",
+                            w.len(),
+                            scales.len(),
+                            out_dim * in_dim,
+                            out_dim
+                        )));
+                    }
+                    let mut row_start = 0usize;
+                    while row_start < out_dim {
+                        let cols_n = (out_dim - row_start).min(chunk_cols);
+                        for i in 0..in_dim {
+                            for c in 0..cols_n {
+                                let row_idx = row_start + c;
+                                let scale = f16::from_bits(scales[row_idx]).to_f32();
+                                weight_t_chunk[i * cols_n + c] =
+                                    (w[row_idx * in_dim + i] as f32) * scale;
+                            }
+                        }
+                        let out_slice = &mut out_chunk[..cols_n];
+                        if ctx
+                            .matmul_row_major_f32(
+                                x,
+                                1,
+                                in_dim,
+                                &weight_t_chunk[..in_dim * cols_n],
+                                cols_n,
+                                out_slice,
+                            )
+                            .is_err()
+                        {
+                            metal_ok = false;
+                            break;
+                        }
+                        out[row_start..row_start + cols_n].copy_from_slice(out_slice);
+                        row_start += cols_n;
+                    }
+                }
                 _ => {
                     metal_ok = false;
                 }
@@ -724,7 +769,7 @@ impl LlamaRunner {
             }
             if self.metal_strict {
                 return Err(CoreError::Backend(format!(
-                    "llama full-metal: linear kernel failed for {weight_name}; CPU fallback disabled"
+                    "gemma full-metal: linear kernel failed for {weight_name}; CPU fallback disabled"
                 )));
             }
         }
@@ -803,52 +848,25 @@ impl LlamaRunner {
         Err(CoreError::Backend(format!("unknown tensor {name}")))
     }
 
-    pub fn topk_from_logits(&self, logits: &[f32], top_k: usize) -> Result<Vec<(u32, f32)>, CoreError> {
-        let vocab = logits.len();
-        let k = top_k.max(1).min(vocab);
-        let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
-        let mut min_idx = 0usize;
-        let mut min_val = f32::INFINITY;
-
-        for vid in 0..vocab {
-            let dot = logits[vid];
-            if top.len() < k {
-                top.push((vid as u32, dot));
-                if dot < min_val {
-                    min_val = dot;
-                    min_idx = top.len() - 1;
-                }
-            } else if dot > min_val {
-                top[min_idx] = (vid as u32, dot);
-                min_val = top[0].1;
-                min_idx = 0;
-                for (i, &(_, s)) in top.iter().enumerate().skip(1) {
-                    if s < min_val {
-                        min_val = s;
-                        min_idx = i;
-                    }
-                }
-            }
+    fn rms_norm_inplace_segment(&self, x: &mut [f32], weight: &[f32], eps: f32) {
+        let mut sumsq = 0.0f32;
+        for &v in x.iter() {
+            sumsq += v * v;
         }
-        top.sort_by(|a, b| b.1.total_cmp(&a.1));
-        Ok(top)
+        let inv_rms = 1.0f32 / (sumsq / (x.len() as f32) + eps).sqrt();
+        for i in 0..x.len() {
+            x[i] = x[i] * inv_rms * weight[i];
+        }
     }
 }
 
-fn sanitize_logits_non_finite(logits: &mut [f32], tag: &str) {
-    let mut found = false;
-    for v in logits.iter_mut() {
-        if !v.is_finite() {
-            *v = f32::NEG_INFINITY;
-            found = true;
-        }
-    }
-    if found {
-        eprintln!("{tag}: detected non-finite logits; clamped to -inf");
-    }
+fn gelu_tanh_f32(x: f32) -> f32 {
+    let k = 0.797_884_6f32;
+    let c = 0.044_715f32;
+    0.5f32 * x * (1.0f32 + (k * (x + c * x * x * x)).tanh())
 }
 
-fn detect_llama_prefix(file: &CellmFile) -> Result<String, CoreError> {
+fn detect_gemma_prefix(file: &CellmFile) -> Result<String, CoreError> {
     for prefix in ["", "language_model."] {
         let embed = format!("{prefix}model.embed_tokens.weight");
         let norm = format!("{prefix}model.norm.weight");
@@ -864,6 +882,45 @@ fn detect_llama_prefix(file: &CellmFile) -> Result<String, CoreError> {
         return Ok(String::new());
     }
     Err(CoreError::Backend(
-        "missing required llama tensors: model.embed_tokens.weight/model.norm.weight".into(),
+        "missing required gemma tensors: model.embed_tokens.weight/model.norm.weight".into(),
     ))
+}
+
+fn infer_gemma_head_dims(
+    file: &CellmFile,
+    prefix: &str,
+    n_heads: usize,
+    n_kv_heads: usize,
+) -> Result<(usize, usize), CoreError> {
+    let q_name = format!("{prefix}model.layers.0.self_attn.q_proj.weight");
+    let k_name = format!("{prefix}model.layers.0.self_attn.k_proj.weight");
+    let q_meta = file
+        .tensor_index(&q_name)
+        .ok_or_else(|| CoreError::Backend(format!("gemma: missing tensor {q_name}")))?;
+    let k_meta = file
+        .tensor_index(&k_name)
+        .ok_or_else(|| CoreError::Backend(format!("gemma: missing tensor {k_name}")))?;
+    if q_meta.shape.len() != 2 || k_meta.shape.len() != 2 {
+        return Err(CoreError::Backend(
+            "gemma: expected 2D q_proj/k_proj weights".into(),
+        ));
+    }
+    let q_out = q_meta.shape[0];
+    let k_out = k_meta.shape[0];
+    if n_heads == 0 || n_kv_heads == 0 {
+        return Err(CoreError::Backend(
+            "gemma: num_attention_heads/num_key_value_heads must be > 0".into(),
+        ));
+    }
+    if q_out % n_heads != 0 {
+        return Err(CoreError::Backend(format!(
+            "gemma: q_proj out_dim {q_out} not divisible by n_heads={n_heads}"
+        )));
+    }
+    if k_out % n_kv_heads != 0 {
+        return Err(CoreError::Backend(format!(
+            "gemma: k_proj out_dim {k_out} not divisible by n_kv_heads={n_kv_heads}"
+        )));
+    }
+    Ok((q_out / n_heads, k_out / n_kv_heads))
 }

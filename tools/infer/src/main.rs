@@ -5,7 +5,7 @@ use anyhow::Result;
 use clap::Parser;
 use cellm_cache::{KVCache, PageTable};
 use cellm_core::KvCacheLayout;
-use cellm_model::{llama::LlamaRunner, qwen::QwenRunner, CellmFile};
+use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, qwen::QwenRunner, CellmFile};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
@@ -113,9 +113,19 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    select_backend(args.backend)?;
+    let t_startup = Instant::now();
 
+    let t_stage = Instant::now();
+    select_backend(args.backend)?;
+    println!("Startup: backend check {:.2}s", t_stage.elapsed().as_secs_f64());
+
+    let t_stage = Instant::now();
     let file = CellmFile::load(&args.model)?;
+    println!(
+        "Startup: model header load {:.2}s ({:?})",
+        t_stage.elapsed().as_secs_f64(),
+        args.model
+    );
     let header = file.header.clone();
     if matches!(header.source_safetensors_format.as_deref(), Some("mlx")) {
         anyhow::bail!(
@@ -126,16 +136,19 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
 
     enum Runner {
         Llama(LlamaRunner),
+        Gemma(GemmaRunner),
         Qwen(QwenRunner),
     }
 
     let text_model_type = effective_text_model_type(&header);
+    let t_stage = Instant::now();
     let mut runner = match text_model_type.as_str() {
         "llama" => Runner::Llama(LlamaRunner::load(&args.model)?),
+        t if t.starts_with("gemma") => Runner::Gemma(GemmaRunner::load(&args.model)?),
         t if t.starts_with("qwen") => Runner::Qwen(QwenRunner::load(&args.model)?),
         _ => {
             anyhow::bail!(
-                "infer supports only llama/qwen right now. Detected model_type={:?} effective_text_model_type={:?} architectures={:?} quantization_config={:?}.",
+                "infer supports only llama/gemma/qwen right now. Detected model_type={:?} effective_text_model_type={:?} architectures={:?} quantization_config={:?}.",
                 header.model_type,
                 text_model_type,
                 header.source_architectures,
@@ -143,31 +156,51 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
             );
         }
     };
+    println!(
+        "Startup: runner init {:.2}s (type={})",
+        t_stage.elapsed().as_secs_f64(),
+        text_model_type
+    );
 
     if args.backend == BackendKind::Metal {
+        let t_stage = Instant::now();
         match &mut runner {
             Runner::Qwen(r) => {
-                if r.enable_metal_linear_backend() {
-                    println!("LLM linear backend: metal (Qwen linear layers)");
+                if r.enable_metal_full_backend() {
+                    println!("LLM backend: metal (Qwen full acceleration)");
                 } else {
-                    println!("LLM linear backend: cpu (metal init failed)");
+                    println!("LLM backend: cpu (Qwen metal init failed)");
                 }
             }
-            Runner::Llama(_) => {
-                println!("LLM linear backend: cpu (metal path not wired for this model yet)");
+            Runner::Gemma(r) => {
+                if r.enable_metal_full_backend() {
+                    println!("LLM backend: metal (Gemma full acceleration)");
+                } else {
+                    println!("LLM backend: cpu (Gemma metal init failed)");
+                }
+            }
+            Runner::Llama(r) => {
+                if r.enable_metal_full_backend() {
+                    println!("LLM backend: metal (Llama full acceleration)");
+                } else {
+                    println!("LLM backend: cpu (Llama metal init failed)");
+                }
             }
         }
+        println!("Startup: metal init {:.2}s", t_stage.elapsed().as_secs_f64());
     }
 
     if let Some(n) = args.max_layers {
         match &mut runner {
             Runner::Llama(r) => r.set_max_layers(n),
+            Runner::Gemma(r) => r.set_max_layers(n),
             Runner::Qwen(r) => r.set_max_layers(n),
         }
     }
 
     let cfg = match &runner {
         Runner::Llama(r) => r.config().clone(),
+        Runner::Gemma(r) => r.config().clone(),
         Runner::Qwen(r) => r.config().clone(),
     };
     println!("Model: {:?}", args.model);
@@ -182,10 +215,12 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
     println!("RoPE theta: {}", cfg.rope_theta);
     let active_layers = match &runner {
         Runner::Llama(r) => r.max_layers(),
+        Runner::Gemma(r) => r.max_layers(),
         Runner::Qwen(r) => r.max_layers(),
     };
     println!("Max layers (active): {}", active_layers);
 
+    let t_stage = Instant::now();
     let tokenizer = if args.prompt.is_some() {
         let tok_path = args
             .tokenizer
@@ -195,6 +230,12 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
     } else {
         None
     };
+    if args.prompt.is_some() {
+        println!(
+            "Startup: tokenizer load {:.2}s",
+            t_stage.elapsed().as_secs_f64()
+        );
+    }
 
     let effective_chat_format = if args.chat {
         match args.chat_format {
@@ -215,6 +256,7 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
         ChatFormat::Plain
     };
 
+    let t_stage = Instant::now();
     let prompt_tokens = if let Some(prompt) = args.prompt.as_deref() {
         let tok = tokenizer.as_ref().expect("tokenizer set when prompt set");
         let tok_path = args
@@ -238,10 +280,17 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
     } else {
         (0..args.seq as u32).collect()
     };
+    if args.prompt.is_some() {
+        println!(
+            "Startup: prompt encode {:.2}s",
+            t_stage.elapsed().as_secs_f64()
+        );
+    }
     let seq = prompt_tokens.len();
 
     let head_dim = match &runner {
         Runner::Llama(_) => cfg.hidden_size / cfg.num_attention_heads,
+        Runner::Gemma(_) => infer_gemma_kv_head_dim(&file)?,
         Runner::Qwen(_) => infer_qwen_kv_head_dim(&file)?,
     };
     let total_tokens = seq + args.gen + 8;
@@ -256,14 +305,28 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
         num_kv_heads: cfg.num_key_value_heads,
         head_dim,
     };
-    let mut kv_cache = KVCache::new(layout)?;
+    let kind = if args.backend == BackendKind::Metal {
+        cellm_cache::KvStorageKind::Metal
+    } else {
+        cellm_cache::KvStorageKind::Cpu
+    };
+    let t_stage = Instant::now();
+    let mut kv_cache = KVCache::new_with_kind(layout, kind)?;
     let mut page_table = PageTable::new(1, args.tokens_per_block).unwrap();
+    println!(
+        "Startup: KV init {:.2}s",
+        t_stage.elapsed().as_secs_f64()
+    );
 
     println!(
         "KV cache: blocks={} tokens_per_block={} f16_bytes={}",
         total_blocks,
         args.tokens_per_block,
         kv_cache.layout().total_bytes_f16()
+    );
+    println!(
+        "Startup: total before prefill {:.2}s",
+        t_startup.elapsed().as_secs_f64()
     );
 
     let mut rng = XorShift64::new(args.seed.unwrap_or_else(seed_from_time));
@@ -285,6 +348,7 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
     for (i, &tok) in prompt_tokens.iter().enumerate() {
         let cand = match &mut runner {
             Runner::Llama(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
+            Runner::Gemma(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
             Runner::Qwen(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
         };
         if debug_logits && i + 1 == prompt_tokens.len() {
@@ -321,6 +385,7 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
         let pos = seq + step;
         let cand = match &mut runner {
             Runner::Llama(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
+            Runner::Gemma(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
             Runner::Qwen(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
         };
         if debug_logits && step == 0 {
@@ -345,6 +410,7 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
         if args.stop_eos {
             let eos = match &runner {
                 Runner::Llama(r) => r.eos_token_id(),
+                Runner::Gemma(r) => r.eos_token_id(),
                 Runner::Qwen(r) => r.eos_token_id(),
             };
             if let Some(eos) = eos {
@@ -425,16 +491,15 @@ fn select_backend(backend: BackendKind) -> Result<()> {
         BackendKind::Metal => {
             match cellm_kernels::MetalKernels::smoke_test_add_f32() {
                 Ok(_) => {
-                    log::info!("Backend: metal (smoke ok). Qwen uses Metal for linear layers; other math still has CPU fallbacks.");
+                    log::info!("Backend: metal (smoke ok). Model-specific Metal acceleration enabled where available.");
                     Ok(())
                 }
                 Err(e) => {
                     if arch == "x86_64" {
-                        log::warn!("Backend: metal requested on Intel host ({os}/{arch}) but unavailable ({e}). Falling back to CPU.");
+                        anyhow::bail!("Backend: metal requested on Intel host ({os}/{arch}) but unavailable ({e}).");
                     } else {
-                        log::warn!("Backend: metal requested ({os}/{arch}) but unavailable ({e}). Falling back to CPU.");
+                        anyhow::bail!("Backend: metal requested ({os}/{arch}) but unavailable ({e}).");
                     }
-                    Ok(())
                 }
             }
         }
@@ -453,6 +518,20 @@ fn infer_qwen_kv_head_dim(file: &CellmFile) -> Result<usize> {
         }
     }
     anyhow::bail!("unable to infer qwen KV head_dim (no self_attn.k_proj.weight found in tensor list)")
+}
+
+fn infer_gemma_kv_head_dim(file: &CellmFile) -> Result<usize> {
+    let h = &file.header;
+    let kv_heads = h.num_kv_heads.max(1);
+    for t in &h.tensors {
+        if t.name.contains(".self_attn.k_proj.weight") && t.shape.len() == 2 {
+            let kv_dim = t.shape[0];
+            if kv_dim % kv_heads == 0 {
+                return Ok(kv_dim / kv_heads);
+            }
+        }
+    }
+    anyhow::bail!("unable to infer gemma KV head_dim (no self_attn.k_proj.weight found in tensor list)")
 }
 
 fn build_prompt_text(

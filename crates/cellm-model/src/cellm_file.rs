@@ -110,6 +110,14 @@ impl CellmFile {
         self.tensors.get(name)
     }
 
+    pub fn all_tensors(&self) -> impl Iterator<Item = (&String, &[u8])> {
+        self.tensors.iter().map(move |(name, t)| {
+            let start = t.offset_bytes as usize;
+            let end = start + t.nbytes as usize;
+            (name, &self.mmap[start..end])
+        })
+    }
+
     pub fn tensor_bytes(&self, name: &str) -> Result<&[u8], CoreError> {
         let t = self
             .tensors

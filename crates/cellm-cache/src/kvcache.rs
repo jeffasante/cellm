@@ -29,6 +29,10 @@ pub struct CpuKvStorage {
 }
 
 impl DeviceKvStorage for CpuKvStorage {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn write_token_f16(
         &mut self,
         base: usize,
@@ -412,6 +416,10 @@ impl MetalKvStorage {
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 impl DeviceKvStorage for MetalKvStorage {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn write_token_f16(
         &mut self,
         base: usize,
@@ -1006,6 +1014,10 @@ impl KVCache {
         self.layout
     }
 
+    pub fn storage(&self) -> &dyn DeviceKvStorage {
+        self.storage.as_ref()
+    }
+
     pub fn allocator_mut(&mut self) -> &mut BlockAllocator {
         &mut self.allocator
     }
@@ -1026,5 +1038,75 @@ impl KVCache {
             layout: self.layout,
             storage: self.storage.as_ref(),
         }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+impl MetalKvStorage {
+    /// Appends the single-token GQA kernel to an active command encoder (NO syncing).
+    pub fn encode_attention(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        bases_buf: &metal::BufferRef,
+        bases_offset: u64,
+        q_buf: &metal::BufferRef,
+        out_buf: &metal::BufferRef,
+        seq: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+    ) {
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let seq_ptr = (&seq as *const u32).cast();
+        let n_heads_ptr = (&n_heads as *const u32).cast();
+        let n_kv_heads_ptr = (&n_kv_heads as *const u32).cast();
+        let head_dim_ptr = (&head_dim as *const u32).cast();
+        let scale_ptr = (&scale as *const f32).cast();
+
+        enc.set_compute_pipeline_state(&self.pso_attn_single_gqa_f32);
+        enc.set_buffer(0, Some(&self.k), 0);
+        enc.set_buffer(1, Some(&self.v), 0);
+        enc.set_buffer(2, Some(bases_buf), bases_offset);
+        enc.set_buffer(3, Some(q_buf), 0);
+        enc.set_buffer(4, Some(out_buf), 0);
+        enc.set_bytes(5, std::mem::size_of::<u32>() as u64, seq_ptr);
+        enc.set_bytes(6, std::mem::size_of::<u32>() as u64, n_heads_ptr);
+        enc.set_bytes(7, std::mem::size_of::<u32>() as u64, n_kv_heads_ptr);
+        enc.set_bytes(8, std::mem::size_of::<u32>() as u64, head_dim_ptr);
+        enc.set_bytes(9, std::mem::size_of::<f32>() as u64, scale_ptr);
+
+        let threads = n_heads as u64;
+        let w = self.pso_attn_single_gqa_f32.thread_execution_width() as u64;
+        let tg = metal::MTLSize { width: w.min(threads), height: 1, depth: 1 };
+        let grid = metal::MTLSize { width: threads, height: 1, depth: 1 };
+        enc.dispatch_threads(grid, tg);
+    }
+    
+    pub fn encode_write_token_f32(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        base: usize,
+        k_buf: &metal::BufferRef,
+        v_buf: &metal::BufferRef,
+        kv_dim: usize,
+    ) {
+        let items = kv_dim as u32;
+        let items_ptr = (&items as *const u32).cast();
+        let base_u32 = base as u32;
+        let base_ptr = (&base_u32 as *const u32).cast();
+
+        enc.set_compute_pipeline_state(&self.pso_write_f32);
+        enc.set_buffer(0, Some(&self.k), 0);
+        enc.set_buffer(1, Some(&self.v), 0);
+        enc.set_buffer(2, Some(k_buf), 0);
+        enc.set_buffer(3, Some(v_buf), 0);
+        enc.set_bytes(4, 4, base_ptr);
+        enc.set_bytes(5, 4, items_ptr);
+        
+        let threads = kv_dim as u64;
+        let w = self.pso_write_f32.thread_execution_width() as u64;
+        let tg = metal::MTLSize { width: w.min(threads), height: 1, depth: 1 };
+        let grid = metal::MTLSize { width: threads, height: 1, depth: 1 };
+        enc.dispatch_threads(grid, tg);
     }
 }

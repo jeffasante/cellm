@@ -147,6 +147,39 @@ Sample output:
 Rust programming serves as a concise and concise language that simplifies the creation of programs, making it easier to understand the
 ```
 
+FunctionGemma mobile-actions (Gemma3 text) action smoke test:
+```bash
+./target/release/infer \
+  --model models/functiongemma-270m-mobile-actions.cellm \
+  --tokenizer models/hf/functiongemma-270m-mobile-actions/mobile/tokenizer.json \
+  --prompt "You are a phone automation model. User request: Turn on Wi-Fi and open Settings. Return only a short action plan." \
+  --chat \
+  --chat-format plain \
+  --gen 32 \
+  --temperature 0 \
+  --backend metal
+```
+
+Note:
+- This confirms Gemma linear layers run on Metal (`LLM linear backend: metal (Gemma linear layers)`).
+- Current output quality for this converted mobile checkpoint is still poor/repetitive; architecture support is in active bring-up.
+
+Observed output (April 3, 2026):
+```text
+setPrototypeOfsetPrototypeOfsetPrototypeOf...
+```
+
+Supported Mobile Actions (reference prompts):
+
+| Function | Example Prompt |
+| --- | --- |
+| Flashlight | "Turn on the flashlight" |
+| Contacts | "Create a contact for John Doe with phone 555-1234" |
+| Email | "Send email to john@example.com" |
+| Maps | "Show Times Square on the map" |
+| WiFi | "Turn off WiFi" |
+| Calendar | "Create a calendar event for Team Meeting tomorrow at 2 PM" |
+
 ### Run VLM (SmolVLM-256M via ONNX, Rust validation)
 SmolVLM-256M-Instruct ships official ONNX exports (`vision_encoder`, `embed_tokens`, `decoder_model_merged`). For quick local validation on macOS, use:
 
@@ -287,6 +320,16 @@ CPU vs Metal request benchmark (same prompts/settings, local run on March 29, 20
 | `infer` (`smollm2-135m-int8`, `--gen 16`) | `--backend metal` | `Backend: metal (smoke ok)` | N/A | `12` tokens in `1.75s` | `16` tokens in `2.07s` |
 | `vlm-infer` (`fp16`, `rococo.jpg`, `--max-new-tokens 16`) | `--backend cpu` | `Backend: cpu (macos/aarch64)` | `[64, 576]` in `2.28s` | N/A | `16` tokens in `2.37s` |
 | `vlm-infer` (`fp16`, `rococo.jpg`, `--max-new-tokens 16`) | `--backend metal` | `Backend: metal (smoke ok)` | `[64, 576]` in `1.85s` | N/A | `16` tokens in `2.56s` |
+
+CPU vs Metal LLM benchmark snapshot (3 passes, local run on April 3, 2026; prompt=`"hi"`, `--gen 8`, report = median / P95):
+| Model | Backend | Startup (s) | Prefill (s) | Decode (s) |
+|---|---|---:|---:|---:|
+| `smollm2-135m-int8.cellm` | `cpu` | `0.04 / 0.04` | `0.07 / 0.30` | `0.50 / 0.51` |
+| `smollm2-135m-int8.cellm` | `metal` | `0.14 / 0.15` | `0.95 / 1.36` | `0.33 / 0.86` |
+| `gemma-3-1b-it-int8.cellmd` | `cpu` | `1.02 / 1.11` | `0.56 / 2.75` | `4.12 / 4.16` |
+| `gemma-3-1b-it-int8.cellmd` | `metal` | `1.06 / 1.07` | `0.80 / 0.98` | `3.62 / 4.01` |
+| `qwen3.5-0.8b-int8.cellm` | `cpu` | `0.28 / 0.32` | `0.52 / 1.98` | `3.79 / 3.85` |
+| `qwen3.5-0.8b-int8.cellm` | `metal` | `0.34 / 0.34` | `0.46 / 0.52` | `2.47 / 2.55` |
 
 Note: in restricted/sandboxed shells, Metal device discovery can fail and trigger CPU fallback. On host macOS runs, Metal smoke succeeds.
 

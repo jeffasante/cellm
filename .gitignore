@@ -30,6 +30,7 @@ cellm.md
 
 # Large local model artifacts (keep out of git history)
 models/**/*.cellm
+models/**/*.cellmd
 !models/smollm2-135m-int8.cellm
 !models/smolvlm-256m-int8.cellm
 !models/qwen3.5-0.8b-int4-textonly.cellm

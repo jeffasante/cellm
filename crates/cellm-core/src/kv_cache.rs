@@ -73,6 +73,8 @@ impl KvCacheLayout {
 }
 
 pub trait DeviceKvStorage: Send + Sync + std::fmt::Debug {
+    fn as_any(&self) -> &dyn std::any::Any;
+
     fn write_token_f16(
         &mut self,
         base: usize,

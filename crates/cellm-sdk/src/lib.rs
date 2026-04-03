@@ -5,7 +5,7 @@ use anyhow::Result;
 use cellm_cache::{KVCache, KvStorageKind, PageTable};
 use cellm_core::KvCacheLayout;
 use cellm_kernels::MetalKernels;
-use cellm_model::{llama::LlamaRunner, qwen::QwenRunner, CellmFile, ModelConfig};
+use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, qwen::QwenRunner, CellmFile, ModelConfig};
 use cellm_scheduler::{RoundRobinScheduler, Session as SchedSession, SessionState, ThermalLevel, ThermalPolicy};
 use serde_json::Value;
 
@@ -58,6 +58,7 @@ struct EngineSession {
 
 enum Runner {
     Llama(LlamaRunner),
+    Gemma(GemmaRunner),
     Qwen(QwenRunner),
 }
 
@@ -92,6 +93,7 @@ impl Engine {
         let text_model_type = effective_text_model_type(&header);
         let mut runner = match text_model_type.as_str() {
             "llama" => Runner::Llama(LlamaRunner::load(model_path)?),
+            t if t.starts_with("gemma") => Runner::Gemma(GemmaRunner::load(model_path)?),
             t if t.starts_with("qwen") => Runner::Qwen(QwenRunner::load(model_path)?),
             other => anyhow::bail!(
                 "unsupported model_type for Engine: model_type={} effective_text_model_type={other}",
@@ -99,20 +101,30 @@ impl Engine {
             ),
         };
         if selected_backend == BackendKind::Metal {
-            if let Runner::Qwen(r) = &mut runner {
-                if !r.enable_metal_full_backend() {
-                    anyhow::bail!("Qwen full-metal backend requested but unavailable");
+            match &mut runner {
+                Runner::Qwen(r) => {
+                    if !r.enable_metal_full_backend() {
+                        anyhow::bail!("Qwen full-metal backend requested but unavailable");
+                    }
                 }
+                Runner::Gemma(r) => {
+                    if !r.enable_metal_linear_backend() {
+                        eprintln!("cellm-sdk: Gemma metal linear backend unavailable; using CPU linear path");
+                    }
+                }
+                Runner::Llama(_) => {}
             }
         }
 
         let cfg = match &runner {
             Runner::Llama(r) => r.config().clone(),
+            Runner::Gemma(r) => r.config().clone(),
             Runner::Qwen(r) => r.config().clone(),
         };
 
         let head_dim = match &runner {
             Runner::Llama(_) => cfg.hidden_size / cfg.num_attention_heads,
+            Runner::Gemma(_) => infer_gemma_kv_head_dim(&file)?,
             Runner::Qwen(_) => infer_qwen_kv_head_dim(&file)?,
         };
 
@@ -204,6 +216,9 @@ impl Engine {
                 Runner::Llama(r) => {
                     r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
                 }
+                Runner::Gemma(r) => {
+                    r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
+                }
                 Runner::Qwen(r) => {
                     r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
                 }
@@ -264,6 +279,9 @@ impl Engine {
             let pos = s.next_pos;
             let cand = match &mut self.runner {
                 Runner::Llama(r) => {
+                    r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
+                }
+                Runner::Gemma(r) => {
                     r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
                 }
                 Runner::Qwen(r) => {
@@ -536,5 +554,21 @@ fn infer_qwen_kv_head_dim(file: &CellmFile) -> Result<usize> {
     }
     anyhow::bail!(
         "unable to infer qwen KV head_dim (no self_attn.k_proj.weight found in tensor list)"
+    )
+}
+
+fn infer_gemma_kv_head_dim(file: &CellmFile) -> Result<usize> {
+    let h = &file.header;
+    let kv_heads = h.num_kv_heads.max(1);
+    for t in &h.tensors {
+        if t.name.contains(".self_attn.k_proj.weight") && t.shape.len() == 2 {
+            let kv_dim = t.shape[0];
+            if kv_dim % kv_heads == 0 {
+                return Ok(kv_dim / kv_heads);
+            }
+        }
+    }
+    anyhow::bail!(
+        "unable to infer gemma KV head_dim (no self_attn.k_proj.weight found in tensor list)"
     )
 }

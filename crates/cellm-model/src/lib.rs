@@ -4,6 +4,8 @@ pub mod cellm_file;
 pub use cellm_file::{CellmFile, CellmHeader, CellmTensorIndex};
 
 pub mod llama;
+pub mod llama_graph;
+pub mod gemma;
 pub mod qwen;
 
 #[derive(Clone, Debug)]
@@ -17,4 +19,3 @@ pub struct ModelConfig {
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
 }
-

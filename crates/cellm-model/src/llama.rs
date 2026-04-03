@@ -22,6 +22,8 @@ pub struct LlamaRunner {
     metal_ops: Option<MetalOps>,
     metal_strict: bool,
     use_metal_mv: bool,
+    use_metal_norm: bool,
+    use_metal_rope: bool,
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     graph_state: Option<LlamaGraphState>,
 }
@@ -59,6 +61,14 @@ impl LlamaRunner {
             metal_ops: None,
             metal_strict: false,
             use_metal_mv: std::env::var("CELLM_LLAMA_USE_MV")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            // For small Llama stacks, per-token Metal norm/RoPE dispatch overhead can
+            // outweigh math cost; keep these off by default and let users opt in.
+            use_metal_norm: std::env::var("CELLM_LLAMA_USE_METAL_NORM")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            use_metal_rope: std::env::var("CELLM_LLAMA_USE_METAL_ROPE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -277,12 +287,15 @@ impl LlamaRunner {
         let mut gather_bases: Vec<usize> = Vec::new();
 
         for layer in 0..self.max_layers {
-            let use_metal_norm = self.metal_ops.is_some();
-            let use_metal_rope = self.metal_ops.is_some();
+            let use_metal_norm = self.metal_ops.is_some() && self.use_metal_norm;
+            let use_metal_rope = self.metal_ops.is_some() && self.use_metal_rope;
 
             // Attention input norm.
             if use_metal_norm {
-                let w = self.tensor_f16(&format!("model.layers.{layer}.input_layernorm.weight"))?.to_vec();
+                let w = self.tensor_f16(&format!("model.layers.{layer}.input_layernorm.weight"))?;
+                let w_ptr = w.as_ptr();
+                let w_len = w.len();
+                let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
                 self.metal_ops.as_mut().unwrap()
                     .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, false, &mut x_norm)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
@@ -372,7 +385,10 @@ impl LlamaRunner {
 
             // Post-attn norm.
             if use_metal_norm {
-                let w = self.tensor_f16(&format!("model.layers.{layer}.post_attention_layernorm.weight"))?.to_vec();
+                let w = self.tensor_f16(&format!("model.layers.{layer}.post_attention_layernorm.weight"))?;
+                let w_ptr = w.as_ptr();
+                let w_len = w.len();
+                let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
                 self.metal_ops.as_mut().unwrap()
                     .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, false, &mut mlp_in)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
@@ -422,11 +438,14 @@ impl LlamaRunner {
         }
 
         // Final norm.
-        let use_metal_norm = self.metal_ops.is_some();
+        let use_metal_norm = self.metal_ops.is_some() && self.use_metal_norm;
         let use_metal_logits = self.metal_ops.is_some();
         let mut x_final = vec![0.0f32; hidden];
         if use_metal_norm {
-            let w = self.tensor_f16("model.norm.weight")?.to_vec();
+            let w = self.tensor_f16("model.norm.weight")?;
+            let w_ptr = w.as_ptr();
+            let w_len = w.len();
+            let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
             self.metal_ops.as_mut().unwrap()
                 .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, false, &mut x_final)
                 .map_err(|e| CoreError::Backend(e.to_string()))?;
@@ -459,14 +478,23 @@ impl LlamaRunner {
             let mut buf = vec![0.0f32; vocab];
             match lm_meta.dtype.as_str() {
                 "f16" => {
-                    let w = self.tensor_f16_by_exact_name(&lm_src_resolved)?.to_vec();
+                    let w = self.tensor_f16_by_exact_name(&lm_src_resolved)?;
+                    let w_ptr = w.as_ptr();
+                    let w_len = w.len();
+                    let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
                     self.metal_ops.as_mut().unwrap()
                         .logits_f16(&x_final, &w, vocab, hidden, &lm_src_resolved, &mut buf)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                 }
                 "i8" => {
-                    let w = self.tensor_i8_by_exact_name(&lm_src_resolved)?.to_vec();
-                    let s = self.tensor_f16_by_exact_name(&format!("{lm_src_resolved}.qscale"))?.to_vec();
+                    let w = self.tensor_i8_by_exact_name(&lm_src_resolved)?;
+                    let s = self.tensor_f16_by_exact_name(&format!("{lm_src_resolved}.qscale"))?;
+                    let w_ptr = w.as_ptr();
+                    let w_len = w.len();
+                    let s_ptr = s.as_ptr();
+                    let s_len = s.len();
+                    let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
+                    let s = unsafe { std::slice::from_raw_parts(s_ptr, s_len) };
                     self.metal_ops.as_mut().unwrap()
                         .logits_i8(&x_final, &w, &s, vocab, hidden, &lm_src_resolved, &mut buf)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;

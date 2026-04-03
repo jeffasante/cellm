@@ -301,6 +301,9 @@ cargo run --release --bin bench -- --model tiny
 
 # Run with SmolLM2-135M configuration
 cargo run --release --bin bench -- --model smollm2-135m --seq 128 --gen 64
+
+# Automated CPU vs Metal 3-pass LLM matrix (SmolLM2, Gemma, Qwen)
+tools/bench/run_llm_backend_matrix.sh
 ```
 
 Recent run-time snapshots (measured locally on March 29, 2026; these are reference numbers, not guaranteed across machines):
@@ -321,17 +324,22 @@ CPU vs Metal request benchmark (same prompts/settings, local run on March 29, 20
 | `vlm-infer` (`fp16`, `rococo.jpg`, `--max-new-tokens 16`) | `--backend cpu` | `Backend: cpu (macos/aarch64)` | `[64, 576]` in `2.28s` | N/A | `16` tokens in `2.37s` |
 | `vlm-infer` (`fp16`, `rococo.jpg`, `--max-new-tokens 16`) | `--backend metal` | `Backend: metal (smoke ok)` | `[64, 576]` in `1.85s` | N/A | `16` tokens in `2.56s` |
 
-CPU vs Metal LLM benchmark snapshot (3 passes, local run on April 3, 2026; prompt=`"hi"`, `--gen 8`, report = median / P95):
+CPU vs Metal LLM benchmark snapshot (3 passes, host macOS run on April 3, 2026; prompt=`"hi"`, `--gen 8`, report = median / P95):
 | Model | Backend | Startup (s) | Prefill (s) | Decode (s) |
 |---|---|---:|---:|---:|
-| `smollm2-135m-int8.cellm` | `cpu` | `0.04 / 0.04` | `0.07 / 0.30` | `0.50 / 0.51` |
-| `smollm2-135m-int8.cellm` | `metal` | `0.14 / 0.15` | `0.95 / 1.36` | `0.33 / 0.86` |
-| `gemma-3-1b-it-int8.cellmd` | `cpu` | `1.02 / 1.11` | `0.56 / 2.75` | `4.12 / 4.16` |
-| `gemma-3-1b-it-int8.cellmd` | `metal` | `1.06 / 1.07` | `0.80 / 0.98` | `3.62 / 4.01` |
-| `qwen3.5-0.8b-int8.cellm` | `cpu` | `0.28 / 0.32` | `0.52 / 1.98` | `3.79 / 3.85` |
-| `qwen3.5-0.8b-int8.cellm` | `metal` | `0.34 / 0.34` | `0.46 / 0.52` | `2.47 / 2.55` |
+| `smollm2-135m-int8.cellm` | `cpu` | `0.04 / 0.05` | `0.07 / 0.53` | `0.48 / 0.49` |
+| `smollm2-135m-int8.cellm` | `metal` | `0.09 / 0.10` | `0.20 / 0.24` | `0.95 / 1.59` |
+| `gemma-3-1b-it-int8.cellmd` | `cpu` | `1.03 / 1.05` | `0.56 / 3.10` | `4.11 / 4.16` |
+| `gemma-3-1b-it-int8.cellmd` | `metal` | `1.05 / 1.06` | `0.62 / 0.66` | `2.07 / 2.33` |
+| `qwen3.5-0.8b-int8.cellm` | `cpu` | `0.26 / 0.28` | `0.52 / 1.80` | `3.87 / 3.89` |
+| `qwen3.5-0.8b-int8.cellm` | `metal` | `0.33 / 0.33` | `0.42 / 0.46` | `2.08 / 2.08` |
 
-Note: in restricted/sandboxed shells, Metal device discovery can fail and trigger CPU fallback. On host macOS runs, Metal smoke succeeds.
+Takeaways from this run:
+- Gemma gets a clear Metal decode win (`4.11s` -> `2.07s` median).
+- Qwen gets a clear Metal win for both prefill and decode.
+- SmolLM2 prefill is faster on Metal, but decode is still faster on CPU in this setup.
+
+Note: in restricted/sandboxed shells, Metal device discovery can fail. `infer --backend metal` now errors instead of silently falling back.
 
 For a dedicated benchmark page (commands + tables), see `docs/benchmarks/README.md`.
 
@@ -347,6 +355,14 @@ cargo run --release --bin metal-smoke
   --prompt "hello" \
   --gen 8 \
   --backend metal
+
+# 3) Llama metal tuning knobs
+# Default now keeps Llama norm/RoPE on CPU (often faster for small models like SmolLM2)
+# You can force Metal norm/RoPE if you want to compare:
+CELLM_LLAMA_USE_METAL_NORM=1 CELLM_LLAMA_USE_METAL_ROPE=1 ./target/release/infer ...
+
+# Experimental fused graph path (can be faster but may be unstable depending on model)
+CELLM_LLAMA_ENABLE_GRAPH=1 ./target/release/infer ...
 ```
 
 ### Convert Models
@@ -365,6 +381,41 @@ cargo run --bin convert -- \
   --output ./models/some-model.cellm \
   --dtype  f16
 ```
+
+GGUF note:
+- `convert` accepts Llama GGUF and converts to `.cellm` (`f16` output).
+- Supported GGUF tensor types in this path: `BF16`, `F16`, `F32`, `Q4_K`, `Q6_K`.
+- `Q4_K`/`Q6_K` are dequantized during conversion (output remains `f16` in `.cellm`).
+
+Example (GGUF -> cellm):
+```bash
+cargo run --release --bin convert -- \
+  --input  ./models/hf/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-bf16.gguf \
+  --output ./models/llama32-1b-bf16-from-gguf.cellm \
+  --dtype  f16
+```
+
+Prompt sanity check on Metal (April 3, 2026):
+
+```bash
+./target/release/infer \
+  --model models/llama32-1b-bf16-from-gguf.cellm \
+  --tokenizer models/hf/unsloth-Llama-3.2-1B-Instruct/tokenizer.json \
+  --prompt "What is 84 * 3 / 2? Answer with only the number." \
+  --temperature 0 \
+  --gen 8 \
+  --backend metal
+```
+
+Observed first answer token across `bf16`, `q4k`, and `q6k` conversions:
+
+```text
+168
+```
+
+Note:
+- This is a useful correctness smoke test, and currently fails for this plain-prompt setup.
+- Prefer a chat-formatted eval set (and multiple prompts) before drawing quality conclusions for these converted checkpoints.
 
 Working quantization option (Llama text stacks):
 ```bash

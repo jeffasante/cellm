@@ -1,0 +1,4 @@
+model,model_path,backend,pass,startup_s,prefill_s,decode_s,status,error
+llama32-1b-bf16-from-gguf.cellm,models/llama32-1b-bf16-from-gguf.cellm,metal,1,0.55,25.38,8.61,ok,
+llama32-1b-bf16-q4k-from-gguf.cellm,models/llama32-1b-bf16-q4k-from-gguf.cellm,metal,1,0.52,25.32,18.61,ok,
+llama32-1b-bf16-q6k-from-gguf.cellm,models/llama32-1b-bf16-q6k-from-gguf.cellm,metal,1,0.52,22.09,19.22,ok,

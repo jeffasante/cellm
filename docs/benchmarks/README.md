@@ -6,6 +6,34 @@ All numbers below are from local runs on **March 29, 2026** and are reference-on
 
 ## How to run
 
+### CPU/Metal LLM matrix (automated)
+
+```bash
+tools/bench/run_llm_backend_matrix.sh
+```
+
+Outputs:
+- Markdown summary table: `docs/benchmarks/runs/llm_backend_matrix_<timestamp>_summary.md`
+- Raw run CSV: `docs/benchmarks/runs/llm_backend_matrix_<timestamp>.csv`
+
+Useful overrides:
+
+```bash
+PASSES=3 GEN_TOKENS=8 PROMPT_TEXT="hi" tools/bench/run_llm_backend_matrix.sh
+```
+
+```bash
+# Skip rebuild if infer is already built
+BUILD_INFER=0 tools/bench/run_llm_backend_matrix.sh
+```
+
+```bash
+# Restrict to one backend
+BACKENDS="cpu" tools/bench/run_llm_backend_matrix.sh
+```
+
+Note: in restricted/sandboxed shells, Metal may be unavailable and report `n/a` for Metal rows.
+
 ### Text benchmark (`infer`)
 
 ```bash

@@ -1,0 +1,4 @@
+model,model_path,backend,pass,startup_s,prefill_s,decode_s,status,error
+llama32-1b-bf16-from-gguf.cellm,models/llama32-1b-bf16-from-gguf.cellm,cpu,1,0.47,13.25,1.62,ok,
+llama32-1b-bf16-q4k-from-gguf.cellm,models/llama32-1b-bf16-q4k-from-gguf.cellm,cpu,1,0.53,15.18,1.59,ok,
+llama32-1b-bf16-q6k-from-gguf.cellm,models/llama32-1b-bf16-q6k-from-gguf.cellm,cpu,1,0.50,13.91,1.63,ok,

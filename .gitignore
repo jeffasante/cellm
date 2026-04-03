@@ -6,6 +6,7 @@ Cargo.lock
 .DS_Store
 *.swp
 *.swo
+*.gguf
 
 # Python envs used for tooling
 .venv/
@@ -43,6 +44,7 @@ models/**/*.onnx
 models/**/*.tflite
 models/**/*.ckpt
 models/**/*.h5
+models/**/*.gguf
 models/hf/**
 
 # Keep lightweight examples/docs under models

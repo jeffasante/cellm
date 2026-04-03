@@ -169,6 +169,53 @@ Observed output (April 3, 2026):
 setPrototypeOfsetPrototypeOfsetPrototypeOf...
 ```
 
+Gemma3-1B prompt validation (April 3, 2026):
+
+Model:
+- `models/gemma-3-1b-it.cellmd`
+- `models/gemma-3-1b-it-int8.cellmd` (quantized with `--quantize-int8-symmetric`)
+
+Prompts and observed outputs:
+
+```bash
+./target/release/infer \
+  --model models/gemma-3-1b-it.cellmd \
+  --tokenizer models/hf/gemma-3-1b-it/tokenizer.json \
+  --prompt "What is 84 * 3 / 2? Answer with only the number." \
+  --chat --chat-format auto --temperature 0 --gen 8 --stop-eos --backend metal
+```
+
+```text
+24
+```
+
+```bash
+./target/release/infer \
+  --model models/gemma-3-1b-it.cellmd \
+  --tokenizer models/hf/gemma-3-1b-it/tokenizer.json \
+  --prompt "If I buy 12 donuts and eat 5, how many donuts are left for tomorrow? Explain each step of your reasoning." \
+  --chat --chat-format auto --temperature 0 --gen 96 --stop-eos --backend cpu
+```
+
+```text
+... Answer: You have 7 donuts left for tomorrow.
+```
+
+```bash
+./target/release/infer \
+  --model models/gemma-3-1b-it.cellmd \
+  --tokenizer models/hf/gemma-3-1b-it/tokenizer.json \
+  --prompt "Translate these phrases into casual Italian:\nInput: 'Hello, how are you?'" \
+  --chat --chat-format auto --temperature 0 --gen 48 --stop-eos --backend cpu
+```
+
+```text
+Ciao, come stai?
+```
+
+Note:
+- For Gemma3, `--backend metal` currently runs Metal smoke but uses CPU math path for correctness (full Gemma3 Metal parity is still in progress).
+
 Supported Mobile Actions (reference prompts):
 
 | Function | Example Prompt |

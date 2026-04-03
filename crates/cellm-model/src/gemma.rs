@@ -3,7 +3,7 @@ use std::path::Path;
 use bytemuck::cast_slice;
 use cellm_cache::{KVCache, PageTable};
 use cellm_core::CoreError;
-use cellm_kernels::cpu_kernels::{rms_norm_f32, rope_inplace_f32};
+use cellm_kernels::cpu_kernels::rms_norm_f32;
 use cellm_kernels::MetalOps;
 use cellm_kernels::metal::MetalMatmul;
 use cellm_kernels::MetalKernels;
@@ -22,6 +22,10 @@ pub struct GemmaRunner {
     head_dim: usize,
     kv_head_dim: usize,
     rmsnorm_weight_is_offset: bool,
+    is_gemma3_text: bool,
+    sliding_window: usize,
+    sliding_window_pattern: usize,
+    rope_theta_sliding: f32,
     linear_backend: GemmaLinearBackend,
     metal_strict: bool,
     /// Present when a Metal backend is active; drives rms_norm / rope / logits on GPU.
@@ -57,6 +61,12 @@ impl GemmaRunner {
             cfg.num_key_value_heads,
         )?;
         let rmsnorm_weight_is_offset = true;
+        let is_gemma3_text = h.model_type.starts_with("gemma3");
+        // Gemma3 uses mixed attention: sliding layers use local RoPE base 10k, while
+        // periodic full-attention layers use the global RoPE theta from config.
+        let sliding_window = if is_gemma3_text { 512 } else { usize::MAX };
+        let sliding_window_pattern = if is_gemma3_text { 6 } else { usize::MAX };
+        let rope_theta_sliding = if is_gemma3_text { 10_000.0 } else { cfg.rope_theta };
 
         Ok(Self {
             file,
@@ -67,6 +77,10 @@ impl GemmaRunner {
             head_dim,
             kv_head_dim,
             rmsnorm_weight_is_offset,
+            is_gemma3_text,
+            sliding_window,
+            sliding_window_pattern,
+            rope_theta_sliding,
             linear_backend: GemmaLinearBackend::Cpu,
             metal_strict: false,
             metal_ops: None,
@@ -108,6 +122,15 @@ impl GemmaRunner {
     }
 
     pub fn enable_metal_full_backend(&mut self) -> bool {
+        if self.is_gemma3_text {
+            eprintln!(
+                "gemma: metal full path disabled for gemma3_text (parity pending); using CPU path"
+            );
+            self.linear_backend = GemmaLinearBackend::Cpu;
+            self.metal_ops = None;
+            self.metal_strict = false;
+            return false;
+        }
         match (MetalKernels::create_matmul(), MetalOps::create()) {
             (Ok(ctx), Ok(ops)) => {
                 self.linear_backend = GemmaLinearBackend::Metal { ctx };
@@ -225,6 +248,18 @@ impl GemmaRunner {
         let mut gather_bases: Vec<usize> = Vec::new();
 
         for layer in 0..self.max_layers {
+            let is_full_attention_layer = if self.is_gemma3_text {
+                // Gemma3 pattern: 5 sliding layers, then 1 full-attention layer.
+                self.sliding_window_pattern != 0 && (layer + 1) % self.sliding_window_pattern == 0
+            } else {
+                true
+            };
+            let layer_rope_theta = if self.is_gemma3_text && !is_full_attention_layer {
+                self.rope_theta_sliding
+            } else {
+                cfg.rope_theta
+            };
+
             // ── Attention input norm (always CPU for now, Metal for rope/logits) ──
             {
                 self.rmsnorm_weight(
@@ -235,7 +270,9 @@ impl GemmaRunner {
             }
 
             let use_metal_norm = self.metal_ops.is_some();
-            let use_metal_rope = self.metal_ops.is_some();
+            // Gemma uses rotate_half-style RoPE; keep RoPE on CPU for Gemma3 to
+            // preserve correctness until Metal path matches this convention.
+            let use_metal_rope = self.metal_ops.is_some() && !self.is_gemma3_text;
 
             // QKV projections (HF weights are [out, in]).
             self.linear_f16_out_in(
@@ -303,13 +340,13 @@ impl GemmaRunner {
             // ── RoPE ──────────────
             if use_metal_rope {
                 let ops = self.metal_ops.as_mut().unwrap();
-                ops.rope_adj_f32(&mut q, n_heads, head_dim, pos, cfg.rope_theta)
+                ops.rope_adj_f32(&mut q, n_heads, head_dim, pos, layer_rope_theta)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
-                ops.rope_adj_f32(&mut k, n_kv_heads, kv_head_dim, pos, cfg.rope_theta)
+                ops.rope_adj_f32(&mut k, n_kv_heads, kv_head_dim, pos, layer_rope_theta)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
             } else {
-                rope_inplace_f32(&mut q, n_heads, head_dim, pos, cfg.rope_theta);
-                rope_inplace_f32(&mut k, n_kv_heads, kv_head_dim, pos, cfg.rope_theta);
+                rope_inplace_rotate_half_f32(&mut q, n_heads, head_dim, pos, layer_rope_theta);
+                rope_inplace_rotate_half_f32(&mut k, n_kv_heads, kv_head_dim, pos, layer_rope_theta);
             }
 
             // Write new token K/V into paged cache.
@@ -322,8 +359,14 @@ impl GemmaRunner {
             let seq = page_table.token_count();
             let cr = kv_cache.view();
             gather_bases.clear();
-            gather_bases.reserve(seq);
-            for tpos in 0..seq {
+            let start_tpos = if self.is_gemma3_text && !is_full_attention_layer {
+                seq.saturating_sub(self.sliding_window)
+            } else {
+                0
+            };
+            let gather_len = seq.saturating_sub(start_tpos);
+            gather_bases.reserve(gather_len);
+            for tpos in start_tpos..seq {
                 let b = page_table.block_for_token(tpos).map_err(|e| {
                     CoreError::Backend(format!("gemma: block_for_token failed: {e}"))
                 })?;
@@ -351,16 +394,15 @@ impl GemmaRunner {
             )?;
 
             let x_residual = x.clone();
-            for i in 0..hidden { x[i] += attn_proj[i]; }
 
-            // ── Post-attention norm 
+            // ── Post-attention norm on attn branch, then residual add
             if use_metal_norm {
                 let w = self.tensor_f16(
                     &format!("model.layers.{layer}.post_attention_layernorm.weight"))?.to_vec();
                 let add_one = self.rmsnorm_weight_is_offset;
                 let mut x_out = vec![0.0f32; hidden];
                 self.metal_ops.as_mut().unwrap()
-                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &mut x_out)
+                    .rms_norm_f16w(&attn_proj, &w, cfg.rms_norm_eps, add_one, &mut x_out)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
                 for i in 0..hidden { x[i] = x_out[i] + x_residual[i]; }
             } else {
@@ -368,7 +410,7 @@ impl GemmaRunner {
                     &format!("model.layers.{layer}.post_attention_layernorm.weight"),
                     &mut post_attn_norm_w,
                 )?;
-                rms_norm_f32(&x, &post_attn_norm_w, cfg.rms_norm_eps, &mut x_norm);
+                rms_norm_f32(&attn_proj, &post_attn_norm_w, cfg.rms_norm_eps, &mut x_norm);
                 for i in 0..hidden { x[i] = x_norm[i] + x_residual[i]; }
             }
 
@@ -413,16 +455,15 @@ impl GemmaRunner {
                 &mut down,
             )?;
             let x_residual = x.clone();
-            for i in 0..hidden { x[i] += down[i]; }
 
-            // ── Post-FFN norm ──────
+            // ── Post-FFN norm on MLP branch, then residual add ──────
             if use_metal_norm {
                 let wffn = self.tensor_f16(
                     &format!("model.layers.{layer}.post_feedforward_layernorm.weight"))?.to_vec();
                 let add_one = self.rmsnorm_weight_is_offset;
                 let mut x_out = vec![0.0f32; hidden];
                 self.metal_ops.as_mut().unwrap()
-                    .rms_norm_f16w(&x, &wffn, cfg.rms_norm_eps, add_one, &mut x_out)
+                    .rms_norm_f16w(&down, &wffn, cfg.rms_norm_eps, add_one, &mut x_out)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
                 for i in 0..hidden { x[i] = x_out[i] + x_residual[i]; }
             } else {
@@ -430,7 +471,7 @@ impl GemmaRunner {
                     &format!("model.layers.{layer}.post_feedforward_layernorm.weight"),
                     &mut post_ffn_norm_w,
                 )?;
-                rms_norm_f32(&x, &post_ffn_norm_w, cfg.rms_norm_eps, &mut x_norm);
+                rms_norm_f32(&down, &post_ffn_norm_w, cfg.rms_norm_eps, &mut x_norm);
                 for i in 0..hidden { x[i] = x_norm[i] + x_residual[i]; }
             }
         }
@@ -570,8 +611,9 @@ impl GemmaRunner {
         let vocab = self.cfg.vocab_size;
         let t = (token as usize) % vocab;
         let row = &embed[t * hidden..(t + 1) * hidden];
+        let embed_scale = (hidden as f32).sqrt();
         for i in 0..hidden {
-            out[i] = f16::from_bits(row[i]).to_f32();
+            out[i] = f16::from_bits(row[i]).to_f32() * embed_scale;
         }
         Ok(())
     }
@@ -864,6 +906,31 @@ fn gelu_tanh_f32(x: f32) -> f32 {
     let k = 0.797_884_6f32;
     let c = 0.044_715f32;
     0.5f32 * x * (1.0f32 + (k * (x + c * x * x * x)).tanh())
+}
+
+fn rope_inplace_rotate_half_f32(
+    x: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    pos: usize,
+    theta: f32,
+) {
+    debug_assert_eq!(x.len(), n_heads * head_dim);
+    debug_assert!(head_dim % 2 == 0, "head_dim must be even for RoPE");
+
+    let half = head_dim / 2;
+    for h in 0..n_heads {
+        let base = h * head_dim;
+        for i in 0..half {
+            let inv_freq = theta.powf(-(2.0 * i as f32) / head_dim as f32);
+            let angle = pos as f32 * inv_freq;
+            let (sin, cos) = angle.sin_cos();
+            let x0 = x[base + i];
+            let x1 = x[base + half + i];
+            x[base + i] = x0 * cos - x1 * sin;
+            x[base + half + i] = x1 * cos + x0 * sin;
+        }
+    }
 }
 
 fn detect_gemma_prefix(file: &CellmFile) -> Result<String, CoreError> {

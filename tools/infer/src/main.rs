@@ -15,6 +15,8 @@ enum ChatFormat {
     Auto,
     /// ChatML-style: <|im_start|>role ... <|im_end|>
     Chatml,
+    /// Gemma turn-style: <start_of_turn>user ... <end_of_turn>
+    Gemma,
     /// Plain: "System: ...\nUser: ...\nAssistant:"
     Plain,
 }
@@ -243,6 +245,8 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
                 if let Some(tok_path) = args.tokenizer.as_ref() {
                     if tokenizer_config_chatml(tok_path) {
                         ChatFormat::Chatml
+                    } else if tokenizer_config_gemma_turn(tok_path) {
+                        ChatFormat::Gemma
                     } else {
                         ChatFormat::Plain
                     }
@@ -257,7 +261,7 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
     };
 
     let t_stage = Instant::now();
-    let prompt_tokens = if let Some(prompt) = args.prompt.as_deref() {
+    let mut prompt_tokens = if let Some(prompt) = args.prompt.as_deref() {
         let tok = tokenizer.as_ref().expect("tokenizer set when prompt set");
         let tok_path = args
             .tokenizer
@@ -280,6 +284,15 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
     } else {
         (0..args.seq as u32).collect()
     };
+    if args.prompt.is_some() {
+        if let (Some(tok_path), Some(bos_id)) = (args.tokenizer.as_ref(), file.header.bos_token_id)
+        {
+            let wants_bos = tokenizer_config_add_bos(tok_path);
+            if wants_bos && prompt_tokens.first().copied() != Some(bos_id) {
+                prompt_tokens.insert(0, bos_id);
+            }
+        }
+    }
     if args.prompt.is_some() {
         println!(
             "Startup: prompt encode {:.2}s",
@@ -565,6 +578,18 @@ fn build_prompt_text(
             }
             s
         }
+        ChatFormat::Gemma => {
+            let user_text = if sys.is_empty() {
+                prompt.to_string()
+            } else {
+                // Gemma 3-style instruction prompts typically do not support an explicit
+                // `system` role, so fold system text into the first user turn.
+                format!("{sys}\n\n{prompt}")
+            };
+            format!(
+                "<start_of_turn>user\n{user_text}<end_of_turn>\n<start_of_turn>model\n"
+            )
+        }
         ChatFormat::Auto | ChatFormat::Plain => match system {
             Some(sys) if !sys.trim().is_empty() => {
                 format!("System: {sys}\nUser: {prompt}\nAssistant:")
@@ -591,6 +616,23 @@ fn tokenizer_config_chatml(tokenizer_json_path: &std::path::Path) -> bool {
     tpl.contains("<|im_start|>") && tpl.contains("<|im_end|>")
 }
 
+fn tokenizer_config_gemma_turn(tokenizer_json_path: &std::path::Path) -> bool {
+    let Some(dir) = tokenizer_json_path.parent() else {
+        return false;
+    };
+    let cfg_path = dir.join("tokenizer_config.json");
+    let Ok(bytes) = std::fs::read(&cfg_path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let Some(tpl) = v.get("chat_template").and_then(|x| x.as_str()) else {
+        return false;
+    };
+    tpl.contains("<start_of_turn>") && tpl.contains("<end_of_turn>")
+}
+
 fn tokenizer_config_contains_think_prefill(tokenizer_json_path: &std::path::Path) -> bool {
     let Some(dir) = tokenizer_json_path.parent() else {
         return false;
@@ -606,6 +648,22 @@ fn tokenizer_config_contains_think_prefill(tokenizer_json_path: &std::path::Path
         return false;
     };
     tpl.contains("<think>") && tpl.contains("</think>")
+}
+
+fn tokenizer_config_add_bos(tokenizer_json_path: &std::path::Path) -> bool {
+    let Some(dir) = tokenizer_json_path.parent() else {
+        return false;
+    };
+    let cfg_path = dir.join("tokenizer_config.json");
+    let Ok(bytes) = std::fs::read(&cfg_path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    v.get("add_bos_token")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false)
 }
 
 fn load_tokenizer(path: &std::path::Path) -> Result<Tokenizer> {

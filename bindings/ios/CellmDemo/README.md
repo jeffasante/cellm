@@ -10,11 +10,11 @@ This folder contains SwiftUI source files for a small iOS app that can load a `.
 - Active backend reporting (`cellm_engine_backend_name`) so app confirms what was selected
 - One-tap sample asset download in-app (GitHub-hosted `.cellm` + sample image + tokenizer)
 
-Note: requesting `Metal` currently verifies Metal availability and selects the Metal backend label, but full LLM/VLM forward math kernels are still CPU in this phase.
+Note: backend selection is strict in this build. If `Metal` is requested and unavailable, engine creation fails instead of silently falling back to CPU.
 
 ## Current limits
 
-- Native VLM path is currently CPU math in this phase; requesting `Metal` preserves backend selection/fallback behavior but does not yet run a full Metal-native VLM forward path.
+- Native VLM path is currently CPU math in this phase.
 
 ## How to run it in Xcode
 
@@ -53,12 +53,22 @@ Note: requesting `Metal` currently verifies Metal availability and selects the M
   - `first_piece`
   - `prefill/decode/total` timing in ms
 
+## Gemma iOS quick run flow
+
+- In `LLM` tab, tap **Download Gemma 3 1B int8 model + tokenizer (~1.2 GB)**
+- Prompt example:
+  - `What is the capital of France?`
+  - `If I buy 12 donuts and eat 5, how many donuts are left for tomorrow?`
+- Choose `Metal` for acceleration, or `CPU` for deterministic CPU-only validation.
+
 ## Sample hosted assets used by the app
 
 - `https://github.com/jeffasante/cellm/blob/main/models/qwen3.5-0.8b.cellm` (stable quality)
 - `https://github.com/jeffasante/cellm/blob/main/models/qwen3.5-0.8b-int4-textonly.cellm` (compact/experimental)
 - `https://github.com/jeffasante/cellm/blob/main/models/smollm2-135m-int8.cellm`
+- `https://huggingface.co/jeffasante/gemma-3-1b-it-int8-cellm/resolve/main/gemma-3-1b-it-int8.cellmd`
 - `https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/tokenizer.json`
+- `https://huggingface.co/unsloth/gemma-3-1b-it/resolve/main/tokenizer.json`
 - `https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/main/tokenizer.json`
 - `https://github.com/jeffasante/cellm/blob/main/models/smolvlm-256m-int8.cellm`
 - `https://github.com/jeffasante/cellm/blob/main/models/test_images/rococo_1.jpg`
@@ -69,7 +79,7 @@ The app normalizes GitHub `blob` URLs to raw-download URLs before fetching.
 
 - Large model files are slow to load over the simulator and can exceed simulator storage limits. A physical device is the fastest way to validate end-to-end.
 - Keep `tokenizer.json` next to the `.cellm` model when you manage files on disk; the app lets you pick both explicitly.
-- For Qwen in this phase, requesting `Metal` verifies backend selection and reports active backend, but forward math remains CPU-path.
+- Qwen and LLM backend selection are strict; no automatic CPU fallback when `Metal` is requested.
 - Qwen compact int4 can still be degenerate; use the stable Qwen model when validating response quality on-device.
 
 ## Latest Metal KV optimization patch (what was changed)

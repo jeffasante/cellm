@@ -125,30 +125,14 @@ final class CellmEngine {
     let activeBackend: String
     private(set) var lastGenerationStats: LlmGenerationStats?
 
-    init(modelURL: URL, tokenizer: CellmTokenizer, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 256, topK: UInt32 = 40, temperature: Float = 0.2, repeatPenalty: Float = 1.08, repeatWindow: UInt32 = 96, seed: UInt64 = 1, backend: CellmBackend = .metal, allowBackendFallback: Bool = true) throws {
+    init(modelURL: URL, tokenizer: CellmTokenizer, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 256, topK: UInt32 = 40, temperature: Float = 0.2, repeatPenalty: Float = 1.08, repeatWindow: UInt32 = 96, seed: UInt64 = 1, backend: CellmBackend = .metal) throws {
         self.tokenizer = tokenizer
         let path = modelURL.path
         let requestedBackend: CellmBackend = backend
-        var h = path.withCString { cstr in
+        let h = path.withCString { cstr in
             cellm_engine_create_v3(cstr, tokensPerBlock, totalBlocks, topK, temperature, repeatPenalty, repeatWindow, seed, requestedBackend.rawValue)
         }
-        var firstError = CellmFFI.lastError()
-
-        // On some devices/SDK states, Metal init can fail without a useful FFI error detail.
-        // Retry with CPU to keep generation usable and surface fallback via activeBackend.
-        if h == 0 && requestedBackend == .metal && allowBackendFallback {
-            h = path.withCString { cstr in
-                cellm_engine_create_v3(cstr, tokensPerBlock, totalBlocks, topK, temperature, repeatPenalty, repeatWindow, seed, CellmBackend.cpu.rawValue)
-            }
-            if h == 0 {
-                let retryError = CellmFFI.lastError()
-                if firstError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || firstError == "unknown error" {
-                    firstError = retryError
-                }
-                let fallbackDetail = retryError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "unknown" : retryError
-                throw CellmError.message("engine_create_v3 failed (metal->cpu retry). first=\(firstError) retry=\(fallbackDetail) model=\(modelURL.lastPathComponent)")
-            }
-        }
+        let firstError = CellmFFI.lastError()
 
         guard h != 0 else {
             let detail = firstError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "unknown error (ffi returned empty last_error)" : firstError
@@ -270,6 +254,8 @@ final class CellmEngine {
                 s += "<think>\n\n</think>\n\n"
             }
             return s
+        case .gemma:
+            return "<start_of_turn>user\n\(cleanPrompt)<end_of_turn>\n<start_of_turn>model\n"
         case .plain:
             return "User: \(cleanPrompt)\nAssistant:"
         }
@@ -278,6 +264,7 @@ final class CellmEngine {
     private enum PromptStyle {
         case smolChat
         case chatML(includeThinkPrefill: Bool)
+        case gemma
         case plain
     }
 
@@ -298,12 +285,15 @@ final class CellmEngine {
             // forcing that path in our mobile runner currently increases degenerate output.
             return .chatML(includeThinkPrefill: false)
         }
+        if tpl.contains("<start_of_turn>") && tpl.contains("<end_of_turn>") {
+            return .gemma
+        }
         return .plain
     }
 
     private static func isStopPiece(_ piece: String) -> Bool {
         let p = piece.trimmingCharacters(in: .whitespacesAndNewlines)
-        return p == "<|im_end|>" || p == "<end_of_utterance>" || p == "<|endoftext|>"
+        return p == "<|im_end|>" || p == "<end_of_utterance>" || p == "<|endoftext|>" || p == "<end_of_turn>"
     }
 
     private static func hasLongDigitRun(_ piece: String, threshold: Int) -> Bool {

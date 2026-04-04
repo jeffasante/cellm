@@ -10,6 +10,7 @@ use cellm_kernels::MetalKernels;
 use half::f16;
 
 use crate::{CellmFile, ModelConfig};
+use serde_json::Value;
 
 const GEMMA_METAL_LINEAR_MAX_ELEMS: usize = 262_144;
 
@@ -61,7 +62,15 @@ impl GemmaRunner {
             cfg.num_key_value_heads,
         )?;
         let rmsnorm_weight_is_offset = true;
-        let is_gemma3_text = h.model_type.starts_with("gemma3");
+        let source_model_type = match &h.source_text_config {
+            Some(Value::Object(obj)) => match obj.get("model_type") {
+                Some(Value::String(mt)) if !mt.is_empty() => Some(mt.as_str()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let is_gemma3_text = h.model_type.starts_with("gemma3")
+            || source_model_type.is_some_and(|mt| mt.starts_with("gemma3"));
         // Gemma3 uses mixed attention: sliding layers use local RoPE base 10k, while
         // periodic full-attention layers use the global RoPE theta from config.
         let sliding_window = if is_gemma3_text { 512 } else { usize::MAX };
@@ -122,15 +131,6 @@ impl GemmaRunner {
     }
 
     pub fn enable_metal_full_backend(&mut self) -> bool {
-        if self.is_gemma3_text {
-            eprintln!(
-                "gemma: metal full path disabled for gemma3_text (parity pending); using CPU path"
-            );
-            self.linear_backend = GemmaLinearBackend::Cpu;
-            self.metal_ops = None;
-            self.metal_strict = false;
-            return false;
-        }
         match (MetalKernels::create_matmul(), MetalOps::create()) {
             (Ok(ctx), Ok(ops)) => {
                 self.linear_backend = GemmaLinearBackend::Metal { ctx };
@@ -272,7 +272,7 @@ impl GemmaRunner {
             let use_metal_norm = self.metal_ops.is_some();
             // Gemma uses rotate_half-style RoPE; keep RoPE on CPU for Gemma3 to
             // preserve correctness until Metal path matches this convention.
-            let use_metal_rope = self.metal_ops.is_some() && !self.is_gemma3_text;
+            let use_metal_rope = self.metal_ops.is_some();
 
             // QKV projections (HF weights are [out, in]).
             self.linear_f16_out_in(

@@ -1,4 +1,4 @@
-// swift-tools-version: 5.9
+// swift-tools-version:5.9
 import PackageDescription
 
 let package = Package(
@@ -6,11 +6,19 @@ let package = Package(
     platforms: [.iOS(.v16), .macOS(.v13)],
     products: [
         .library(name: "CellmSDK", targets: ["CellmSDK"]),
+        .executable(name: "CellmSmoke", targets: ["CellmSmoke"]),
     ],
     targets: [
         .target(
             name: "CellmSDK",
             dependencies: ["CellmFFI"]
+        ),
+        .executableTarget(
+            name: "CellmSmoke",
+            dependencies: ["CellmSDK"],
+            linkerSettings: [
+                .linkedFramework("Metal")
+            ]
         ),
         .binaryTarget(
             name: "CellmFFI",

@@ -21,6 +21,15 @@ enum DemoAssetLinks {
     static let smollm2FileName = "\(smollm2Dir)/smollm2-135m-int8.cellm"
     static let smollm2TokenizerFileName = "\(smollm2Dir)/tokenizer-smollm2-135m.json"
     static let smollm2TokenizerConfigFileName = "\(smollm2Dir)/tokenizer_config.json"
+
+    static let gemma3Int8 = "https://huggingface.co/jeffasante/gemma-3-1b-it-int8-cellm/resolve/main/gemma-3-1b-it-int8.cellmd"
+    static let gemma3Tokenizer = "https://huggingface.co/unsloth/gemma-3-1b-it/resolve/main/tokenizer.json"
+    static let gemma3TokenizerConfig = "https://huggingface.co/unsloth/gemma-3-1b-it/resolve/main/tokenizer_config.json"
+    static let gemma3Dir = "samples/gemma-3-1b-it"
+    static let gemma3FileName = "\(gemma3Dir)/gemma-3-1b-it-int8.cellmd"
+    static let gemma3TokenizerFileName = "\(gemma3Dir)/tokenizer-gemma-3-1b-it.json"
+    static let gemma3TokenizerConfigFileName = "\(gemma3Dir)/tokenizer_config.json"
+
     static let smolvlmFileName = "smolvlm-256m-int8.cellm"
     static let smolvlmTokenizerFileName = "tokenizer-smolvlm-256m.json"
     static let rococoFileName = "rococo_1.jpg"
@@ -93,6 +102,26 @@ enum RemoteAssets {
     static func candidateURLs(from raw: String) throws -> [URL] {
         guard let url = URL(string: raw) else {
             throw CellmError.message("Invalid URL: \(raw)")
+        }
+
+        if url.host == "huggingface.co" {
+            let parts = url.pathComponents.filter { $0 != "/" }
+            if let blobIndex = parts.firstIndex(of: "blob"), blobIndex >= 2, parts.count > blobIndex + 2 {
+                let repo = parts[1]
+                let ref = parts[blobIndex + 1]
+                let rest = parts[(blobIndex + 2)...].joined(separator: "/")
+                var resolve = URLComponents()
+                resolve.scheme = "https"
+                resolve.host = "huggingface.co"
+                resolve.path = "/\(parts[0])/\(repo)/resolve/\(ref)/\(rest)"
+                var resolveWithDownload = resolve
+                resolveWithDownload.queryItems = [URLQueryItem(name: "download", value: "true")]
+                var out: [URL] = []
+                if let u = resolveWithDownload.url { out.append(u) }
+                if let u = resolve.url { out.append(u) }
+                out.append(url)
+                return out
+            }
         }
 
         if url.host == "github.com" {

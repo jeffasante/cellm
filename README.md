@@ -381,6 +381,18 @@ CPU vs Metal LLM benchmark snapshot (3 passes, host macOS run on April 3, 2026; 
 | `qwen3.5-0.8b-int8.cellm` | `cpu` | `0.26 / 0.28` | `0.52 / 1.80` | `3.87 / 3.89` |
 | `qwen3.5-0.8b-int8.cellm` | `metal` | `0.33 / 0.33` | `0.42 / 0.46` | `2.08 / 2.08` |
 
+Gemma3 int8 strict backend check (April 4, 2026; prompt=`"What is the capital of France?"`, `--gen 16`, `--temperature 0`):
+| Model | Backend | Init total before prefill | Prefill | Decode |
+|---|---|---:|---:|---:|
+| `gemma-3-1b-it-int8.cellmd` | `cpu` | `5.23s` | `8` tokens in `75.84s` | `16` tokens in `147.06s` |
+| `gemma-3-1b-it-int8.cellmd` | `metal` | `5.51s` | `8` tokens in `3.32s` | `16` tokens in `3.97s` |
+
+Initialization breakdown from this run:
+| Backend | backend check | model header | runner init | metal init | tokenizer load | prompt encode | KV init |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `cpu` | `0.00s` | `0.00s` | `0.00s` | N/A | `4.23s` | `0.99s` | `0.00s` |
+| `metal` | `0.07s` | `0.00s` | `0.00s` | `0.00s` | `4.41s` | `1.02s` | `0.01s` |
+
 Takeaways from this run:
 - Gemma gets a clear Metal decode win (`4.11s` -> `2.07s` median).
 - Qwen gets a clear Metal win for both prefill and decode.

@@ -104,7 +104,7 @@ struct Args {
 
     /// Inference backend selector.
     ///
-    /// `metal` currently performs a Metal kernel smoke check and then falls back to CPU math paths.
+    /// `metal` uses strict model Metal backend init; failures return an error.
     #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
     backend: BackendKind,
 }
@@ -171,21 +171,21 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
                 if r.enable_metal_full_backend() {
                     println!("LLM backend: metal (Qwen full acceleration)");
                 } else {
-                    println!("LLM backend: cpu (Qwen metal init failed)");
+                    anyhow::bail!("LLM backend: metal requested, but Qwen full-metal init failed");
                 }
             }
             Runner::Gemma(r) => {
                 if r.enable_metal_full_backend() {
                     println!("LLM backend: metal (Gemma full acceleration)");
                 } else {
-                    println!("LLM backend: cpu (Gemma metal init failed)");
+                    anyhow::bail!("LLM backend: metal requested, but Gemma full-metal init failed");
                 }
             }
             Runner::Llama(r) => {
                 if r.enable_metal_full_backend() {
                     println!("LLM backend: metal (Llama full acceleration)");
                 } else {
-                    println!("LLM backend: cpu (Llama metal init failed)");
+                    anyhow::bail!("LLM backend: metal requested, but Llama full-metal init failed");
                 }
             }
         }

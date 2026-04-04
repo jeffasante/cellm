@@ -172,6 +172,9 @@ struct LLMView: View {
             actionButton(isDownloading ? "Downloading sample files…" : "Download SmolLM sample model + tokenizer", icon: "arrow.down.circle", disabled: isDownloading || isRunning) {
                 downloadSmolLMSampleAssets()
             }
+            actionButton(isDownloading ? "Downloading sample files…" : "Download Gemma 3 1B int8 model + tokenizer (~1.2 GB)", icon: "arrow.down.circle", disabled: isDownloading || isRunning) {
+                downloadGemmaSampleAssets()
+            }
             actionButton(isDownloading ? "Downloading sample files…" : "Download SmolLM model only", icon: "shippingbox", disabled: isDownloading || isRunning) {
                 downloadSmolLMModelOnly()
             }
@@ -268,7 +271,7 @@ struct LLMView: View {
             if let backendWarning {
                 Text(backendWarning).font(.footnote).foregroundStyle(.orange)
             }
-            Text("Note: Qwen+Metal runs in strict mode in this build (no CPU fallback in runner math).")
+            Text("Note: Backend selection is strict in this build (no automatic CPU fallback).")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
             if isQwenSelected {
@@ -391,7 +394,6 @@ struct LLMView: View {
         let shouldForceStrictForExperimentalQwen = (qwenVariant == .experimental && selectedPreset != .strict)
         let preset = shouldForceStrictForExperimentalQwen ? GenerationPreset.strict : selectedPreset
         let isExperimentalQwen = (qwenVariant == .experimental)
-        let isQwenSelectedForRun = isQwenSelected
         let requestedMaxTokens = maxTokensOverride ?? preset.maxTokens
         let effectiveMaxTokens = isExperimentalQwen ? min(requestedMaxTokens, 4) : requestedMaxTokens
         let tokensPerBlock: UInt32 = 8
@@ -400,14 +402,8 @@ struct LLMView: View {
         isRunning = true
         Task.detached(priority: .userInitiated) {
             do {
-                var effectiveBackend = backend
-                var preflightWarning: String?
                 if backend == .metal, let metalErr = CellmFFI.metalSmokeError() {
-                    if isQwenSelectedForRun {
-                        throw CellmError.message("Qwen full-metal requested but Metal is unavailable: \(metalErr)")
-                    }
-                    effectiveBackend = .cpu
-                    preflightWarning = "Metal unavailable (\(metalErr)). Using CPU fallback for this run."
+                    throw CellmError.message("Metal requested but unavailable: \(metalErr)")
                 }
                 let tok = try CellmTokenizer(tokenizerURL: tokenizerURL)
                 let eng = try CellmEngine(
@@ -420,8 +416,7 @@ struct LLMView: View {
                     repeatPenalty: preset.repeatPenalty,
                     repeatWindow: preset.repeatWindow,
                     seed: 1,
-                    backend: effectiveBackend,
-                    allowBackendFallback: !(isQwenSelectedForRun && backend == .metal)
+                    backend: backend
                 )
                 let text = try eng.generate(
                     prompt: promptText,
@@ -429,7 +424,6 @@ struct LLMView: View {
                     thermalLevel: thermal,
                     exerciseSuspendResume: exerciseSuspendResume
                 )
-                let preflightWarningMessage = preflightWarning
                 await MainActor.run {
                     self.output = prettyOutput(text)
                     if let stats = eng.lastGenerationStats {
@@ -437,11 +431,8 @@ struct LLMView: View {
                     }
                     self.activeBackend = eng.activeBackend
                     var warnings: [String] = []
-                    if let preflightWarningMessage {
-                        warnings.append(preflightWarningMessage)
-                    }
                     if backend == .metal && !eng.activeBackend.lowercased().contains("metal") {
-                        warnings.append("Metal requested, fell back to \(eng.activeBackend).")
+                        warnings.append("Metal requested but active backend is \(eng.activeBackend).")
                     }
                     if shouldForceStrictForExperimentalQwen {
                         warnings.append("Strict preset auto-applied because selected Qwen variant is experimental.")
@@ -575,6 +566,69 @@ struct LLMView: View {
                     fileName: DemoAssetLinks.smollm2TokenizerConfigFileName,
                     progress: { p in
                         setDownloadProgress(completedFiles: 2.0, progress: p, totalFiles: totalFiles, label: "SmolLM", fileName: DemoAssetLinks.smollm2TokenizerConfigFileName)
+                    }
+                )
+                await MainActor.run {
+                    self.modelURL = modelPath
+                    self.tokenizerURL = tokPath
+                    self.downloadProgress = 1.0
+                    self.downloadStatus = "Saved: \(modelPath.lastPathComponent), \(tokPath.lastPathComponent)"
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
+                    self.isDownloading = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorText = String(describing: error)
+                    self.downloadStatus = ""
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
+                    self.isDownloading = false
+                }
+            }
+        }
+    }
+
+    private func downloadGemmaSampleAssets() {
+        errorText = nil
+        selectedSampleLabel = "Gemma3-1B-IT (int8)"
+        if let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3FileName),
+           let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerFileName),
+           RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerConfigFileName) != nil {
+            modelURL = model
+            tokenizerURL = tok
+            downloadStatus = "Using existing files in Documents."
+            downloadProgress = 0
+            return
+        }
+
+        downloadStatus = "Downloading Gemma sample files..."
+        downloadProgress = 0
+        currentDownloadFile = ""
+        currentDownloadSizeText = ""
+        isDownloading = true
+        Task {
+            do {
+                let totalFiles = 3.0
+                let modelPath = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.gemma3Int8,
+                    fileName: DemoAssetLinks.gemma3FileName,
+                    progress: { p in
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "Gemma", fileName: DemoAssetLinks.gemma3FileName)
+                    }
+                )
+                let tokPath = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.gemma3Tokenizer,
+                    fileName: DemoAssetLinks.gemma3TokenizerFileName,
+                    progress: { p in
+                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "Gemma tokenizer", fileName: DemoAssetLinks.gemma3TokenizerFileName)
+                    }
+                )
+                _ = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.gemma3TokenizerConfig,
+                    fileName: DemoAssetLinks.gemma3TokenizerConfigFileName,
+                    progress: { p in
+                        setDownloadProgress(completedFiles: 2.0, progress: p, totalFiles: totalFiles, label: "Gemma tokenizer", fileName: DemoAssetLinks.gemma3TokenizerConfigFileName)
                     }
                 )
                 await MainActor.run {
@@ -800,6 +854,20 @@ struct LLMView: View {
     }
 
     private func restoreAssets() {
+        let gemmaModel = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3FileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "gemma-3-1b-it-int8.cellmd")
+        let gemmaTok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerFileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "tokenizer-gemma-3-1b-it.json")
+        let gemmaCfg = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerConfigFileName) != nil
+            || RemoteAssets.existingDocumentsFile(fileName: "tokenizer_config.json") != nil
+        if let gemmaModel, let gemmaTok, gemmaCfg {
+            modelURL = gemmaModel
+            tokenizerURL = gemmaTok
+            selectedSampleLabel = "Gemma3-1B-IT (int8)"
+            if downloadStatus.isEmpty { downloadStatus = "Loaded local sample files." }
+            return
+        }
+
         let qwenModel = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35StableFileName)
             ?? RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35CompactFileName)
             ?? RemoteAssets.existingDocumentsFile(fileName: "qwen3.5-0.8b-int4-textonly.cellm")
@@ -835,6 +903,9 @@ struct LLMView: View {
     }
 
     private func clearLocalFiles() {
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma3FileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerFileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerConfigFileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.qwen35StableFileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.qwen35CompactFileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.qwen35TokenizerFileName)
@@ -862,6 +933,8 @@ struct LLMView: View {
         clearLocalFiles()
         if priorSelection == "SmolLM2" {
             downloadSmolLMSampleAssets()
+        } else if priorSelection == "Gemma3-1B-IT (int8)" {
+            downloadGemmaSampleAssets()
         } else {
             downloadQwenSampleAssets()
         }

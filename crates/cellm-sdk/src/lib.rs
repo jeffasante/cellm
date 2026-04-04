@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use cellm_cache::{KVCache, KvStorageKind, PageTable};
 use cellm_core::KvCacheLayout;
-use cellm_kernels::MetalKernels;
 use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, qwen::QwenRunner, CellmFile, ModelConfig};
 use cellm_scheduler::{RoundRobinScheduler, Session as SchedSession, SessionState, ThermalLevel, ThermalPolicy};
 use serde_json::Value;
@@ -108,11 +107,15 @@ impl Engine {
                     }
                 }
                 Runner::Gemma(r) => {
-                    if !r.enable_metal_linear_backend() {
-                        eprintln!("cellm-sdk: Gemma metal linear backend unavailable; using CPU linear path");
+                    if !r.enable_metal_full_backend() {
+                        anyhow::bail!("Gemma full-metal backend requested but unavailable");
                     }
                 }
-                Runner::Llama(_) => {}
+                Runner::Llama(r) => {
+                    if !r.enable_metal_full_backend() {
+                        anyhow::bail!("Llama full-metal backend requested but unavailable");
+                    }
+                }
             }
         }
 
@@ -413,18 +416,7 @@ impl Engine {
 }
 
 fn resolve_backend(requested: BackendKind) -> BackendKind {
-    match requested {
-        BackendKind::Cpu => BackendKind::Cpu,
-        BackendKind::Metal => match MetalKernels::smoke_test_add_f32() {
-            Ok(_) => BackendKind::Metal,
-            Err(e) => {
-                eprintln!(
-                    "cellm-sdk: Metal requested but unavailable ({e}). Falling back to CPU."
-                );
-                BackendKind::Cpu
-            }
-        },
-    }
+    requested
 }
 
 fn effective_text_model_type(header: &cellm_model::CellmHeader) -> String {

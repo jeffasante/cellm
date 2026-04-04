@@ -215,17 +215,23 @@ impl Engine {
         let mut next = 0u32;
         for (i, &tok) in tokens.iter().enumerate() {
             let pos = s.next_pos + i;
-            let cand = match &mut self.runner {
+            let mut cand = match &mut self.runner {
                 Runner::Llama(r) => {
                     r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
                 }
                 Runner::Gemma(r) => {
-                    r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
+                    let top_k = if r.is_gemma3_text() { self.top_k.max(8) } else { self.top_k };
+                    r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, top_k)?
                 }
                 Runner::Qwen(r) => {
                     r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
                 }
             };
+            if let Runner::Gemma(r) = &self.runner {
+                if r.is_gemma3_text() {
+                    apply_gemma3_stability_candidate_filter(&mut cand, &s.recent, self.backend);
+                }
+            }
             next = select_next_with_params(
                 temperature,
                 repeat_penalty,
@@ -280,17 +286,23 @@ impl Engine {
             };
 
             let pos = s.next_pos;
-            let cand = match &mut self.runner {
+            let mut cand = match &mut self.runner {
                 Runner::Llama(r) => {
                     r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
                 }
                 Runner::Gemma(r) => {
-                    r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
+                    let top_k = if r.is_gemma3_text() { self.top_k.max(8) } else { self.top_k };
+                    r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?
                 }
                 Runner::Qwen(r) => {
                     r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
                 }
             };
+            if let Runner::Gemma(r) = &self.runner {
+                if r.is_gemma3_text() {
+                    apply_gemma3_stability_candidate_filter(&mut cand, &s.recent, self.backend);
+                }
+            }
             let next = select_next_with_params(
                 temperature,
                 repeat_penalty,
@@ -515,6 +527,56 @@ fn select_next_with_params(
         }
     }
     Ok(*ids.last().unwrap())
+}
+
+fn apply_gemma3_stability_candidate_filter(
+    cand: &mut Vec<(u32, f32)>,
+    recent: &[u32],
+    backend: BackendKind,
+) {
+    if backend != BackendKind::Metal {
+        return;
+    }
+    // Device-specific Gemma3 metal runs can collapse onto empty/markdown/newline tokens.
+    // Drop known degenerate ids when alternatives exist.
+    if cand.len() > 1 {
+        cand.retain(|(id, _)| *id != 106);
+    }
+    if cand.len() > 1 {
+        cand.retain(|(id, _)| *id != 1018);
+    }
+
+    // If we're already in a newline/markdown loop, steer away from pure formatting tokens.
+    if looks_like_format_loop(recent) && cand.len() > 1 {
+        cand.retain(|(id, _)| !matches!(*id, 107 | 108 | 109 | 110 | 1018 | 236865));
+    }
+
+    // If a token is already heavily repeated in the recent window, avoid selecting it again
+    // when alternatives exist. This helps break low-information loops like "is ... is ...".
+    if cand.len() > 1 && recent.len() >= 8 {
+        let tail = &recent[recent.len().saturating_sub(16)..];
+        let mut counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for &t in tail {
+            *counts.entry(t).or_insert(0) += 1;
+        }
+        let original = cand.clone();
+        cand.retain(|(id, _)| counts.get(id).copied().unwrap_or(0) < 3);
+        if cand.is_empty() {
+            *cand = original;
+        }
+    }
+}
+
+fn looks_like_format_loop(recent: &[u32]) -> bool {
+    if recent.len() < 6 {
+        return false;
+    }
+    let tail = &recent[recent.len() - 6..];
+    let format_count = tail
+        .iter()
+        .filter(|&&id| matches!(id, 107 | 108 | 109 | 110 | 1018 | 236865))
+        .count();
+    format_count >= 4
 }
 
 pub struct EngineStats {

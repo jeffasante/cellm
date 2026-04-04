@@ -83,6 +83,11 @@ struct LLMView: View {
         (modelURL?.lastPathComponent.lowercased().contains("qwen") ?? false) ||
         (tokenizerURL?.lastPathComponent.lowercased().contains("qwen") ?? false)
     }
+    
+    private var isGemmaSelected: Bool {
+        (modelURL?.lastPathComponent.lowercased().contains("gemma") ?? false) ||
+        (tokenizerURL?.lastPathComponent.lowercased().contains("gemma") ?? false)
+    }
 
     private var qwenVariant: QwenVariant {
         guard isQwenSelected else { return .none }
@@ -166,7 +171,7 @@ struct LLMView: View {
             actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen compact model only (~361 MB, experimental)", icon: "shippingbox", disabled: isDownloading || isRunning) {
                 downloadQwenCompactModelOnly()
             }
-            actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen tokenizer JSON only", icon: "doc.badge.arrow.down", disabled: isDownloading || isRunning) {
+            actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen tokenizer JSON only", icon: "arrow.down.doc", disabled: isDownloading || isRunning) {
                 downloadQwenTokenizerOnly()
             }
             actionButton(isDownloading ? "Downloading sample files…" : "Download SmolLM sample model + tokenizer", icon: "arrow.down.circle", disabled: isDownloading || isRunning) {
@@ -178,7 +183,7 @@ struct LLMView: View {
             actionButton(isDownloading ? "Downloading sample files…" : "Download SmolLM model only", icon: "shippingbox", disabled: isDownloading || isRunning) {
                 downloadSmolLMModelOnly()
             }
-            actionButton(isDownloading ? "Downloading sample files…" : "Download SmolLM tokenizer JSON only", icon: "doc.badge.arrow.down", disabled: isDownloading || isRunning) {
+            actionButton(isDownloading ? "Downloading sample files…" : "Download SmolLM tokenizer JSON only", icon: "arrow.down.doc", disabled: isDownloading || isRunning) {
                 downloadSmolLMTokenizerOnly()
             }
             actionButton("Run Qwen Smoke Test", icon: "bolt.circle", disabled: isRunning || modelURL == nil || tokenizerURL == nil) {
@@ -392,42 +397,91 @@ struct LLMView: View {
         let backend = selectedBackend
         let thermal = selectedThermalLevel
         let shouldForceStrictForExperimentalQwen = (qwenVariant == .experimental && selectedPreset != .strict)
+        let useGemmaMetalStabilitySampling = (selectedBackend == .metal && isGemmaSelected)
         let preset = shouldForceStrictForExperimentalQwen ? GenerationPreset.strict : selectedPreset
         let isExperimentalQwen = (qwenVariant == .experimental)
         let requestedMaxTokens = maxTokensOverride ?? preset.maxTokens
         let effectiveMaxTokens = isExperimentalQwen ? min(requestedMaxTokens, 4) : requestedMaxTokens
         let tokensPerBlock: UInt32 = 8
         let totalBlocks: UInt32 = isExperimentalQwen ? 24 : 48
+        let runtimeTopK: UInt32 = useGemmaMetalStabilitySampling ? max(preset.topK, 40) : preset.topK
+        let runtimeTemperature: Float = useGemmaMetalStabilitySampling ? max(preset.temperature, 0.35) : preset.temperature
+        let runtimeRepeatPenalty: Float = useGemmaMetalStabilitySampling ? max(preset.repeatPenalty, 1.18) : preset.repeatPenalty
+        let runtimeRepeatWindow: UInt32 = useGemmaMetalStabilitySampling ? max(preset.repeatWindow, 128) : preset.repeatWindow
 
         isRunning = true
         Task.detached(priority: .userInitiated) {
             do {
+                let initStart = Date()
+                var initLogLines: [String] = []
                 if backend == .metal, let metalErr = CellmFFI.metalSmokeError() {
                     throw CellmError.message("Metal requested but unavailable: \(metalErr)")
                 }
+                let afterPreflight = Date()
+                initLogLines.append(
+                    String(
+                        format: "init_preflight=%.1fms",
+                        afterPreflight.timeIntervalSince(initStart) * 1000.0
+                    )
+                )
+
+                let tokStart = Date()
                 let tok = try CellmTokenizer(tokenizerURL: tokenizerURL)
+                let tokEnd = Date()
+                initLogLines.append(
+                    String(
+                        format: "init_tokenizer=%.1fms",
+                        tokEnd.timeIntervalSince(tokStart) * 1000.0
+                    )
+                )
+
+                let engineStart = Date()
                 let eng = try CellmEngine(
                     modelURL: modelURL,
                     tokenizer: tok,
                     tokensPerBlock: tokensPerBlock,
                     totalBlocks: totalBlocks,
-                    topK: preset.topK,
-                    temperature: preset.temperature,
-                    repeatPenalty: preset.repeatPenalty,
-                    repeatWindow: preset.repeatWindow,
-                    seed: 1,
+                    topK: runtimeTopK,
+                    temperature: runtimeTemperature,
+                    repeatPenalty: runtimeRepeatPenalty,
+                    repeatWindow: runtimeRepeatWindow,
+                    seed: UInt64(Date().timeIntervalSince1970 * 1000.0),
                     backend: backend
                 )
+                let engineEnd = Date()
+                initLogLines.append(
+                    String(
+                        format: "init_engine=%.1fms",
+                        engineEnd.timeIntervalSince(engineStart) * 1000.0
+                    )
+                )
+                initLogLines.append(
+                    String(
+                        format: "init_total=%.1fms",
+                        engineEnd.timeIntervalSince(initStart) * 1000.0
+                    )
+                )
+                initLogLines.append("requested_backend=\(backend.label.lowercased()) active_backend=\(eng.activeBackend)")
+
                 let text = try eng.generate(
                     prompt: promptText,
                     maxNewTokens: effectiveMaxTokens,
                     thermalLevel: thermal,
-                    exerciseSuspendResume: exerciseSuspendResume
+                    exerciseSuspendResume: exerciseSuspendResume,
+                    onToken: { piece in
+                        Task { @MainActor in
+                            self.output += piece
+                        }
+                    }
                 )
                 await MainActor.run {
                     self.output = prettyOutput(text)
                     if let stats = eng.lastGenerationStats {
-                        self.runDiagnostics = formatDiagnostics(stats: stats)
+                        initLogLines.append("prompt_style=\(eng.lastPromptStyle)")
+                        if !eng.lastDebugTrace.isEmpty {
+                            initLogLines.append(contentsOf: eng.lastDebugTrace.map { "trace \($0)" })
+                        }
+                        self.runDiagnostics = formatInitDiagnostics(lines: initLogLines, stats: stats)
                     }
                     self.activeBackend = eng.activeBackend
                     var warnings: [String] = []
@@ -437,8 +491,14 @@ struct LLMView: View {
                     if shouldForceStrictForExperimentalQwen {
                         warnings.append("Strict preset auto-applied because selected Qwen variant is experimental.")
                     }
+                    if useGemmaMetalStabilitySampling {
+                        warnings.append("Gemma Metal stability sampling applied (temp/top-k/repetition tuned) to reduce decode loops.")
+                    }
                     if isExperimentalQwen && effectiveMaxTokens < requestedMaxTokens {
                         warnings.append("Experimental Qwen token cap applied (\(effectiveMaxTokens) max) to avoid long looped runs.")
+                    }
+                    if backend == .metal && isGemmaSelected {
+                        warnings.append("Gemma Metal is enabled, but output quality parity is still being tuned in this build.")
                     }
                     warnings.append("Mobile KV cache tuned for latency (block=\(tokensPerBlock), total=\(totalBlocks)).")
                     self.backendWarning = warnings.isEmpty ? nil : warnings.joined(separator: " ")
@@ -1020,14 +1080,21 @@ struct LLMView: View {
 
     private func formatDiagnostics(stats: LlmGenerationStats) -> String {
         String(
-            format: "prompt_tokens=%d generated_tokens=%d first_piece=%@ prefill=%.1fms decode=%.1fms total=%.1fms",
+            format: "prompt_tokens=%d generated_tokens=%d stop_reason=%@ first_piece=%@ prefill=%.1fms decode=%.1fms total=%.1fms",
             stats.promptTokenCount,
             stats.generatedTokenCount,
+            stats.stopReason,
             stats.firstPiece,
             stats.prefillMs,
             stats.decodeMs,
             stats.totalMs
         )
+    }
+
+    private func formatInitDiagnostics(lines: [String], stats: LlmGenerationStats) -> String {
+        let initLine = lines.joined(separator: " ")
+        let genLine = formatDiagnostics(stats: stats)
+        return "\(initLine)\n\(genLine)"
     }
 
     private func setDownloadProgress(completedFiles: Double, progress: RemoteAssets.DownloadProgress, totalFiles: Double, label: String, fileName: String) {

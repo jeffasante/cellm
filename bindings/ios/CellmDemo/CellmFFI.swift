@@ -56,6 +56,7 @@ struct LlmGenerationStats {
     let decodeMs: Double
     let totalMs: Double
     let firstPiece: String
+    let stopReason: String
 }
 
 final class CellmTokenizer {
@@ -121,11 +122,17 @@ final class CellmEngine {
     private var handle: cellm_engine_t = 0
     private let tokenizer: CellmTokenizer
     private let session: cellm_session_t
+    private let modelURL: URL
 
     let activeBackend: String
+    private(set) var lastPromptStyle: String = "unknown"
+    private(set) var lastDebugTrace: [String] = []
     private(set) var lastGenerationStats: LlmGenerationStats?
 
+    private static let debugLogsEnabled = true
+
     init(modelURL: URL, tokenizer: CellmTokenizer, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 256, topK: UInt32 = 40, temperature: Float = 0.2, repeatPenalty: Float = 1.08, repeatWindow: UInt32 = 96, seed: UInt64 = 1, backend: CellmBackend = .metal) throws {
+        self.modelURL = modelURL
         self.tokenizer = tokenizer
         let path = modelURL.path
         let requestedBackend: CellmBackend = backend
@@ -154,10 +161,21 @@ final class CellmEngine {
         }
     }
 
-    func generate(prompt: String, maxNewTokens: Int, thermalLevel: CellmThermalLevel = .nominal, exerciseSuspendResume: Bool = false) throws -> String {
+    func generate(
+        prompt: String,
+        maxNewTokens: Int,
+        thermalLevel: CellmThermalLevel = .nominal,
+        exerciseSuspendResume: Bool = false,
+        onToken: ((String) -> Void)? = nil
+    ) throws -> String {
         lastGenerationStats = nil
-        let promptText = Self.wrapPrompt(prompt, tokenizerURL: tokenizer.tokenizerURL)
+        lastDebugTrace = []
+        let promptStyle = Self.promptStyle(tokenizerURL: tokenizer.tokenizerURL, modelURL: modelURL)
+        lastPromptStyle = promptStyle.label
+        let promptText = Self.wrapPrompt(prompt, style: promptStyle)
         let promptTokens = try tokenizer.encode(promptText)
+        lastDebugTrace.append("start backend=\(activeBackend) prompt_style=\(lastPromptStyle) prompt_tokens=\(promptTokens.count)")
+        Self.debugLog("generate start backend=\(activeBackend) prompt_style=\(lastPromptStyle) prompt_tokens=\(promptTokens.count) max_new_tokens=\(maxNewTokens)")
 
         let tStart = Date()
         try setThermalLevel(thermalLevel)
@@ -167,6 +185,8 @@ final class CellmEngine {
         }
         if rc != 0 { throw CellmError.message(CellmFFI.lastError()) }
         let tAfterPrefill = Date()
+        lastDebugTrace.append("prefill next_token=\(next) prefill_ms=\(String(format: "%.1f", tAfterPrefill.timeIntervalSince(tStart) * 1000.0))")
+        Self.debugLog("prefill done next_token=\(next) prefill_ms=\(String(format: "%.1f", tAfterPrefill.timeIntervalSince(tStart) * 1000.0))")
 
         if exerciseSuspendResume {
             try suspendSession()
@@ -177,10 +197,13 @@ final class CellmEngine {
         let firstPiece = try tokenizer.decodeOne(next)
         if !Self.isStopPiece(firstPiece) {
             out += firstPiece
+            onToken?(firstPiece)
         }
         var lastPiece = firstPiece
         var samePieceRun = firstPiece.isEmpty ? 0 : 1
+        var generatedTokens: [UInt32] = [next]
         var generated = 1
+        var stopReason = "max_tokens"
 
         if maxNewTokens <= 1 {
             let totalMs = Date().timeIntervalSince(tStart) * 1000.0
@@ -191,28 +214,59 @@ final class CellmEngine {
                 prefillMs: prefillMs,
                 decodeMs: max(0.0, totalMs - prefillMs),
                 totalMs: totalMs,
-                firstPiece: firstPiece
+                firstPiece: firstPiece,
+                stopReason: "max_tokens_1"
             )
+            Self.debugLog("generate done generated=\(generated) stop_reason=max_tokens_1 total_ms=\(String(format: "%.1f", totalMs))")
             return out
         }
 
-        for _ in 0..<(maxNewTokens - 1) {
+        for i in 0..<(maxNewTokens - 1) {
             var outSession: UInt64 = 0
             var tok: UInt32 = 0
             let r = cellm_step_decode(handle, &outSession, &tok)
             if r < 0 { throw CellmError.message(CellmFFI.lastError()) }
-            if r == 0 { break }
+            if r == 0 {
+                stopReason = "eos_or_engine_stop"
+                break
+            }
             let piece = try tokenizer.decodeOne(tok)
-            if Self.isStopPiece(piece) { break }
-            if Self.hasLongDigitRun(piece, threshold: 10) { break }
+            if Self.debugLogsEnabled && (i < 8 || i % 8 == 0) {
+                let cleanPiece = piece.replacingOccurrences(of: "\n", with: "\\n")
+                if i < 12 {
+                    lastDebugTrace.append("decode[\(i)] tok=\(tok) piece=\"\(cleanPiece)\"")
+                }
+                Self.debugLog("decode[\(i)] token=\(tok) piece=\"\(cleanPiece)\"")
+            }
+            if Self.isStopPiece(piece) {
+                stopReason = "stop_piece"
+                break
+            }
+            if Self.hasLongDigitRun(piece, threshold: 10) {
+                stopReason = "digit_run_guard"
+                break
+            }
+            generatedTokens.append(tok)
             if piece == lastPiece && !piece.isEmpty {
                 samePieceRun += 1
             } else {
                 samePieceRun = piece.isEmpty ? 0 : 1
                 lastPiece = piece
             }
-            if samePieceRun >= 4 { break }
+            if samePieceRun >= 4 {
+                stopReason = "same_piece_loop_guard"
+                break
+            }
+            if Self.isLikelyTokenLoop(generatedTokens, window: 12, maxDominantCount: 8) {
+                stopReason = "dominant_token_loop_guard"
+                break
+            }
+            if Self.isAlternatingTwoTokenLoop(generatedTokens, minLength: 8) {
+                stopReason = "alternating_loop_guard"
+                break
+            }
             out += piece
+            onToken?(piece)
             generated += 1
         }
         let totalMs = Date().timeIntervalSince(tStart) * 1000.0
@@ -223,9 +277,17 @@ final class CellmEngine {
             prefillMs: prefillMs,
             decodeMs: max(0.0, totalMs - prefillMs),
             totalMs: totalMs,
-            firstPiece: firstPiece
+            firstPiece: firstPiece,
+            stopReason: stopReason
         )
+        lastDebugTrace.append("done generated=\(generated) stop_reason=\(stopReason) total_ms=\(String(format: "%.1f", totalMs))")
+        Self.debugLog("generate done generated=\(generated) stop_reason=\(stopReason) total_ms=\(String(format: "%.1f", totalMs))")
         return out
+    }
+
+    private static func debugLog(_ message: String) {
+        guard debugLogsEnabled else { return }
+        print("[CellmDebug] \(message)")
     }
 
     func setThermalLevel(_ level: CellmThermalLevel) throws {
@@ -243,9 +305,9 @@ final class CellmEngine {
         if rc != 0 { throw CellmError.message(CellmFFI.lastError()) }
     }
 
-    private static func wrapPrompt(_ prompt: String, tokenizerURL: URL) -> String {
+    private static func wrapPrompt(_ prompt: String, style: PromptStyle) -> String {
         let cleanPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        switch promptStyle(tokenizerURL: tokenizerURL) {
+        switch style {
         case .smolChat:
             return "<|im_start|>User: \(cleanPrompt)<end_of_utterance>\nAssistant:"
         case .chatML(let includeThinkPrefill):
@@ -255,6 +317,8 @@ final class CellmEngine {
             }
             return s
         case .gemma:
+            // Do not prepend BOS as raw text (e.g. "<bos>"): if BOS is needed it should be
+            // injected as an id-level special token, not literal bytes in the prompt.
             return "<start_of_turn>user\n\(cleanPrompt)<end_of_turn>\n<start_of_turn>model\n"
         case .plain:
             return "User: \(cleanPrompt)\nAssistant:"
@@ -264,17 +328,37 @@ final class CellmEngine {
     private enum PromptStyle {
         case smolChat
         case chatML(includeThinkPrefill: Bool)
-        case gemma
+        case gemma(bosToken: String?)
         case plain
+
+        var label: String {
+            switch self {
+            case .smolChat: return "smol_chat"
+            case .chatML: return "chatml"
+            case .gemma: return "gemma_turn"
+            case .plain: return "plain"
+            }
+        }
     }
 
-    private static func promptStyle(tokenizerURL: URL) -> PromptStyle {
+    private static func promptStyle(tokenizerURL: URL, modelURL: URL? = nil) -> PromptStyle {
+        let tokenizerName = tokenizerURL.lastPathComponent.lowercased()
+        let modelName = modelURL?.lastPathComponent.lowercased() ?? ""
         let cfgURL = tokenizerURL.deletingLastPathComponent().appendingPathComponent("tokenizer_config.json")
         guard
             let data = try? Data(contentsOf: cfgURL),
             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let tpl = obj["chat_template"] as? String
         else {
+            if tokenizerName.contains("gemma") || modelName.contains("gemma") {
+                return .gemma(bosToken: nil)
+            }
+            if tokenizerName.contains("qwen") || modelName.contains("qwen") {
+                return .chatML(includeThinkPrefill: false)
+            }
+            if tokenizerName.contains("smollm") || modelName.contains("smollm") {
+                return .smolChat
+            }
             return .plain
         }
         if tpl.contains("<end_of_utterance>") && tpl.contains("Assistant:") {
@@ -286,7 +370,9 @@ final class CellmEngine {
             return .chatML(includeThinkPrefill: false)
         }
         if tpl.contains("<start_of_turn>") && tpl.contains("<end_of_turn>") {
-            return .gemma
+            let addBos = (obj["add_bos_token"] as? Bool) ?? false
+            let bosToken = addBos ? (obj["bos_token"] as? String) : nil
+            return .gemma(bosToken: bosToken)
         }
         return .plain
     }
@@ -308,6 +394,33 @@ final class CellmEngine {
             }
         }
         return false
+    }
+
+    private static func isLikelyTokenLoop(_ tokens: [UInt32], window: Int, maxDominantCount: Int) -> Bool {
+        guard tokens.count >= window else { return false }
+        let recent = tokens.suffix(window)
+        var counts: [UInt32: Int] = [:]
+        for t in recent {
+            counts[t, default: 0] += 1
+        }
+        guard let dominant = counts.values.max() else { return false }
+        return dominant >= maxDominantCount
+    }
+
+    private static func isAlternatingTwoTokenLoop(_ tokens: [UInt32], minLength: Int) -> Bool {
+        guard tokens.count >= minLength else { return false }
+        let recent = Array(tokens.suffix(minLength))
+        guard minLength >= 4 else { return false }
+        let a = recent[0]
+        let b = recent[1]
+        if a == b { return false }
+        for i in 0..<recent.count {
+            let expected = (i % 2 == 0) ? a : b
+            if recent[i] != expected {
+                return false
+            }
+        }
+        return true
     }
 }
 

@@ -111,6 +111,10 @@ impl GemmaRunner {
     pub fn eos_token_id(&self) -> Option<u32> {
         self.eos_token_id
     }
+    
+    pub fn is_gemma3_text(&self) -> bool {
+        self.is_gemma3_text
+    }
 
     pub fn enable_metal_linear_backend(&mut self) -> bool {
         match (MetalKernels::create_matmul(), MetalOps::create()) {
@@ -303,17 +307,18 @@ impl GemmaRunner {
                     &format!("model.layers.{layer}.self_attn.q_norm.weight"))?.to_vec();
                 let kw = self.tensor_f16(
                     &format!("model.layers.{layer}.self_attn.k_norm.weight"))?.to_vec();
+                let add_one = self.rmsnorm_weight_is_offset;
                 let ops = self.metal_ops.as_mut().unwrap();
                 for hidx in 0..n_heads {
                     let seg = &mut q[hidx * head_dim..(hidx + 1) * head_dim];
                     let inp = seg.to_vec();
-                    ops.rms_norm_f16w(&inp, &qw, cfg.rms_norm_eps, false, seg)
+                    ops.rms_norm_f16w(&inp, &qw, cfg.rms_norm_eps, add_one, seg)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                 }
                 for hidx in 0..n_kv_heads {
                     let seg = &mut k[hidx * kv_head_dim..(hidx + 1) * kv_head_dim];
                     let inp = seg.to_vec();
-                    ops.rms_norm_f16w(&inp, &kw, cfg.rms_norm_eps, false, seg)
+                    ops.rms_norm_f16w(&inp, &kw, cfg.rms_norm_eps, add_one, seg)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                 }
             } else {

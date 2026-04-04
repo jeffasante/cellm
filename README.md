@@ -19,6 +19,23 @@ Not a wrapper around `llama.cpp`. Not a port of `vLLM`. A new runtime designed f
 
 ---
 
+## Why cellm?
+
+> [!NOTE]
+> This is just a research project—don't get mad at me lol!
+
+**cellm** is a unique hybrid of server-grade serving concepts (vLLM-style) and mobile-native execution (MLX-style). 
+
+| Feature | `llama.cpp` | `MLX` | `ExecuTorch` | **`cellm`** |
+| :--- | :--- | :--- | :--- | :--- |
+| **Language** | C++ | C++/Python | C++ | **Rust** |
+| **KV Cache** | Contiguous | Contiguous | Contiguous | **Paged (Block-based)** |
+| **Focus** | Portability | Apple Native | Model Export | **Mobile Multi-session** |
+| **Scheduling** | Static Batch | Mostly Single | N/A | **Round-Robin Interleaved**|
+| **Memory** | Manual/Static | Managed Buffer | Static Graph | **Dynamic Block Allocator**|
+
+---
+
 ## Getting Started
 
 ### Prerequisites

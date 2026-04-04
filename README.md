@@ -85,6 +85,33 @@ cargo run --release --bin infer -- \
   --backend metal
 ```
 
+KV encoding selection (safe opt-in):
+- Default remains current behavior: `--kv-encoding f16`
+- Experimental TurboQuant mode (opt-in only): `--kv-encoding turboquant`
+- If you do not pass this flag, nothing changes in your current setup.
+
+TurboQuant reference (cited):
+- **TurboQuant: Redefining AI efficiency with extreme compression** (March 24, 2026)
+- Amir Zandieh, Research Scientist, and Vahab Mirrokni, VP and Google Fellow, Google Research
+- Data-flow note in this repo: `docs/turboquant_dataflow.md`
+
+Current implementation status:
+- `cpu + turboquant`: enabled (int8 packed K/V with per-token scales, experimental)
+- `metal + turboquant`: enabled (int8 packed K/V with per-token scales, experimental)
+
+Example:
+```bash
+./target/release/infer \
+  --model models/gemma-3-1b-it-int8.cellmd \
+  --tokenizer models/hf/gemma-3-1b-it/tokenizer.json \
+  --prompt "What is the capital of France?" \
+  --chat \
+  --chat-format auto \
+  --gen 16 \
+  --backend metal \
+  --kv-encoding turboquant
+```
+
 Qwen3.5 notes:
 - Qwen3.5 4-bit MLX tokenizers sometimes store BPE merges as `[[a,b], ...]` instead of `["a b", ...]`. `infer` auto-normalizes this on load.
 - Qwen3.5 mixes `full_attention` layers and `linear_attention` (DeltaNet / gated delta rule) layers. `infer` includes a CPU reference implementation for both.
@@ -398,6 +425,14 @@ CPU vs Metal LLM benchmark snapshot (3 passes, host macOS run on April 3, 2026; 
 | `qwen3.5-0.8b-int8.cellm` | `cpu` | `0.26 / 0.28` | `0.52 / 1.80` | `3.87 / 3.89` |
 | `qwen3.5-0.8b-int8.cellm` | `metal` | `0.33 / 0.33` | `0.42 / 0.46` | `2.08 / 2.08` |
 
+KV encoding benchmark snapshot (3 passes, host macOS run on April 4, 2026; model=`smollm2-135m.cellm`, prompt=`"hello"`, `--gen 8`, report = median / P95):
+| Backend | KV Encoding | Prefill (s) | Decode (s) |
+|---|---|---:|---:|
+| `cpu` | `f16` | `2.85 / 4.30` | `22.22 / 24.20` |
+| `cpu` | `turboquant` | `2.79 / 2.80` | `22.19 / 23.31` |
+| `metal` | `f16` | `4.72 / 4.79` | `36.83 / 37.15` |
+| `metal` | `turboquant` | `4.69 / 4.73` | `37.41 / 37.56` |
+
 Gemma3 int8 strict backend check (April 4, 2026; prompt=`"What is the capital of France?"`, `--gen 16`, `--temperature 0`):
 | Model | Backend | Init total before prefill | Prefill | Decode |
 |---|---|---:|---:|---:|
@@ -439,6 +474,17 @@ CELLM_LLAMA_USE_METAL_NORM=1 CELLM_LLAMA_USE_METAL_ROPE=1 ./target/release/infer
 
 # Experimental fused graph path (can be faster but may be unstable depending on model)
 CELLM_LLAMA_ENABLE_GRAPH=1 ./target/release/infer ...
+```
+
+Gemma Metal parity controls (for debugging quality vs speed):
+```bash
+# Default (recommended for Gemma-3 quality parity):
+# Metal backend active, but Gemma norm/rope/logits stay on CPU-safe path.
+
+# Opt-in toggles (experimental):
+CELLM_GEMMA_USE_METAL_NORM=1   # enable Metal RMSNorm
+CELLM_GEMMA_USE_METAL_ROPE=1   # enable Metal RoPE
+CELLM_GEMMA_USE_METAL_LOGITS=1 # enable Metal final logits matvec
 ```
 
 ### Convert Models

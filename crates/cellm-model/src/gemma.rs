@@ -31,6 +31,9 @@ pub struct GemmaRunner {
     metal_strict: bool,
     /// Present when a Metal backend is active; drives rms_norm / rope / logits on GPU.
     metal_ops: Option<MetalOps>,
+    use_metal_norm: bool,
+    use_metal_rope: bool,
+    use_metal_logits: bool,
 }
 
 enum GemmaLinearBackend {
@@ -93,6 +96,15 @@ impl GemmaRunner {
             linear_backend: GemmaLinearBackend::Cpu,
             metal_strict: false,
             metal_ops: None,
+            use_metal_norm: std::env::var("CELLM_GEMMA_USE_METAL_NORM")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            use_metal_rope: std::env::var("CELLM_GEMMA_USE_METAL_ROPE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            use_metal_logits: std::env::var("CELLM_GEMMA_USE_METAL_LOGITS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         })
     }
 
@@ -273,10 +285,10 @@ impl GemmaRunner {
                 rms_norm_f32(&x, &attn_norm_w, cfg.rms_norm_eps, &mut x_norm);
             }
 
-            let use_metal_norm = self.metal_ops.is_some();
+            let use_metal_norm = self.metal_ops.is_some() && self.use_metal_norm;
             // Gemma uses rotate_half-style RoPE; keep RoPE on CPU for Gemma3 to
             // preserve correctness until Metal path matches this convention.
-            let use_metal_rope = self.metal_ops.is_some();
+            let use_metal_rope = self.metal_ops.is_some() && self.use_metal_rope;
 
             // QKV projections (HF weights are [out, in]).
             self.linear_f16_out_in(
@@ -482,7 +494,7 @@ impl GemmaRunner {
         }
 
         // Final norm.
-        let use_metal_norm = self.metal_ops.is_some();
+        let use_metal_norm = self.metal_ops.is_some() && self.use_metal_norm;
         let mut x_final = vec![0.0f32; hidden];
         if use_metal_norm {
             let w = self.tensor_f16("model.norm.weight")?.to_vec();
@@ -500,7 +512,7 @@ impl GemmaRunner {
         let vocab = cfg.vocab_size;
         let k = top_k.max(1).min(vocab);
 
-        let use_metal_logits = self.metal_ops.is_some();
+        let use_metal_logits = self.metal_ops.is_some() && self.use_metal_logits;
 
         let lm_head_name = self.resolve_name("lm_head.weight");
         let maybe_lm_head = lm_head_name

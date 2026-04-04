@@ -8,6 +8,6 @@ pub mod eviction;
 
 pub use allocator::BlockAllocator;
 pub use error::CacheError;
-pub use kvcache::{KVCache, KvStorageKind};
+pub use kvcache::{KVCache, KvEncodingKind, KvStorageKind};
 pub use pagetable::PageTable;
 pub use eviction::EvictionPolicy;

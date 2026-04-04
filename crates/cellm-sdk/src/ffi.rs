@@ -6,6 +6,7 @@ use std::path::Path;
 use std::slice;
 
 use crate::{vlm::VlmRunConfig, BackendKind, Engine, EngineConfig, SessionId};
+use cellm_cache::KvEncodingKind;
 use cellm_kernels::MetalKernels;
 use cellm_scheduler::ThermalLevel;
 use serde_json::Value;
@@ -285,6 +286,7 @@ pub extern "C" fn cellm_engine_create(
             repeat_window: 0,
             seed: 0,
             backend: BackendKind::Cpu,
+            kv_encoding: KvEncodingKind::F16,
         };
         let engine = Engine::new(Path::new(model_path), cfg)
             .map_err(|e| format!("engine_create failed: {e}"))?;
@@ -332,6 +334,7 @@ pub extern "C" fn cellm_engine_create_v2(
             repeat_window: repeat_window as usize,
             seed,
             backend: BackendKind::Cpu,
+            kv_encoding: KvEncodingKind::F16,
         };
         let engine = Engine::new(Path::new(model_path), cfg)
             .map_err(|e| format!("engine_create_v2 failed: {e}"))?;
@@ -373,6 +376,7 @@ pub extern "C" fn cellm_engine_create_v3(
                 repeat_window: repeat_window as usize,
                 seed,
                 backend,
+                kv_encoding: KvEncodingKind::F16,
             };
             let engine = Engine::new(Path::new(model_path), cfg)
                 .map_err(|e| format!("engine_create_v3 failed: {e}"))?;

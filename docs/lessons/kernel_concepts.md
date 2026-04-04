@@ -82,7 +82,7 @@ graph TD
 ---
 
 ## 5. Causal Masking
-In autoregressive decoding, tokens cannot "look ahead." We apply a lower-triangular mask by setting scores above the diagonal to $-\infty$. During softmax, $e^{-\infty}$ becomes 0.
+In autoregressive decoding, tokens cannot "look ahead". We apply a lower-triangular mask by setting scores above the diagonal to $-\infty$. During softmax, $e^{-\infty}$ becomes 0.
 
 ```mermaid
 graph TD

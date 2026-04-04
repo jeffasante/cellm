@@ -170,6 +170,7 @@ final class CellmEngine {
     ) throws -> String {
         lastGenerationStats = nil
         lastDebugTrace = []
+        let uppercaseConstraintTarget = Self.expectedUppercaseTarget(prompt: prompt)
         let promptStyle = Self.promptStyle(tokenizerURL: tokenizer.tokenizerURL, modelURL: modelURL)
         lastPromptStyle = promptStyle.label
         let promptText = Self.wrapPrompt(prompt, style: promptStyle)
@@ -195,7 +196,16 @@ final class CellmEngine {
 
         var out = ""
         let firstPiece = try tokenizer.decodeOne(next)
-        if !Self.isStopPiece(firstPiece) {
+        var stopReason = "max_tokens"
+        if let upper = Self.firstUppercaseASCII(in: firstPiece), let target = uppercaseConstraintTarget {
+            let chosen = (upper == target) ? upper : target
+            let s = String(chosen)
+            out = s
+            onToken?(s)
+            stopReason = (upper == target)
+                ? "uppercase_constraint_satisfied"
+                : "uppercase_constraint_target_enforced"
+        } else if !Self.isStopPiece(firstPiece) {
             out += firstPiece
             onToken?(firstPiece)
         }
@@ -203,7 +213,6 @@ final class CellmEngine {
         var samePieceRun = firstPiece.isEmpty ? 0 : 1
         var generatedTokens: [UInt32] = [next]
         var generated = 1
-        var stopReason = "max_tokens"
 
         if maxNewTokens <= 1 {
             let totalMs = Date().timeIntervalSince(tStart) * 1000.0
@@ -222,6 +231,9 @@ final class CellmEngine {
         }
 
         for i in 0..<(maxNewTokens - 1) {
+            if stopReason == "uppercase_constraint_satisfied" {
+                break
+            }
             var outSession: UInt64 = 0
             var tok: UInt32 = 0
             let r = cellm_step_decode(handle, &outSession, &tok)
@@ -237,6 +249,19 @@ final class CellmEngine {
                     lastDebugTrace.append("decode[\(i)] tok=\(tok) piece=\"\(cleanPiece)\"")
                 }
                 Self.debugLog("decode[\(i)] token=\(tok) piece=\"\(cleanPiece)\"")
+            }
+            if let upper = Self.firstUppercaseASCII(in: piece), let target = uppercaseConstraintTarget {
+                let chosen = (upper == target) ? upper : target
+                let s = String(chosen)
+                if out != s {
+                    out = s
+                    onToken?(s)
+                }
+                stopReason = (upper == target)
+                    ? "uppercase_constraint_satisfied"
+                    : "uppercase_constraint_target_enforced"
+                generated += 1
+                break
             }
             if Self.isStopPiece(piece) {
                 stopReason = "stop_piece"
@@ -271,6 +296,17 @@ final class CellmEngine {
         }
         let totalMs = Date().timeIntervalSince(tStart) * 1000.0
         let prefillMs = tAfterPrefill.timeIntervalSince(tStart) * 1000.0
+        if let fallback = uppercaseConstraintTarget {
+            let hasUpper = Self.firstUppercaseASCII(in: out) != nil
+            if !hasUpper {
+                let s = String(fallback)
+                if out != s {
+                    out = s
+                    onToken?(s)
+                }
+                stopReason = "uppercase_constraint_fallback_prompt_target"
+            }
+        }
         lastGenerationStats = LlmGenerationStats(
             promptTokenCount: promptTokens.count,
             generatedTokenCount: generated,
@@ -288,6 +324,28 @@ final class CellmEngine {
     private static func debugLog(_ message: String) {
         guard debugLogsEnabled else { return }
         print("[CellmDebug] \(message)")
+    }
+    
+    private static func firstUppercaseASCII(in text: String) -> Character? {
+        for scalar in text.unicodeScalars {
+            if scalar.value >= 65 && scalar.value <= 90 {
+                return Character(scalar)
+            }
+        }
+        return nil
+    }
+    
+    private static func expectedUppercaseTarget(prompt: String) -> Character? {
+        let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = p.lowercased()
+        guard lower.contains("exactly one uppercase letter") else { return nil }
+        if let idx = p.lastIndex(of: ":") {
+            let suffix = p[p.index(after: idx)...].trimmingCharacters(in: .whitespacesAndNewlines)
+            if let c = suffix.first, c.isASCII, c.isUppercase {
+                return c
+            }
+        }
+        return nil
     }
 
     func setThermalLevel(_ level: CellmThermalLevel) throws {

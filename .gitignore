@@ -51,3 +51,6 @@ models/hf/**
 !models/README.md
 !models/test_images/
 !models/test_images/*.jpg
+
+turboquant-main/
+metal/

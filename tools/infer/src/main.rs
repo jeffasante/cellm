@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
-use cellm_cache::{KVCache, PageTable};
+use cellm_cache::{KVCache, KvEncodingKind, PageTable};
 use cellm_core::KvCacheLayout;
 use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, qwen::QwenRunner, CellmFile};
 use serde_json::Value;
@@ -25,6 +25,12 @@ enum ChatFormat {
 enum BackendKind {
     Cpu,
     Metal,
+}
+
+#[derive(clap::ValueEnum, Copy, Clone, Debug, Eq, PartialEq)]
+enum KvEncodingArg {
+    F16,
+    Turboquant,
 }
 
 #[derive(Parser, Debug)]
@@ -107,6 +113,13 @@ struct Args {
     /// `metal` uses strict model Metal backend init; failures return an error.
     #[arg(long, value_enum, default_value_t = BackendKind::Cpu)]
     backend: BackendKind,
+
+    /// KV cache encoding mode.
+    ///
+    /// `f16` is the current default and stable path.
+    /// `turboquant` enables an experimental CPU int8+scale packed KV path.
+    #[arg(long, value_enum, default_value_t = KvEncodingArg::F16)]
+    kv_encoding: KvEncodingArg,
 }
 
 fn main() -> Result<()> {
@@ -323,8 +336,12 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
     } else {
         cellm_cache::KvStorageKind::Cpu
     };
+    let kv_encoding = match args.kv_encoding {
+        KvEncodingArg::F16 => KvEncodingKind::F16,
+        KvEncodingArg::Turboquant => KvEncodingKind::TurboQuant,
+    };
     let t_stage = Instant::now();
-    let mut kv_cache = KVCache::new_with_kind(layout, kind)?;
+    let mut kv_cache = KVCache::new_with_kind_and_encoding(layout, kind, kv_encoding)?;
     let mut page_table = PageTable::new(1, args.tokens_per_block).unwrap();
     println!(
         "Startup: KV init {:.2}s",
@@ -337,6 +354,7 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
         args.tokens_per_block,
         kv_cache.layout().total_bytes_f16()
     );
+    println!("KV encoding: {:?}", kv_cache.encoding());
     println!(
         "Startup: total before prefill {:.2}s",
         t_startup.elapsed().as_secs_f64()

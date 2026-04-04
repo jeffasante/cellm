@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use cellm_cache::{KVCache, KvStorageKind, PageTable};
+use cellm_cache::{KVCache, KvEncodingKind, KvStorageKind, PageTable};
 use cellm_core::KvCacheLayout;
 use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, qwen::QwenRunner, CellmFile, ModelConfig};
 use cellm_scheduler::{RoundRobinScheduler, Session as SchedSession, SessionState, ThermalLevel, ThermalPolicy};
@@ -23,6 +23,7 @@ pub struct EngineConfig {
     pub repeat_window: usize,
     pub seed: u64,
     pub backend: BackendKind,
+    pub kv_encoding: KvEncodingKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,7 @@ impl Default for EngineConfig {
             repeat_window: 64,
             seed: 1,
             backend: BackendKind::Cpu,
+            kv_encoding: KvEncodingKind::F16,
         }
     }
 }
@@ -142,7 +144,7 @@ impl Engine {
             BackendKind::Cpu => KvStorageKind::Cpu,
             BackendKind::Metal => KvStorageKind::Metal,
         };
-        let kv_cache = KVCache::new_with_kind(layout, storage_kind)?;
+        let kv_cache = KVCache::new_with_kind_and_encoding(layout, storage_kind, engine_cfg.kv_encoding)?;
 
         Ok(Self {
             model_path: model_path.to_path_buf(),
@@ -548,6 +550,26 @@ fn apply_gemma3_stability_candidate_filter(
     if cand.len() > 1 {
         // Markdown-heavy loops seen on-device: '#', ' #', and code-fence token.
         cand.retain(|(id, _)| !matches!(*id, 236865 | 997 | 2717));
+    }
+    if cand.len() > 1 {
+        // Star-heavy loops seen on-device: '*', ' *', and bold marker patterns.
+        cand.retain(|(id, _)| !matches!(*id, 236829 | 808 | 13513));
+    }
+    if cand.len() > 1 {
+        // Horizontal-rule / separator loops seen on-device: '-', '--', '---', '----', '&#'.
+        cand.retain(|(id, _)| !matches!(*id, 236772 | 726 | 7243 | 1040 | 21841));
+    }
+    if cand.len() > 1 {
+        // Additional low-information loop tokens observed on-device.
+        cand.retain(|(id, _)| !matches!(*id, 4368 | 1340 | 236775 | 236913 | 3056));
+    }
+    if cand.len() > 1 {
+        // Zero-width / invisible Unicode loop tokens observed on-device.
+        cand.retain(|(id, _)| !matches!(*id, 237141 | 237218 | 237243));
+    }
+    if cand.len() > 1 {
+        // Another recurrent low-information loop token observed on-device ("Model").
+        cand.retain(|(id, _)| *id != 4968);
     }
 
     // If we're already in a newline/markdown loop, steer away from pure formatting tokens.

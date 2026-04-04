@@ -54,7 +54,7 @@ graph LR
     Q3[Q3] --> G1
     
     G0 --> KV0[KV Head 0]
-    G1 --> KV Head 1[KV Head 1]
+    G1 --> KV1[KV Head 1]
 
     style KV0 fill:#f9f,stroke:#333
 ```

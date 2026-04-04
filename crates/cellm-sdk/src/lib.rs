@@ -545,6 +545,10 @@ fn apply_gemma3_stability_candidate_filter(
     if cand.len() > 1 {
         cand.retain(|(id, _)| *id != 1018);
     }
+    if cand.len() > 1 {
+        // Markdown-heavy loops seen on-device: '#', ' #', and code-fence token.
+        cand.retain(|(id, _)| !matches!(*id, 236865 | 997 | 2717));
+    }
 
     // If we're already in a newline/markdown loop, steer away from pure formatting tokens.
     if looks_like_format_loop(recent) && cand.len() > 1 {

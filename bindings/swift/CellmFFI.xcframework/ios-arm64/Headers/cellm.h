@@ -116,6 +116,7 @@ cellm_session_t cellm_session_create(cellm_engine_t engine);
 int32_t cellm_session_cancel(cellm_engine_t engine, cellm_session_t session);
 int32_t cellm_session_suspend(cellm_engine_t engine, cellm_session_t session);
 int32_t cellm_session_resume(cellm_engine_t engine, cellm_session_t session);
+int32_t cellm_session_reset(cellm_engine_t engine, cellm_session_t session);
 
 // Thermal level for scheduler behavior:
 // 0=Nominal, 1=Elevated, 2=Critical, 3=Emergency
@@ -128,6 +129,16 @@ int32_t cellm_submit_tokens(
     const uint32_t* tokens,
     size_t token_count,
     uint32_t* out_next_token
+);
+
+// Like `cellm_submit_tokens`, but returns whether prefill cache was reused.
+int32_t cellm_submit_tokens_cached(
+    cellm_engine_t engine,
+    cellm_session_t session,
+    const uint32_t* tokens,
+    size_t token_count,
+    uint32_t* out_next_token,
+    uint32_t* out_cache_hit // 0=no, 1=yes
 );
 
 // One decode step for the next scheduled session.

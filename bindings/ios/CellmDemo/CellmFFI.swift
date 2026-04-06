@@ -207,13 +207,15 @@ final class CellmEngine {
         let tStart = Date()
         try setThermalLevel(thermalLevel)
         var next: UInt32 = 0
+        var cacheHit: UInt32 = 0
         let rc = promptTokens.withUnsafeBufferPointer { buf in
-            cellm_submit_tokens(handle, session, buf.baseAddress, buf.count, &next)
+            cellm_submit_tokens_cached(handle, session, buf.baseAddress, buf.count, &next, &cacheHit)
         }
         if rc != 0 { throw CellmError.message(CellmFFI.lastError()) }
         let tAfterPrefill = Date()
+        lastDebugTrace.append("prefill_cache_hit=\(cacheHit == 1 ? "yes" : "no")")
         lastDebugTrace.append("prefill next_token=\(next) prefill_ms=\(String(format: "%.1f", tAfterPrefill.timeIntervalSince(tStart) * 1000.0))")
-        Self.debugLog("prefill done next_token=\(next) prefill_ms=\(String(format: "%.1f", tAfterPrefill.timeIntervalSince(tStart) * 1000.0))")
+        Self.debugLog("prefill done cache_hit=\(cacheHit == 1 ? "yes" : "no") next_token=\(next) prefill_ms=\(String(format: "%.1f", tAfterPrefill.timeIntervalSince(tStart) * 1000.0))")
 
         if exerciseSuspendResume {
             try suspendSession()
@@ -221,22 +223,33 @@ final class CellmEngine {
         }
 
         var out = ""
-        // Stream in chunks to reduce per-token UI/bridge overhead on mobile.
-        let streamChunkTokenCount = 4
+        // Stream with low-latency cadence so output feels continuous while
+        // still avoiding per-token UI churn.
+        let streamMaxFlushInterval: TimeInterval = 0.06
+        let streamMaxBufferedChars = 32
         var pendingStreamChunk = ""
-        var pendingStreamPieces = 0
-        let flushPendingChunk: () -> Void = {
-            guard pendingStreamPieces > 0, !pendingStreamChunk.isEmpty else { return }
+        var lastStreamFlushAt = Date()
+        let shouldForceFlush: (String) -> Bool = { piece in
+            if piece.contains("\n") { return true }
+            if piece.contains(".") || piece.contains("!") || piece.contains("?") { return true }
+            if piece.hasSuffix(":") || piece.hasSuffix(";") { return true }
+            return false
+        }
+        let flushPendingChunk: (Bool) -> Void = { force in
+            guard !pendingStreamChunk.isEmpty else { return }
+            let now = Date()
+            let dueByTime = now.timeIntervalSince(lastStreamFlushAt) >= streamMaxFlushInterval
+            let dueBySize = pendingStreamChunk.count >= streamMaxBufferedChars
+            if !force && !dueByTime && !dueBySize {
+                return
+            }
             onToken?(pendingStreamChunk)
             pendingStreamChunk = ""
-            pendingStreamPieces = 0
+            lastStreamFlushAt = now
         }
         let pushStreamPiece: (String) -> Void = { piece in
             pendingStreamChunk += piece
-            pendingStreamPieces += 1
-            if pendingStreamPieces >= streamChunkTokenCount || piece.contains("\n") {
-                flushPendingChunk()
-            }
+            flushPendingChunk(shouldForceFlush(piece))
         }
         let firstPiece = try tokenizer.decodeOne(next)
         var stopReason = "max_tokens"
@@ -298,7 +311,7 @@ final class CellmEngine {
                 let s = String(chosen)
                 if out != s {
                     out = s
-                    flushPendingChunk()
+                    flushPendingChunk(true)
                     onToken?(s)
                 }
                 stopReason = (upper == target)
@@ -346,13 +359,13 @@ final class CellmEngine {
                 let s = String(fallback)
                 if out != s {
                     out = s
-                    flushPendingChunk()
+                    flushPendingChunk(true)
                     onToken?(s)
                 }
                 stopReason = "uppercase_constraint_fallback_prompt_target"
             }
         }
-        flushPendingChunk()
+        flushPendingChunk(true)
         lastGenerationStats = LlmGenerationStats(
             promptTokenCount: promptTokens.count,
             generatedTokenCount: generated,
@@ -410,11 +423,8 @@ final class CellmEngine {
     }
 
     func resetSession() throws {
-        let cancelRc = cellm_session_cancel(handle, session)
-        if cancelRc != 0 { throw CellmError.message(CellmFFI.lastError()) }
-        let sid = cellm_session_create(handle)
-        guard sid != 0 else { throw CellmError.message(CellmFFI.lastError()) }
-        session = sid
+        let rc = cellm_session_reset(handle, session)
+        if rc != 0 { throw CellmError.message(CellmFFI.lastError()) }
     }
 
     private static func wrapPrompt(_ prompt: String, style: PromptStyle) -> String {

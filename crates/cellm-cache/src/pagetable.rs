@@ -93,6 +93,31 @@ impl PageTable {
         self.token_count = 0;
         Ok(())
     }
+
+    /// Truncate to `new_token_count`, freeing suffix blocks as needed.
+    pub fn truncate_tokens(
+        &mut self,
+        alloc: &mut BlockAllocator,
+        new_token_count: usize,
+    ) -> Result<(), CacheError> {
+        if new_token_count >= self.token_count {
+            return Ok(());
+        }
+        let keep_blocks = if new_token_count == 0 {
+            0
+        } else {
+            (new_token_count - 1) / self.tokens_per_block + 1
+        };
+        while self.blocks.len() > keep_blocks {
+            let id = self
+                .blocks
+                .pop()
+                .ok_or(CacheError::InvalidConfig("truncate_tokens internal underflow"))?;
+            alloc.free(id)?;
+        }
+        self.token_count = new_token_count;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

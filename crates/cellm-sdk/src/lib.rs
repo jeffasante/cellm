@@ -60,6 +60,10 @@ struct EngineSession {
     recent: Vec<u32>,
     pending_out: VecDeque<u32>,
     rng: XorShift64,
+    cached_prompt: Vec<u32>,
+    cached_next_pos: usize,
+    cached_last_token: Option<u32>,
+    cached_recent: Vec<u32>,
 }
 
 enum Runner {
@@ -198,6 +202,10 @@ impl Engine {
                 recent: Vec::new(),
                 pending_out: VecDeque::new(),
                 rng: XorShift64::seeded(self.seed_for_session(id)),
+                cached_prompt: Vec::new(),
+                cached_next_pos: 0,
+                cached_last_token: None,
+                cached_recent: Vec::new(),
             },
         );
         self.session_meta.insert(id, SchedSession::new(id));
@@ -206,10 +214,20 @@ impl Engine {
 
     /// Submit token ids (already-tokenized) and return the next token id (greedy).
     pub fn submit_tokens(&mut self, id: SessionId, tokens: &[u32]) -> Result<u32> {
+        let (next, _cache_hit) = self.submit_tokens_cached(id, tokens)?;
+        Ok(next)
+    }
+
+    /// Submit token ids and optionally reuse cached prefill state for identical prompts.
+    /// Returns `(next_token, cache_hit)`.
+    pub fn submit_tokens_cached(&mut self, id: SessionId, tokens: &[u32]) -> Result<(u32, bool)> {
         let temperature = self.temperature;
         let repeat_penalty = self.repeat_penalty;
         let repeat_window = self.repeat_window;
 
+        let cache_trace = std::env::var("CELLM_DEBUG_PREFILL_CACHE")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
         let s = self
             .sessions
             .get_mut(&id)
@@ -220,6 +238,43 @@ impl Engine {
             .ok_or_else(|| anyhow::anyhow!("missing session metadata for session id: {id}"))?;
         meta.transition(SessionState::Prefill)
             .map_err(|e| anyhow::anyhow!("session transition failed: {e:?}"))?;
+
+        if !s.cached_prompt.is_empty()
+            && s.cached_prompt == tokens
+            && s.cached_last_token.is_some()
+            && s.page_table.token_count() >= s.cached_next_pos
+        {
+            if cache_trace {
+                eprintln!(
+                    "[cellm-sdk] prefill cache HIT sid={} prompt_tokens={} next_pos={}",
+                    id,
+                    tokens.len(),
+                    s.cached_next_pos
+                );
+            }
+            s.page_table
+                .truncate_tokens(self.kv_cache.allocator_mut(), s.cached_next_pos)
+                .map_err(|e| anyhow::anyhow!("truncate_tokens failed: {e}"))?;
+            s.next_pos = s.cached_next_pos;
+            s.last_token = s.cached_last_token;
+            s.recent = s.cached_recent.clone();
+            s.pending_out.clear();
+            meta.transition(SessionState::Decoding)
+                .map_err(|e| anyhow::anyhow!("session transition failed: {e:?}"))?;
+            self.rr.add(id);
+            return Ok((s.cached_last_token.unwrap_or(0), true));
+        }
+        if cache_trace {
+            eprintln!(
+                "[cellm-sdk] prefill cache MISS sid={} incoming={} cached={} cached_last_token={} token_count={} cached_next_pos={}",
+                id,
+                tokens.len(),
+                s.cached_prompt.len(),
+                s.cached_last_token.is_some(),
+                s.page_table.token_count(),
+                s.cached_next_pos
+            );
+        }
 
         let mut next = 0u32;
         s.pending_out.clear();
@@ -255,11 +310,15 @@ impl Engine {
 
         s.next_pos += tokens.len();
         s.last_token = Some(next);
+        s.cached_prompt = tokens.to_vec();
+        s.cached_next_pos = s.next_pos;
+        s.cached_last_token = s.last_token;
+        s.cached_recent = s.recent.clone();
         meta.add_prompt_tokens(tokens.len());
         meta.transition(SessionState::Decoding)
             .map_err(|e| anyhow::anyhow!("session transition failed: {e:?}"))?;
         self.rr.add(id);
-        Ok(next)
+        Ok((next, false))
     }
 
     /// Run a single decode step for the next scheduled session (greedy).
@@ -300,6 +359,45 @@ impl Engine {
             let _ = meta.transition(SessionState::Terminal);
         }
         self.session_meta.remove(&id);
+        Ok(())
+    }
+
+    /// Reset session decode state while preserving any cached prefill snapshot.
+    pub fn reset_session(&mut self, id: SessionId) -> Result<()> {
+        self.rr.remove(id);
+        let s = self
+            .sessions
+            .get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("unknown session id: {id}"))?;
+        let keep_tokens = if s.cached_last_token.is_some() && !s.cached_prompt.is_empty() {
+            s.cached_next_pos
+        } else {
+            0
+        };
+        s.page_table
+            .truncate_tokens(self.kv_cache.allocator_mut(), keep_tokens)
+            .map_err(|e| anyhow::anyhow!("truncate_tokens failed: {e}"))?;
+        if keep_tokens > 0 {
+            s.next_pos = s.cached_next_pos;
+            s.last_token = s.cached_last_token;
+            s.recent = s.cached_recent.clone();
+        } else {
+            s.next_pos = 0;
+            s.last_token = None;
+            s.recent.clear();
+        }
+        s.pending_out.clear();
+
+        let meta = self
+            .session_meta
+            .get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("missing session metadata for session id: {id}"))?;
+        if meta.state() == SessionState::Decoding {
+            meta.transition(SessionState::Suspended)
+                .map_err(|e| anyhow::anyhow!("session transition failed: {e:?}"))?;
+        }
+        meta.transition(SessionState::Queued)
+            .map_err(|e| anyhow::anyhow!("session transition failed: {e:?}"))?;
         Ok(())
     }
 

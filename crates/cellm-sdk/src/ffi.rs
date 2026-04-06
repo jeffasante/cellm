@@ -692,6 +692,22 @@ pub extern "C" fn cellm_session_resume(engine: cellm_engine_t, session: SessionI
 }
 
 #[no_mangle]
+pub extern "C" fn cellm_session_reset(engine: cellm_engine_t, session: SessionId) -> i32 {
+    if engine == 0 {
+        set_last_error("session_reset: null engine".to_string());
+        return -1;
+    }
+    let e = unsafe { &mut *(engine as *mut Engine) };
+    match e.reset_session(session) {
+        Ok(_) => 0,
+        Err(err) => {
+            set_last_error(format!("session_reset failed: {err}"));
+            -1
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn cellm_engine_set_thermal_level(engine: cellm_engine_t, level: u32) -> i32 {
     if engine == 0 {
         set_last_error("set_thermal_level: null engine".to_string());
@@ -753,6 +769,55 @@ pub extern "C" fn cellm_submit_tokens(
         Err(panic_payload) => {
             set_last_error(format!(
                 "submit_tokens panicked: {}",
+                panic_payload_to_string(panic_payload)
+            ));
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cellm_submit_tokens_cached(
+    engine: cellm_engine_t,
+    session: SessionId,
+    tokens: *const u32,
+    token_count: usize,
+    out_next_token: *mut u32,
+    out_cache_hit: *mut u32,
+) -> i32 {
+    if engine == 0 {
+        set_last_error("submit_tokens_cached: null engine".to_string());
+        return -1;
+    }
+    if tokens.is_null() || token_count == 0 {
+        set_last_error("submit_tokens_cached: null/empty tokens".to_string());
+        return -1;
+    }
+    if out_next_token.is_null() || out_cache_hit.is_null() {
+        set_last_error("submit_tokens_cached: null outputs".to_string());
+        return -1;
+    }
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let e = unsafe { &mut *(engine as *mut Engine) };
+        let slice = unsafe { std::slice::from_raw_parts(tokens, token_count) };
+        e.submit_tokens_cached(session, slice)
+    }));
+    match result {
+        Ok(Ok((next, cache_hit))) => {
+            unsafe {
+                *out_next_token = next;
+                *out_cache_hit = if cache_hit { 1 } else { 0 };
+            }
+            0
+        }
+        Ok(Err(err)) => {
+            set_last_error(format!("submit_tokens_cached failed: {err}"));
+            -1
+        }
+        Err(panic_payload) => {
+            set_last_error(format!(
+                "submit_tokens_cached panicked: {}",
                 panic_payload_to_string(panic_payload)
             ));
             -1

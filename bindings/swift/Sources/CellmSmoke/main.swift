@@ -80,6 +80,7 @@ Usage:
 
 let backend = parseFlag("--backend", in: args, default: "cpu") ?? "cpu"
 let gen = Int(parseFlag("--gen", in: args, default: "32") ?? "32") ?? 32
+let runs = Int(parseFlag("--runs", in: args, default: "1") ?? "1") ?? 1
 
 if backend.lowercased() == "metal" {
     let smoke = cellm_metal_smoke_test()
@@ -131,32 +132,42 @@ let wrapped = wrapGemmaPrompt(prompt)
 let promptTokens = try encode(tok: tok, text: wrapped)
 print("prompt_tokens=\(promptTokens.count)")
 
-var next: UInt32 = 0
-let submitRc = promptTokens.withUnsafeBufferPointer { bp in
-    cellm_submit_tokens(engine, session, bp.baseAddress, bp.count, &next)
-}
-if submitRc != 0 {
-    throw SmokeError.message("submit_tokens failed: \(ffiLastError())")
-}
-
-var textOut = ""
-for i in 0..<gen {
-    let piece = decodeOne(tok: tok, token: next)
-    let sanitized = piece.replacingOccurrences(of: "\n", with: "\\n")
-    print("gen[\(i)] token=\(next) piece=\"\(sanitized)\"")
-    textOut += piece
-
-    var sid: cellm_session_t = 0
-    var tokNext: UInt32 = 0
-    let rc = cellm_step_decode(engine, &sid, &tokNext)
-    if rc < 0 {
-        throw SmokeError.message("step_decode failed: \(ffiLastError())")
+for run in 0..<max(1, runs) {
+    if run > 0 {
+        let rr = cellm_session_reset(engine, session)
+        if rr != 0 {
+            throw SmokeError.message("session_reset failed: \(ffiLastError())")
+        }
     }
-    if rc == 0 {
-        break
-    }
-    next = tokNext
-}
 
-print("----")
-print(textOut.isEmpty ? "<empty>" : textOut)
+    var next: UInt32 = 0
+    var cacheHit: UInt32 = 0
+    let submitRc = promptTokens.withUnsafeBufferPointer { bp in
+        cellm_submit_tokens_cached(engine, session, bp.baseAddress, bp.count, &next, &cacheHit)
+    }
+    if submitRc != 0 {
+        throw SmokeError.message("submit_tokens_cached failed: \(ffiLastError())")
+    }
+    print("run=\(run + 1) prefill_cache_hit=\(cacheHit == 1 ? "yes" : "no")")
+
+    var textOut = ""
+    for i in 0..<gen {
+        let piece = decodeOne(tok: tok, token: next)
+        let sanitized = piece.replacingOccurrences(of: "\n", with: "\\n")
+        print("gen[\(i)] token=\(next) piece=\"\(sanitized)\"")
+        textOut += piece
+
+        var sid: cellm_session_t = 0
+        var tokNext: UInt32 = 0
+        let rc = cellm_step_decode(engine, &sid, &tokNext)
+        if rc < 0 {
+            throw SmokeError.message("step_decode failed: \(ffiLastError())")
+        }
+        if rc == 0 {
+            break
+        }
+        next = tokNext
+    }
+    print("----")
+    print(textOut.isEmpty ? "<empty>" : textOut)
+}

@@ -6,7 +6,8 @@ This folder contains SwiftUI source files for a small iOS app that can load a `.
 
 - LLM text generation (tokenize prompt → prefill → decode tokens)
 - VLM image description through native `.cellm` path in `cellm-sdk` (vision encoder + multimodal prompt packing + text decode)
-- Backend request from iOS UI (`CPU` / `Metal`) through FFI (`cellm_engine_create_v3`)
+- Backend request from iOS UI (`CPU` / `Metal`) through FFI (`cellm_engine_create_v4`)
+- KV encoding + TurboQuant runtime knobs are also passed through `cellm_engine_create_v4`
 - Active backend reporting (`cellm_engine_backend_name`) so app confirms what was selected
 - One-tap sample asset download in-app (GitHub-hosted `.cellm` + sample image + tokenizer)
 

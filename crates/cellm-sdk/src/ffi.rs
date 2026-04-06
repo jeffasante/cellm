@@ -98,6 +98,16 @@ fn backend_from_ffi(kind: u32) -> Result<BackendKind, String> {
     }
 }
 
+fn kv_encoding_from_ffi(kind: u32) -> Result<KvEncodingKind, String> {
+    match kind {
+        0 => Ok(KvEncodingKind::F16),
+        1 => Ok(KvEncodingKind::TurboQuant),
+        other => Err(format!(
+            "invalid kv encoding kind: {other} (expected 0=f16, 1=turboquant)"
+        )),
+    }
+}
+
 /// Opaque engine handle for C/Swift/Kotlin.
 #[allow(non_camel_case_types)]
 pub type cellm_engine_t = u64;
@@ -287,6 +297,8 @@ pub extern "C" fn cellm_engine_create(
             seed: 0,
             backend: BackendKind::Cpu,
             kv_encoding: KvEncodingKind::F16,
+            turboq_int8_dot: true,
+            turboq_qjl_corr: true,
         };
         let engine = Engine::new(Path::new(model_path), cfg)
             .map_err(|e| format!("engine_create failed: {e}"))?;
@@ -335,6 +347,8 @@ pub extern "C" fn cellm_engine_create_v2(
             seed,
             backend: BackendKind::Cpu,
             kv_encoding: KvEncodingKind::F16,
+            turboq_int8_dot: true,
+            turboq_qjl_corr: true,
         };
         let engine = Engine::new(Path::new(model_path), cfg)
             .map_err(|e| format!("engine_create_v2 failed: {e}"))?;
@@ -377,6 +391,8 @@ pub extern "C" fn cellm_engine_create_v3(
                 seed,
                 backend,
                 kv_encoding: KvEncodingKind::F16,
+                turboq_int8_dot: true,
+                turboq_qjl_corr: true,
             };
             let engine = Engine::new(Path::new(model_path), cfg)
                 .map_err(|e| format!("engine_create_v3 failed: {e}"))?;
@@ -397,6 +413,64 @@ pub extern "C" fn cellm_engine_create_v3(
                 panic_payload_to_string(panic_payload)
             ));
             ensure_last_error("engine_create_v3 panicked without payload detail");
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cellm_engine_create_v4(
+    model_path: *const c_char,
+    tokens_per_block: u32,
+    total_blocks: u32,
+    top_k: u32,
+    temperature: f32,
+    repeat_penalty: f32,
+    repeat_window: u32,
+    seed: u64,
+    backend: u32,     // 0=cpu, 1=metal
+    kv_encoding: u32, // 0=f16, 1=turboquant
+    turboq_int8_dot: u32,
+    turboq_qjl_corr: u32,
+) -> cellm_engine_t {
+    ensure_last_error("engine_create_v4 failed: no detail");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (|| {
+            let model_path = cstr_to_str(model_path)?;
+            let backend = backend_from_ffi(backend)?;
+            let kv_encoding = kv_encoding_from_ffi(kv_encoding)?;
+            let cfg = EngineConfig {
+                tokens_per_block: tokens_per_block as usize,
+                total_blocks: total_blocks as usize,
+                top_k: top_k as usize,
+                temperature: temperature as f64,
+                repeat_penalty: repeat_penalty as f64,
+                repeat_window: repeat_window as usize,
+                seed,
+                backend,
+                kv_encoding,
+                turboq_int8_dot: turboq_int8_dot != 0,
+                turboq_qjl_corr: turboq_qjl_corr != 0,
+            };
+            let engine = Engine::new(Path::new(model_path), cfg)
+                .map_err(|e| format!("engine_create_v4 failed: {e}"))?;
+            Ok::<cellm_engine_t, String>(Box::into_raw(Box::new(engine)) as u64)
+        })()
+    }));
+
+    match result {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => {
+            set_last_error(e);
+            ensure_last_error("engine_create_v4 failed: empty error");
+            0
+        }
+        Err(panic_payload) => {
+            set_last_error(format!(
+                "engine_create_v4 panicked: {}",
+                panic_payload_to_string(panic_payload)
+            ));
+            ensure_last_error("engine_create_v4 panicked without payload detail");
             0
         }
     }

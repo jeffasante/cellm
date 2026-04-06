@@ -14,6 +14,19 @@ enum CellmBackend: UInt32, CaseIterable, Identifiable {
     }
 }
 
+enum CellmKvEncoding: UInt32, CaseIterable, Identifiable {
+    case f16 = 0
+    case turboquant = 1
+
+    var id: UInt32 { rawValue }
+    var label: String {
+        switch self {
+        case .f16: return "F16"
+        case .turboquant: return "TurboQuant"
+        }
+    }
+}
+
 enum CellmThermalLevel: UInt32, CaseIterable, Identifiable {
     case nominal = 0
     case elevated = 1
@@ -121,7 +134,7 @@ final class CellmTokenizer {
 final class CellmEngine {
     private var handle: cellm_engine_t = 0
     private let tokenizer: CellmTokenizer
-    private let session: cellm_session_t
+    private var session: cellm_session_t
     private let modelURL: URL
 
     let activeBackend: String
@@ -131,19 +144,32 @@ final class CellmEngine {
 
     private static let debugLogsEnabled = true
 
-    init(modelURL: URL, tokenizer: CellmTokenizer, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 256, topK: UInt32 = 40, temperature: Float = 0.2, repeatPenalty: Float = 1.08, repeatWindow: UInt32 = 96, seed: UInt64 = 1, backend: CellmBackend = .metal) throws {
+    init(modelURL: URL, tokenizer: CellmTokenizer, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 256, topK: UInt32 = 40, temperature: Float = 0.2, repeatPenalty: Float = 1.08, repeatWindow: UInt32 = 96, seed: UInt64 = 1, backend: CellmBackend = .metal, kvEncoding: CellmKvEncoding = .f16, turboqInt8Dot: Bool = true, turboqQjlCorr: Bool = true) throws {
         self.modelURL = modelURL
         self.tokenizer = tokenizer
         let path = modelURL.path
         let requestedBackend: CellmBackend = backend
         let h = path.withCString { cstr in
-            cellm_engine_create_v3(cstr, tokensPerBlock, totalBlocks, topK, temperature, repeatPenalty, repeatWindow, seed, requestedBackend.rawValue)
+            cellm_engine_create_v4(
+                cstr,
+                tokensPerBlock,
+                totalBlocks,
+                topK,
+                temperature,
+                repeatPenalty,
+                repeatWindow,
+                seed,
+                requestedBackend.rawValue,
+                kvEncoding.rawValue,
+                turboqInt8Dot ? 1 : 0,
+                turboqQjlCorr ? 1 : 0
+            )
         }
         let firstError = CellmFFI.lastError()
 
         guard h != 0 else {
             let detail = firstError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "unknown error (ffi returned empty last_error)" : firstError
-            throw CellmError.message("engine_create_v3 failed: \(detail) model=\(modelURL.lastPathComponent) backend=\(requestedBackend.label.lowercased())")
+            throw CellmError.message("engine_create_v4 failed: \(detail) model=\(modelURL.lastPathComponent) backend=\(requestedBackend.label.lowercased()) kv=\(kvEncoding.label.lowercased())")
         }
         self.handle = h
 
@@ -195,6 +221,23 @@ final class CellmEngine {
         }
 
         var out = ""
+        // Stream in chunks to reduce per-token UI/bridge overhead on mobile.
+        let streamChunkTokenCount = 4
+        var pendingStreamChunk = ""
+        var pendingStreamPieces = 0
+        let flushPendingChunk: () -> Void = {
+            guard pendingStreamPieces > 0, !pendingStreamChunk.isEmpty else { return }
+            onToken?(pendingStreamChunk)
+            pendingStreamChunk = ""
+            pendingStreamPieces = 0
+        }
+        let pushStreamPiece: (String) -> Void = { piece in
+            pendingStreamChunk += piece
+            pendingStreamPieces += 1
+            if pendingStreamPieces >= streamChunkTokenCount || piece.contains("\n") {
+                flushPendingChunk()
+            }
+        }
         let firstPiece = try tokenizer.decodeOne(next)
         var stopReason = "max_tokens"
         if let upper = Self.firstUppercaseASCII(in: firstPiece), let target = uppercaseConstraintTarget {
@@ -207,7 +250,7 @@ final class CellmEngine {
                 : "uppercase_constraint_target_enforced"
         } else if !Self.isStopPiece(firstPiece) {
             out += firstPiece
-            onToken?(firstPiece)
+            pushStreamPiece(firstPiece)
         }
         var lastPiece = firstPiece
         var samePieceRun = firstPiece.isEmpty ? 0 : 1
@@ -255,6 +298,7 @@ final class CellmEngine {
                 let s = String(chosen)
                 if out != s {
                     out = s
+                    flushPendingChunk()
                     onToken?(s)
                 }
                 stopReason = (upper == target)
@@ -291,7 +335,7 @@ final class CellmEngine {
                 break
             }
             out += piece
-            onToken?(piece)
+            pushStreamPiece(piece)
             generated += 1
         }
         let totalMs = Date().timeIntervalSince(tStart) * 1000.0
@@ -302,11 +346,13 @@ final class CellmEngine {
                 let s = String(fallback)
                 if out != s {
                     out = s
+                    flushPendingChunk()
                     onToken?(s)
                 }
                 stopReason = "uppercase_constraint_fallback_prompt_target"
             }
         }
+        flushPendingChunk()
         lastGenerationStats = LlmGenerationStats(
             promptTokenCount: promptTokens.count,
             generatedTokenCount: generated,
@@ -363,6 +409,14 @@ final class CellmEngine {
         if rc != 0 { throw CellmError.message(CellmFFI.lastError()) }
     }
 
+    func resetSession() throws {
+        let cancelRc = cellm_session_cancel(handle, session)
+        if cancelRc != 0 { throw CellmError.message(CellmFFI.lastError()) }
+        let sid = cellm_session_create(handle)
+        guard sid != 0 else { throw CellmError.message(CellmFFI.lastError()) }
+        session = sid
+    }
+
     private static func wrapPrompt(_ prompt: String, style: PromptStyle) -> String {
         let cleanPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         switch style {
@@ -378,6 +432,8 @@ final class CellmEngine {
             // Do not prepend BOS as raw text (e.g. "<bos>"): if BOS is needed it should be
             // injected as an id-level special token, not literal bytes in the prompt.
             return "<start_of_turn>user\n\(cleanPrompt)<end_of_turn>\n<start_of_turn>model\n"
+        case .gemma4:
+            return "<|turn>user\n\(cleanPrompt)<turn|>\n<|turn>model\n"
         case .plain:
             return "User: \(cleanPrompt)\nAssistant:"
         }
@@ -387,6 +443,7 @@ final class CellmEngine {
         case smolChat
         case chatML(includeThinkPrefill: Bool)
         case gemma(bosToken: String?)
+        case gemma4
         case plain
 
         var label: String {
@@ -394,6 +451,7 @@ final class CellmEngine {
             case .smolChat: return "smol_chat"
             case .chatML: return "chatml"
             case .gemma: return "gemma_turn"
+            case .gemma4: return "gemma4_turn"
             case .plain: return "plain"
             }
         }
@@ -408,6 +466,9 @@ final class CellmEngine {
             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let tpl = obj["chat_template"] as? String
         else {
+            if tokenizerName.contains("gemma-4") || modelName.contains("gemma-4") {
+                return .gemma4
+            }
             if tokenizerName.contains("gemma") || modelName.contains("gemma") {
                 return .gemma(bosToken: nil)
             }
@@ -427,6 +488,9 @@ final class CellmEngine {
             // forcing that path in our mobile runner currently increases degenerate output.
             return .chatML(includeThinkPrefill: false)
         }
+        if tpl.contains("<|turn>") && tpl.contains("<turn|>") {
+            return .gemma4
+        }
         if tpl.contains("<start_of_turn>") && tpl.contains("<end_of_turn>") {
             let addBos = (obj["add_bos_token"] as? Bool) ?? false
             let bosToken = addBos ? (obj["bos_token"] as? String) : nil
@@ -437,7 +501,7 @@ final class CellmEngine {
 
     private static func isStopPiece(_ piece: String) -> Bool {
         let p = piece.trimmingCharacters(in: .whitespacesAndNewlines)
-        return p == "<|im_end|>" || p == "<end_of_utterance>" || p == "<|endoftext|>" || p == "<end_of_turn>"
+        return p == "<|im_end|>" || p == "<end_of_utterance>" || p == "<|endoftext|>" || p == "<end_of_turn>" || p == "<turn|>"
     }
 
     private static func hasLongDigitRun(_ piece: String, threshold: Int) -> Bool {
@@ -489,10 +553,23 @@ final class CellmVLMEngine {
     let activeBackend: String
     private(set) var lastTimings: VlmTimings?
 
-    init(modelURL: URL, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 512, topK: UInt32 = 40, temperature: Float = 0.7, repeatPenalty: Float = 1.15, repeatWindow: UInt32 = 128, seed: UInt64 = 1, backend: CellmBackend = .metal) throws {
+    init(modelURL: URL, tokensPerBlock: UInt32 = 16, totalBlocks: UInt32 = 512, topK: UInt32 = 40, temperature: Float = 0.7, repeatPenalty: Float = 1.15, repeatWindow: UInt32 = 128, seed: UInt64 = 1, backend: CellmBackend = .metal, kvEncoding: CellmKvEncoding = .f16, turboqInt8Dot: Bool = true, turboqQjlCorr: Bool = true) throws {
         let path = modelURL.path
         let h = path.withCString { cstr in
-            cellm_engine_create_v3(cstr, tokensPerBlock, totalBlocks, topK, temperature, repeatPenalty, repeatWindow, seed, backend.rawValue)
+            cellm_engine_create_v4(
+                cstr,
+                tokensPerBlock,
+                totalBlocks,
+                topK,
+                temperature,
+                repeatPenalty,
+                repeatWindow,
+                seed,
+                backend.rawValue,
+                kvEncoding.rawValue,
+                turboqInt8Dot ? 1 : 0,
+                turboqQjlCorr ? 1 : 0
+            )
         }
         guard h != 0 else { throw CellmError.message(CellmFFI.lastError()) }
         self.handle = h

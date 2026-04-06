@@ -97,10 +97,23 @@ if tok == 0 {
 defer { cellm_tokenizer_destroy(tok) }
 
 let engine = model.withCString { cstr in
-    cellm_engine_create_v3(cstr, 8, 48, 40, 0.0, 1.08, 96, 1, backendRaw(backend))
+    cellm_engine_create_v4(
+        cstr,
+        8,
+        48,
+        40,
+        0.0,
+        1.08,
+        96,
+        1,
+        backendRaw(backend),
+        UInt32(CELLM_KV_ENCODING_F16.rawValue),
+        1,
+        1
+    )
 }
 if engine == 0 {
-    throw SmokeError.message("engine_create_v3 failed: \(ffiLastError())")
+    throw SmokeError.message("engine_create_v4 failed: \(ffiLastError())")
 }
 defer { cellm_engine_destroy(engine) }
 

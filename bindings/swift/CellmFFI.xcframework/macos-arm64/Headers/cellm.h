@@ -16,6 +16,11 @@ typedef enum cellm_backend_kind_t {
     CELLM_BACKEND_METAL = 1,
 } cellm_backend_kind_t;
 
+typedef enum cellm_kv_encoding_kind_t {
+    CELLM_KV_ENCODING_F16 = 0,
+    CELLM_KV_ENCODING_TURBOQUANT = 1,
+} cellm_kv_encoding_kind_t;
+
 // Error handling (thread-local).
 // Returns number of bytes written (excluding null terminator).
 size_t cellm_last_error_message(char* out_buf, size_t buf_len);
@@ -58,6 +63,22 @@ cellm_engine_t cellm_engine_create_v3(
     uint32_t repeat_window,
     uint64_t seed,
     uint32_t backend // cellm_backend_kind_t
+);
+
+// Engine lifecycle (v4) with backend + KV encoding + TurboQuant controls.
+cellm_engine_t cellm_engine_create_v4(
+    const char* model_path,
+    uint32_t tokens_per_block,
+    uint32_t total_blocks,
+    uint32_t top_k,
+    float temperature,
+    float repeat_penalty,
+    uint32_t repeat_window,
+    uint64_t seed,
+    uint32_t backend,       // cellm_backend_kind_t
+    uint32_t kv_encoding,   // cellm_kv_encoding_kind_t
+    uint32_t turboq_int8_dot, // 0=off, nonzero=on
+    uint32_t turboq_qjl_corr  // 0=off, nonzero=on
 );
 
 void cellm_engine_destroy(cellm_engine_t engine);

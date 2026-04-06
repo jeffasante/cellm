@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -24,6 +24,8 @@ pub struct EngineConfig {
     pub seed: u64,
     pub backend: BackendKind,
     pub kv_encoding: KvEncodingKind,
+    pub turboq_int8_dot: bool,
+    pub turboq_qjl_corr: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +46,8 @@ impl Default for EngineConfig {
             seed: 1,
             backend: BackendKind::Cpu,
             kv_encoding: KvEncodingKind::F16,
+            turboq_int8_dot: true,
+            turboq_qjl_corr: true,
         }
     }
 }
@@ -54,6 +58,7 @@ struct EngineSession {
     next_pos: usize,
     last_token: Option<u32>,
     recent: Vec<u32>,
+    pending_out: VecDeque<u32>,
     rng: XorShift64,
 }
 
@@ -87,6 +92,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(model_path: &Path, engine_cfg: EngineConfig) -> Result<Self> {
+        apply_turboquant_runtime_config(&engine_cfg);
         let selected_backend = resolve_backend(engine_cfg.backend);
         let file = CellmFile::load(model_path)?;
         let header = file.header.clone();
@@ -190,6 +196,7 @@ impl Engine {
                 next_pos: 0,
                 last_token: None,
                 recent: Vec::new(),
+                pending_out: VecDeque::new(),
                 rng: XorShift64::seeded(self.seed_for_session(id)),
             },
         );
@@ -215,6 +222,7 @@ impl Engine {
             .map_err(|e| anyhow::anyhow!("session transition failed: {e:?}"))?;
 
         let mut next = 0u32;
+        s.pending_out.clear();
         for (i, &tok) in tokens.iter().enumerate() {
             let pos = s.next_pos + i;
             let mut cand = match &mut self.runner {
@@ -256,70 +264,23 @@ impl Engine {
 
     /// Run a single decode step for the next scheduled session (greedy).
     pub fn step_decode(&mut self) -> Result<Option<(SessionId, u32)>> {
-        let temperature = self.temperature;
-        let repeat_penalty = self.repeat_penalty;
-        let repeat_window = self.repeat_window;
-
         if self.thermal.should_pause_decode() || self.rr.is_empty() {
             return Ok(None);
         }
 
-        let n = self.sessions.len().max(1);
-        for _ in 0..n {
-            let id = match self.rr.next() {
-                Some(id) => id,
-                None => return Ok(None),
-            };
-
-            let s = match self.sessions.get_mut(&id) {
-                Some(s) => s,
-                None => continue,
-            };
-            let meta = match self.session_meta.get_mut(&id) {
-                Some(m) => m,
-                None => continue,
-            };
-            if meta.state() == SessionState::Suspended || meta.state() == SessionState::Terminal {
-                continue;
-            }
-
-            let Some(cur) = s.last_token else {
-                continue;
-            };
-
-            let pos = s.next_pos;
-            let mut cand = match &mut self.runner {
-                Runner::Llama(r) => {
-                    r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
-                }
-                Runner::Gemma(r) => {
-                    let top_k = if r.is_gemma3_text() { self.top_k.max(8) } else { self.top_k };
-                    r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?
-                }
-                Runner::Qwen(r) => {
-                    r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
-                }
-            };
-            if let Runner::Gemma(r) = &self.runner {
-                if r.is_gemma3_text() {
-                    apply_gemma3_stability_candidate_filter(&mut cand, &s.recent, self.backend);
-                }
-            }
-            let next = select_next_with_params(
-                temperature,
-                repeat_penalty,
-                repeat_window,
-                &cand,
-                &s.recent,
-                &mut s.rng,
-            )?;
-            s.recent.push(cur);
-            s.last_token = Some(next);
-            s.next_pos += 1;
-            meta.add_generated_token();
-            return Ok(Some((id, next)));
+        if let Some(pair) = self.pop_pending_scheduled() {
+            return Ok(Some(pair));
         }
 
+        let burst = self.decode_burst_budget();
+        if burst == 0 {
+            return Ok(None);
+        }
+        let _produced = self.pump_decode_burst(burst)?;
+
+        if let Some(pair) = self.pop_pending_scheduled() {
+            return Ok(Some(pair));
+        }
         Ok(None)
     }
 
@@ -427,6 +388,163 @@ impl Engine {
     }
 
     // sampling logic lives in `select_next_with_params` to avoid borrow issues
+
+    fn decode_burst_budget(&self) -> usize {
+        if self.rr.is_empty() || self.thermal.should_pause_decode() {
+            return 0;
+        }
+        let active_cap = self.thermal.max_active_decode_sessions();
+        if active_cap == 0 {
+            return 0;
+        }
+        let active_sessions = self.sessions.len().max(1);
+        let session_cap = if active_cap == usize::MAX {
+            active_sessions
+        } else {
+            active_cap.min(active_sessions)
+        };
+        let backend_cap = match self.backend {
+            BackendKind::Metal => 4usize,
+            BackendKind::Cpu => 2usize,
+        };
+        session_cap.min(backend_cap).max(1)
+    }
+
+    fn pop_pending_scheduled(&mut self) -> Option<(SessionId, u32)> {
+        let n = self.sessions.len().max(1);
+        for _ in 0..n {
+            let id = self.rr.next()?;
+            let suspended_or_terminal = self
+                .session_meta
+                .get(&id)
+                .map(|m| matches!(m.state(), SessionState::Suspended | SessionState::Terminal))
+                .unwrap_or(true);
+            if suspended_or_terminal {
+                continue;
+            }
+            if let Some(s) = self.sessions.get_mut(&id) {
+                if let Some(tok) = s.pending_out.pop_front() {
+                    return Some((id, tok));
+                }
+            }
+        }
+        None
+    }
+
+    fn pump_decode_burst(&mut self, budget: usize) -> Result<usize> {
+        if budget == 0 {
+            return Ok(0);
+        }
+        let mut produced = 0usize;
+        for _ in 0..budget {
+            let Some(id) = self.pick_next_decodable_session() else {
+                break;
+            };
+            let Some(tok) = self.decode_one_for_session(id)? else {
+                break;
+            };
+            if let Some(s) = self.sessions.get_mut(&id) {
+                s.pending_out.push_back(tok);
+                produced += 1;
+            }
+        }
+        Ok(produced)
+    }
+
+    fn pick_next_decodable_session(&mut self) -> Option<SessionId> {
+        let n = self.sessions.len().max(1);
+        for _ in 0..n {
+            let id = self.rr.next()?;
+            let Some(meta) = self.session_meta.get(&id) else {
+                continue;
+            };
+            if matches!(meta.state(), SessionState::Suspended | SessionState::Terminal) {
+                continue;
+            }
+            let Some(s) = self.sessions.get(&id) else {
+                continue;
+            };
+            if s.last_token.is_none() {
+                continue;
+            }
+            return Some(id);
+        }
+        None
+    }
+
+    fn decode_one_for_session(&mut self, id: SessionId) -> Result<Option<u32>> {
+        let temperature = self.temperature;
+        let repeat_penalty = self.repeat_penalty;
+        let repeat_window = self.repeat_window;
+        let backend = self.backend;
+        let top_k = self.top_k;
+
+        let mut s = match self.sessions.remove(&id) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let mut meta = match self.session_meta.remove(&id) {
+            Some(m) => m,
+            None => {
+                self.sessions.insert(id, s);
+                return Ok(None);
+            }
+        };
+
+        let out = (|| -> Result<Option<u32>> {
+            if matches!(meta.state(), SessionState::Suspended | SessionState::Terminal) {
+                return Ok(None);
+            }
+            let Some(cur) = s.last_token else {
+                return Ok(None);
+            };
+            let pos = s.next_pos;
+            let mut cand = match &mut self.runner {
+                Runner::Llama(r) => r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
+                Runner::Gemma(r) => {
+                    let top_k = if r.is_gemma3_text() { top_k.max(8) } else { top_k };
+                    r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?
+                }
+                Runner::Qwen(r) => r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
+            };
+            if let Runner::Gemma(r) = &self.runner {
+                if r.is_gemma3_text() {
+                    apply_gemma3_stability_candidate_filter(&mut cand, &s.recent, backend);
+                }
+            }
+            let next = select_next_with_params(
+                temperature,
+                repeat_penalty,
+                repeat_window,
+                &cand,
+                &s.recent,
+                &mut s.rng,
+            )?;
+            s.recent.push(cur);
+            s.last_token = Some(next);
+            s.next_pos += 1;
+            meta.add_generated_token();
+            Ok(Some(next))
+        })();
+
+        self.sessions.insert(id, s);
+        self.session_meta.insert(id, meta);
+        out
+    }
+}
+
+fn apply_turboquant_runtime_config(cfg: &EngineConfig) {
+    if cfg.kv_encoding != KvEncodingKind::TurboQuant {
+        return;
+    }
+    std::env::set_var(
+        "CELLM_TURBOQ_INT8_DOT",
+        if cfg.turboq_int8_dot { "1" } else { "0" },
+    );
+    std::env::set_var(
+        "CELLM_TURBOQ_QJL_CORR",
+        if cfg.turboq_qjl_corr { "1" } else { "0" },
+    );
 }
 
 fn resolve_backend(requested: BackendKind) -> BackendKind {
@@ -640,15 +758,20 @@ fn infer_qwen_kv_head_dim(file: &CellmFile) -> Result<usize> {
 fn infer_gemma_kv_head_dim(file: &CellmFile) -> Result<usize> {
     let h = &file.header;
     let kv_heads = h.num_kv_heads.max(1);
+    let mut max_head_dim = 0usize;
     for t in &h.tensors {
         if t.name.contains(".self_attn.k_proj.weight") && t.shape.len() == 2 {
             let kv_dim = t.shape[0];
             if kv_dim % kv_heads == 0 {
-                return Ok(kv_dim / kv_heads);
+                max_head_dim = max_head_dim.max(kv_dim / kv_heads);
             }
         }
     }
-    anyhow::bail!(
-        "unable to infer gemma KV head_dim (no self_attn.k_proj.weight found in tensor list)"
-    )
+    if max_head_dim > 0 {
+        Ok(max_head_dim)
+    } else {
+        anyhow::bail!(
+            "unable to infer gemma KV head_dim (no self_attn.k_proj.weight found in tensor list)"
+        )
+    }
 }

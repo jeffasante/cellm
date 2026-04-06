@@ -20,13 +20,20 @@ pub struct GemmaRunner {
     max_layers: usize,
     eos_token_id: Option<u32>,
     tensor_prefix: String,
-    head_dim: usize,
-    kv_head_dim: usize,
+    layer_attn: Vec<GemmaLayerAttnSpec>,
+    max_q_dim: usize,
+    max_kv_dim: usize,
+    max_ffn_dim: usize,
     rmsnorm_weight_is_offset: bool,
     is_gemma3_text: bool,
+    is_gemma4_text: bool,
     sliding_window: usize,
     sliding_window_pattern: usize,
+    gemma4_sliding_mask: Vec<bool>,
+    gemma4_shared_kv_layers: usize,
     rope_theta_sliding: f32,
+    final_logit_softcapping: Option<f32>,
+    per_layer_input: Option<GemmaPerLayerInputSpec>,
     linear_backend: GemmaLinearBackend,
     metal_strict: bool,
     /// Present when a Metal backend is active; drives rms_norm / rope / logits on GPU.
@@ -39,6 +46,26 @@ pub struct GemmaRunner {
 enum GemmaLinearBackend {
     Cpu,
     Metal { ctx: MetalMatmul },
+}
+
+#[derive(Clone, Debug)]
+struct GemmaLayerAttnSpec {
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    kv_head_dim: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    ffn_dim: usize,
+}
+
+#[derive(Clone, Debug)]
+struct GemmaPerLayerInputSpec {
+    token_embd_name: String,
+    model_proj_name: String,
+    proj_norm_name: String,
+    per_total_dim: usize,
+    per_layer_dim: usize,
 }
 
 impl GemmaRunner {
@@ -58,13 +85,13 @@ impl GemmaRunner {
         };
 
         let tensor_prefix = detect_gemma_prefix(&file)?;
-        let (head_dim, kv_head_dim) = infer_gemma_head_dims(
+        let (layer_attn, max_q_dim, max_kv_dim, max_ffn_dim) = infer_gemma_layer_attn_specs(
             &file,
             &tensor_prefix,
+            cfg.num_hidden_layers,
             cfg.num_attention_heads,
             cfg.num_key_value_heads,
         )?;
-        let rmsnorm_weight_is_offset = true;
         let source_model_type = match &h.source_text_config {
             Some(Value::Object(obj)) => match obj.get("model_type") {
                 Some(Value::String(mt)) if !mt.is_empty() => Some(mt.as_str()),
@@ -74,11 +101,33 @@ impl GemmaRunner {
         };
         let is_gemma3_text = h.model_type.starts_with("gemma3")
             || source_model_type.is_some_and(|mt| mt.starts_with("gemma3"));
+        let is_gemma4_text = h.model_type.starts_with("gemma4")
+            || source_model_type.is_some_and(|mt| mt.starts_with("gemma4"));
+        let rmsnorm_weight_is_offset = !is_gemma4_text;
         // Gemma3 uses mixed attention: sliding layers use local RoPE base 10k, while
         // periodic full-attention layers use the global RoPE theta from config.
-        let sliding_window = if is_gemma3_text { 512 } else { usize::MAX };
-        let sliding_window_pattern = if is_gemma3_text { 6 } else { usize::MAX };
-        let rope_theta_sliding = if is_gemma3_text { 10_000.0 } else { cfg.rope_theta };
+        let (sliding_window, sliding_window_pattern, gemma4_sliding_mask, gemma4_shared_kv_layers, rope_theta_sliding) =
+            if is_gemma3_text {
+                (512usize, 6usize, Vec::new(), 0usize, 10_000.0f32)
+            } else if is_gemma4_text {
+                // Gemma4 GGUF metadata defaults:
+                //   sliding_window=512, sliding_window_pattern=[T,T,T,T,F,...], rope.freq_base_swa=10000.
+                // Infer sliding mask directly from layer attention shape: smaller q_dim layers are SWA.
+                let max_q = max_q_dim.max(1);
+                let mask = layer_attn.iter().map(|s| s.q_dim < max_q).collect::<Vec<_>>();
+                // Gemma4 E2B uses shared KV layers (20 in published configs).
+                (512usize, usize::MAX, mask, 20usize, 10_000.0f32)
+            } else {
+                (usize::MAX, usize::MAX, Vec::new(), 0usize, cfg.rope_theta)
+            };
+        let final_logit_softcapping = if is_gemma4_text { Some(30.0f32) } else { None };
+        let per_layer_input = infer_gemma_per_layer_input_spec(
+            &file,
+            &tensor_prefix,
+            cfg.vocab_size,
+            cfg.hidden_size,
+            cfg.num_hidden_layers,
+        )?;
 
         Ok(Self {
             file,
@@ -86,13 +135,20 @@ impl GemmaRunner {
             max_layers: cfg.num_hidden_layers,
             eos_token_id: h.eos_token_id,
             tensor_prefix,
-            head_dim,
-            kv_head_dim,
+            layer_attn,
+            max_q_dim,
+            max_kv_dim,
+            max_ffn_dim,
             rmsnorm_weight_is_offset,
             is_gemma3_text,
+            is_gemma4_text,
             sliding_window,
             sliding_window_pattern,
+            gemma4_sliding_mask,
+            gemma4_shared_kv_layers,
             rope_theta_sliding,
+            final_logit_softcapping,
+            per_layer_input,
             linear_backend: GemmaLinearBackend::Cpu,
             metal_strict: false,
             metal_ops: None,
@@ -152,6 +208,10 @@ impl GemmaRunner {
                 self.linear_backend = GemmaLinearBackend::Metal { ctx };
                 self.metal_ops = Some(ops);
                 self.metal_strict = true;
+                // Full-metal mode must enable all eligible Gemma ops on GPU.
+                self.use_metal_norm = true;
+                self.use_metal_rope = true;
+                self.use_metal_logits = true;
                 true
             }
             (Err(e), _) | (_, Err(e)) => {
@@ -182,7 +242,8 @@ impl GemmaRunner {
     ) -> Result<Vec<(u32, f32)>, CoreError> {
         let mut x = vec![0.0f32; self.cfg.hidden_size];
         self.embed_token(token, &mut x)?;
-        self.step_topk_from_hidden(&x, pos, page_table, kv_cache, top_k)
+        let per_layer_input = self.prepare_gemma4_per_layer_inputs(Some(token), &x)?;
+        self.step_topk_from_hidden_inner(&x, per_layer_input.as_deref(), pos, page_table, kv_cache, top_k)
     }
 
     pub fn step_topk_from_hidden(
@@ -193,25 +254,26 @@ impl GemmaRunner {
         kv_cache: &mut KVCache,
         top_k: usize,
     ) -> Result<Vec<(u32, f32)>, CoreError> {
+        let per_layer_input = self.prepare_gemma4_per_layer_inputs(None, x0)?;
+        self.step_topk_from_hidden_inner(x0, per_layer_input.as_deref(), pos, page_table, kv_cache, top_k)
+    }
+
+    fn step_topk_from_hidden_inner(
+        &mut self,
+        x0: &[f32],
+        per_layer_input: Option<&[f32]>,
+        pos: usize,
+        page_table: &mut PageTable,
+        kv_cache: &mut KVCache,
+        top_k: usize,
+    ) -> Result<Vec<(u32, f32)>, CoreError> {
         let cfg = self.cfg.clone();
         let hidden = cfg.hidden_size;
-        let n_heads = cfg.num_attention_heads;
-        let n_kv_heads = cfg.num_key_value_heads;
-        let head_dim = self.head_dim;
-        let kv_head_dim = self.kv_head_dim;
-        if n_heads * head_dim == 0 || n_kv_heads * kv_head_dim == 0 {
+        if self.max_q_dim == 0 || self.max_kv_dim == 0 {
             return Err(CoreError::Backend(
                 "gemma: invalid attention head geometry".into(),
             ));
         }
-        if head_dim != kv_head_dim {
-            return Err(CoreError::Backend(format!(
-                "gemma: head_dim mismatch q={} kv={} (mixed dims not supported yet)",
-                head_dim, kv_head_dim
-            )));
-        }
-        let q_dim = n_heads * head_dim;
-        let kv_dim = n_kv_heads * kv_head_dim;
 
         // Ensure pagetable covers this token position.
         if pos == page_table.token_count() {
@@ -244,40 +306,110 @@ impl GemmaRunner {
         // Per-layer scratch.
         let mut attn_norm_w = vec![0.0f32; hidden];
         let mut x_norm = vec![0.0f32; hidden];
-        let mut q = vec![0.0f32; q_dim];
-        let mut k = vec![0.0f32; kv_dim];
-        let mut v = vec![0.0f32; kv_dim];
-        let mut attn_out = vec![0.0f32; q_dim];
+        let mut q = vec![0.0f32; self.max_q_dim];
+        let mut k = vec![0.0f32; self.max_kv_dim];
+        let mut v = vec![0.0f32; self.max_kv_dim];
+        let mut attn_out = vec![0.0f32; self.max_q_dim];
         let mut attn_proj = vec![0.0f32; hidden];
 
-        let mut q_norm_w = vec![0.0f32; head_dim];
-        let mut k_norm_w = vec![0.0f32; kv_head_dim];
+        let mut q_norm_w = Vec::<f32>::new();
+        let mut k_norm_w = Vec::<f32>::new();
         let mut post_attn_norm_w = vec![0.0f32; hidden];
         let mut pre_ffn_norm_w = vec![0.0f32; hidden];
         let mut post_ffn_norm_w = vec![0.0f32; hidden];
         let mut mlp_in = vec![0.0f32; hidden];
-        let mut gate = vec![0.0f32; cfg.intermediate_size];
-        let mut up = vec![0.0f32; cfg.intermediate_size];
-        let mut ffn_out = vec![0.0f32; cfg.intermediate_size];
+        let mut gate = vec![0.0f32; self.max_ffn_dim];
+        let mut up = vec![0.0f32; self.max_ffn_dim];
+        let mut ffn_out = vec![0.0f32; self.max_ffn_dim];
         let mut down = vec![0.0f32; hidden];
+        let mut per_gate: Vec<f32> = Vec::new();
+        let mut per_proj = vec![0.0f32; hidden];
+        let mut per_post_norm_w = vec![0.0f32; hidden];
 
         let mut gather_bases: Vec<usize> = Vec::new();
+        let layout_kv_dim = kv_cache.view().layout.kv_dim();
+        if layout_kv_dim < self.max_kv_dim {
+            return Err(CoreError::Backend(format!(
+                "gemma: kv cache layout too small (layout_kv_dim={} < model_max_kv_dim={})",
+                layout_kv_dim, self.max_kv_dim
+            )));
+        }
+        let mut k_store = vec![0.0f32; layout_kv_dim];
+        let mut v_store = vec![0.0f32; layout_kv_dim];
 
         for layer in 0..self.max_layers {
+            let (is_kv_shared_layer, kv_shared_source_layer) = if self.is_gemma4_text
+                && self.gemma4_shared_kv_layers > 0
+                && self.gemma4_shared_kv_layers < self.max_layers
+            {
+                let first_kv_shared = self.max_layers - self.gemma4_shared_kv_layers;
+                if layer >= first_kv_shared {
+                    let is_sliding = self.gemma4_sliding_mask.get(layer).copied().unwrap_or(false);
+                    let src = (0..first_kv_shared)
+                        .rev()
+                        .find(|&i| self.gemma4_sliding_mask.get(i).copied().unwrap_or(false) == is_sliding)
+                        .ok_or_else(|| {
+                            CoreError::Backend(format!(
+                                "gemma: failed to resolve shared-kv source layer for layer {} (is_sliding={})",
+                                layer, is_sliding
+                            ))
+                        })?;
+                    (true, src)
+                } else {
+                    (false, layer)
+                }
+            } else {
+                (false, layer)
+            };
+            let layer_spec = self
+                .layer_attn
+                .get(layer)
+                .ok_or_else(|| CoreError::Backend(format!("gemma: missing layer attn spec for layer {layer}")))?;
+            let n_heads = layer_spec.n_heads;
+            let n_kv_heads = layer_spec.n_kv_heads;
+            let head_dim = layer_spec.head_dim;
+            let kv_head_dim = layer_spec.kv_head_dim;
+            let q_dim = layer_spec.q_dim;
+            let kv_dim = layer_spec.kv_dim;
+            let ffn_dim = layer_spec.ffn_dim;
+            let q_slice = &mut q[..q_dim];
+            let k_slice = &mut k[..kv_dim];
+            let v_slice = &mut v[..kv_dim];
+            let attn_out_slice = &mut attn_out[..q_dim];
+            let gate_slice = &mut gate[..ffn_dim];
+            let up_slice = &mut up[..ffn_dim];
+            let ffn_out_slice = &mut ffn_out[..ffn_dim];
+
             let is_full_attention_layer = if self.is_gemma3_text {
                 // Gemma3 pattern: 5 sliding layers, then 1 full-attention layer.
                 self.sliding_window_pattern != 0 && (layer + 1) % self.sliding_window_pattern == 0
+            } else if self.is_gemma4_text {
+                // Gemma4: mask=true means sliding-window layer, false means full attention.
+                !self.gemma4_sliding_mask.get(layer).copied().unwrap_or(false)
             } else {
                 true
             };
-            let layer_rope_theta = if self.is_gemma3_text && !is_full_attention_layer {
+            let layer_rope_theta = if (self.is_gemma3_text || self.is_gemma4_text)
+                && !is_full_attention_layer
+            {
                 self.rope_theta_sliding
             } else {
                 cfg.rope_theta
             };
 
-            // ── Attention input norm (always CPU for now, Metal for rope/logits) ──
-            {
+            // Attention input norm 
+            let use_metal_norm = self.metal_ops.is_some() && self.use_metal_norm;
+            if use_metal_norm {
+                let w = self
+                    .tensor_f16(&format!("model.layers.{layer}.input_layernorm.weight"))?
+                    .to_vec();
+                let add_one = self.rmsnorm_weight_is_offset;
+                self.metal_ops
+                    .as_mut()
+                    .unwrap()
+                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &mut x_norm)
+                    .map_err(|e| CoreError::Backend(e.to_string()))?;
+            } else {
                 self.rmsnorm_weight(
                     &format!("model.layers.{layer}.input_layernorm.weight"),
                     &mut attn_norm_w,
@@ -285,98 +417,145 @@ impl GemmaRunner {
                 rms_norm_f32(&x, &attn_norm_w, cfg.rms_norm_eps, &mut x_norm);
             }
 
-            let use_metal_norm = self.metal_ops.is_some() && self.use_metal_norm;
             // Gemma uses rotate_half-style RoPE; keep RoPE on CPU for Gemma3 to
             // preserve correctness until Metal path matches this convention.
             let use_metal_rope = self.metal_ops.is_some() && self.use_metal_rope;
 
             // QKV projections (HF weights are [out, in]).
-            self.linear_f16_out_in(
-                &x_norm,
-                &format!("model.layers.{layer}.self_attn.q_proj.weight"),
-                q_dim,
-                hidden,
-                &mut q,
-            )?;
-            self.linear_f16_out_in(
-                &x_norm,
-                &format!("model.layers.{layer}.self_attn.k_proj.weight"),
-                kv_dim,
-                hidden,
-                &mut k,
-            )?;
-            self.linear_f16_out_in(
-                &x_norm,
-                &format!("model.layers.{layer}.self_attn.v_proj.weight"),
-                kv_dim,
-                hidden,
-                &mut v,
-            )?;
+            let q_name = format!("model.layers.{layer}.self_attn.q_proj.weight");
+            let k_name = format!("model.layers.{layer}.self_attn.k_proj.weight");
+            let v_name = format!("model.layers.{layer}.self_attn.v_proj.weight");
+            if !is_kv_shared_layer {
+                let fused_qkv = self.linear_qkv_f16_out_in(
+                    &x_norm,
+                    &q_name,
+                    q_dim,
+                    &k_name,
+                    kv_dim,
+                    &v_name,
+                    kv_dim,
+                    hidden,
+                    q_slice,
+                    k_slice,
+                    v_slice,
+                )?;
+                if !fused_qkv {
+                    self.linear_f16_out_in(&x_norm, &q_name, q_dim, hidden, q_slice)?;
+                    self.linear_f16_out_in(&x_norm, &k_name, kv_dim, hidden, k_slice)?;
+                    self.linear_f16_out_in(&x_norm, &v_name, kv_dim, hidden, v_slice)?;
+                }
+            } else {
+                self.linear_f16_out_in(&x_norm, &q_name, q_dim, hidden, q_slice)?;
+            }
 
             // ── Gemma per-head Q/K RMSNorm before RoPE ────────────────────────
             if use_metal_norm {
                 let qw = self.tensor_f16(
                     &format!("model.layers.{layer}.self_attn.q_norm.weight"))?.to_vec();
-                let kw = self.tensor_f16(
-                    &format!("model.layers.{layer}.self_attn.k_norm.weight"))?.to_vec();
+                let kw = if !is_kv_shared_layer {
+                    Some(
+                        self.tensor_f16(
+                            &format!("model.layers.{layer}.self_attn.k_norm.weight"),
+                        )?
+                        .to_vec(),
+                    )
+                } else {
+                    None
+                };
                 let add_one = self.rmsnorm_weight_is_offset;
                 let ops = self.metal_ops.as_mut().unwrap();
                 for hidx in 0..n_heads {
-                    let seg = &mut q[hidx * head_dim..(hidx + 1) * head_dim];
+                    let seg = &mut q_slice[hidx * head_dim..(hidx + 1) * head_dim];
                     let inp = seg.to_vec();
                     ops.rms_norm_f16w(&inp, &qw, cfg.rms_norm_eps, add_one, seg)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                 }
-                for hidx in 0..n_kv_heads {
-                    let seg = &mut k[hidx * kv_head_dim..(hidx + 1) * kv_head_dim];
-                    let inp = seg.to_vec();
-                    ops.rms_norm_f16w(&inp, &kw, cfg.rms_norm_eps, add_one, seg)
-                        .map_err(|e| CoreError::Backend(e.to_string()))?;
+                if !is_kv_shared_layer {
+                    let kw = kw.as_ref().unwrap();
+                    for hidx in 0..n_kv_heads {
+                        let seg = &mut k_slice[hidx * kv_head_dim..(hidx + 1) * kv_head_dim];
+                        let inp = seg.to_vec();
+                        ops.rms_norm_f16w(&inp, &kw, cfg.rms_norm_eps, add_one, seg)
+                            .map_err(|e| CoreError::Backend(e.to_string()))?;
+                    }
                 }
             } else {
+                q_norm_w.resize(head_dim, 0.0);
                 self.rmsnorm_weight(
                     &format!("model.layers.{layer}.self_attn.q_norm.weight"),
                     &mut q_norm_w,
                 )?;
-                self.rmsnorm_weight(
-                    &format!("model.layers.{layer}.self_attn.k_norm.weight"),
-                    &mut k_norm_w,
-                )?;
                 for hidx in 0..n_heads {
                     let start = hidx * head_dim;
                     let end = start + head_dim;
-                    self.rms_norm_inplace_segment(&mut q[start..end], &q_norm_w, cfg.rms_norm_eps);
+                    self.rms_norm_inplace_segment(&mut q_slice[start..end], &q_norm_w, cfg.rms_norm_eps);
                 }
+                if !is_kv_shared_layer {
+                    k_norm_w.resize(kv_head_dim, 0.0);
+                    self.rmsnorm_weight(
+                        &format!("model.layers.{layer}.self_attn.k_norm.weight"),
+                        &mut k_norm_w,
+                    )?;
+                    for hidx in 0..n_kv_heads {
+                        let start = hidx * kv_head_dim;
+                        let end = start + kv_head_dim;
+                        self.rms_norm_inplace_segment(&mut k_slice[start..end], &k_norm_w, cfg.rms_norm_eps);
+                    }
+                }
+            }
+
+            // V norm uses Gemma4 RMSNorm without scale.
+            if !is_kv_shared_layer && self.is_gemma4_text {
                 for hidx in 0..n_kv_heads {
                     let start = hidx * kv_head_dim;
                     let end = start + kv_head_dim;
-                    self.rms_norm_inplace_segment(&mut k[start..end], &k_norm_w, cfg.rms_norm_eps);
+                    self.rms_norm_inplace_no_weight_segment(&mut v_slice[start..end], cfg.rms_norm_eps);
                 }
             }
 
             // ── RoPE ──────────────
             if use_metal_rope {
                 let ops = self.metal_ops.as_mut().unwrap();
-                ops.rope_adj_f32(&mut q, n_heads, head_dim, pos, layer_rope_theta)
+                ops.rope_half_f32(q_slice, n_heads, head_dim, head_dim, pos, layer_rope_theta)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
-                ops.rope_adj_f32(&mut k, n_kv_heads, kv_head_dim, pos, layer_rope_theta)
-                    .map_err(|e| CoreError::Backend(e.to_string()))?;
+                if !is_kv_shared_layer {
+                    ops.rope_half_f32(
+                        k_slice,
+                        n_kv_heads,
+                        kv_head_dim,
+                        kv_head_dim,
+                        pos,
+                        layer_rope_theta,
+                    )
+                        .map_err(|e| CoreError::Backend(e.to_string()))?;
+                }
             } else {
-                rope_inplace_rotate_half_f32(&mut q, n_heads, head_dim, pos, layer_rope_theta);
-                rope_inplace_rotate_half_f32(&mut k, n_kv_heads, kv_head_dim, pos, layer_rope_theta);
+                rope_inplace_rotate_half_f32(q_slice, n_heads, head_dim, pos, layer_rope_theta);
+                if !is_kv_shared_layer {
+                    rope_inplace_rotate_half_f32(k_slice, n_kv_heads, kv_head_dim, pos, layer_rope_theta);
+                }
             }
 
             // Write new token K/V into paged cache.
-            {
+            if !is_kv_shared_layer {
+                if kv_dim == layout_kv_dim {
+                    k_store.copy_from_slice(k_slice);
+                    v_store.copy_from_slice(v_slice);
+                } else {
+                    k_store.fill(0.0);
+                    v_store.fill(0.0);
+                    k_store[..kv_dim].copy_from_slice(k_slice);
+                    v_store[..kv_dim].copy_from_slice(v_slice);
+                }
                 let mut cv = kv_cache.view_mut();
-                cv.write_token(block_id, layer, token_off, &k, &v)?;
+                cv.write_token(block_id, layer, token_off, &k_store, &v_store)?;
             }
 
             // Gather historical K/V and run attention for this token.
             let seq = page_table.token_count();
             let cr = kv_cache.view();
             gather_bases.clear();
-            let start_tpos = if self.is_gemma3_text && !is_full_attention_layer {
+            let start_tpos = if (self.is_gemma3_text || self.is_gemma4_text) && !is_full_attention_layer {
                 seq.saturating_sub(self.sliding_window)
             } else {
                 0
@@ -390,20 +569,29 @@ impl GemmaRunner {
                 let o = page_table.offset_in_block(tpos).map_err(|e| {
                     CoreError::Backend(format!("gemma: offset_in_block failed: {e}"))
                 })?;
-                gather_bases.push(cr.layout.token_base_elem(b, layer, o)?);
+                gather_bases.push(cr.layout.token_base_elem(b, kv_shared_source_layer, o)?);
             }
+            // Gemma4 attention uses scaling=1.0 in HF; KV kernel applies 1/sqrt(head_dim),
+            // so pre-scale queries by sqrt(head_dim) to match Gemma4 behavior.
+            let q_attn_scaled: Option<Vec<f32>> = if self.is_gemma4_text {
+                let s = (head_dim as f32).sqrt();
+                Some(q_slice.iter().map(|&v| v * s).collect())
+            } else {
+                None
+            };
+            let q_for_attn: &[f32] = q_attn_scaled.as_deref().unwrap_or(q_slice);
             cr.attention_single_token_gqa_from_bases(
                 &gather_bases,
-                &q,
+                q_for_attn,
                 n_heads,
                 n_kv_heads,
                 head_dim,
-                &mut attn_out,
+                attn_out_slice,
             )?;
 
             // o_proj: hidden <- hidden
             self.linear_f16_out_in(
-                &attn_out,
+                attn_out_slice,
                 &format!("model.layers.{layer}.self_attn.o_proj.weight"),
                 hidden,
                 q_dim,
@@ -450,25 +638,25 @@ impl GemmaRunner {
             self.linear_f16_out_in(
                 &mlp_in,
                 &format!("model.layers.{layer}.mlp.gate_proj.weight"),
-                cfg.intermediate_size,
+                ffn_dim,
                 hidden,
-                &mut gate,
+                gate_slice,
             )?;
             self.linear_f16_out_in(
                 &mlp_in,
                 &format!("model.layers.{layer}.mlp.up_proj.weight"),
-                cfg.intermediate_size,
+                ffn_dim,
                 hidden,
-                &mut up,
+                up_slice,
             )?;
-            for i in 0..gate.len() {
-                ffn_out[i] = gelu_tanh_f32(gate[i]) * up[i];
+            for i in 0..ffn_dim {
+                ffn_out_slice[i] = gelu_tanh_f32(gate_slice[i]) * up_slice[i];
             }
             self.linear_f16_out_in(
-                &ffn_out,
+                ffn_out_slice,
                 &format!("model.layers.{layer}.mlp.down_proj.weight"),
                 hidden,
-                cfg.intermediate_size,
+                ffn_dim,
                 &mut down,
             )?;
             let x_residual = x.clone();
@@ -490,6 +678,71 @@ impl GemmaRunner {
                 )?;
                 rms_norm_f32(&down, &post_ffn_norm_w, cfg.rms_norm_eps, &mut x_norm);
                 for i in 0..hidden { x[i] = x_norm[i] + x_residual[i]; }
+            }
+
+            if let (Some(spec), Some(per_input_all)) = (&self.per_layer_input, per_layer_input) {
+                let per_layer_dim = spec.per_layer_dim;
+                let l0 = layer * per_layer_dim;
+                let l1 = l0 + per_layer_dim;
+                if l1 > per_input_all.len() {
+                    return Err(CoreError::Backend(format!(
+                        "gemma: per-layer input buffer too small for layer {} (need {}, have {})",
+                        layer,
+                        l1,
+                        per_input_all.len()
+                    )));
+                }
+                let per_input = &per_input_all[l0..l1];
+                let residual = x.clone();
+                per_gate.resize(per_layer_dim, 0.0);
+                self.linear_f16_out_in(
+                    &x,
+                    &format!("model.layers.{layer}.per_layer_input_gate.weight"),
+                    per_layer_dim,
+                    hidden,
+                    &mut per_gate,
+                )?;
+                for i in 0..per_layer_dim {
+                    per_gate[i] = gelu_tanh_f32(per_gate[i]) * per_input[i];
+                }
+                self.linear_f16_out_in(
+                    &per_gate,
+                    &format!("model.layers.{layer}.per_layer_projection.weight"),
+                    hidden,
+                    per_layer_dim,
+                    &mut per_proj,
+                )?;
+                self.rmsnorm_weight(
+                    &format!("model.layers.{layer}.post_per_layer_input_norm.weight"),
+                    &mut per_post_norm_w,
+                )?;
+                rms_norm_f32(&per_proj, &per_post_norm_w, cfg.rms_norm_eps, &mut x_norm);
+                for i in 0..hidden {
+                    x[i] = residual[i] + x_norm[i];
+                }
+            }
+
+            if self.is_gemma4_text {
+                let scale_name = self.resolve_name(&format!("model.layers.{layer}.layer_output_scale.weight"))?;
+                let scale = self.tensor_f16_by_exact_name(&scale_name)?;
+                if scale.len() == 1 {
+                    let s = f16::from_bits(scale[0]).to_f32();
+                    for i in 0..hidden {
+                        x[i] *= s;
+                    }
+                } else if scale.len() == hidden {
+                    for i in 0..hidden {
+                        let s = f16::from_bits(scale[i]).to_f32();
+                        x[i] *= s;
+                    }
+                } else {
+                    return Err(CoreError::Backend(format!(
+                        "gemma: invalid layer_output_scale shape at layer {} (len={} expected 1 or {})",
+                        layer,
+                        scale.len(),
+                        hidden
+                    )));
+                }
             }
         }
 
@@ -584,7 +837,16 @@ impl GemmaRunner {
         let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
         let mut min_idx = 0usize;
         let mut min_val = f32::INFINITY;
-        for (vid, &dot) in all_logits.iter().enumerate() {
+        for (vid, &raw_dot) in all_logits.iter().enumerate() {
+            let dot = if let Some(cap) = self.final_logit_softcapping {
+                if cap > 0.0 {
+                    cap * (raw_dot / cap).tanh()
+                } else {
+                    raw_dot
+                }
+            } else {
+                raw_dot
+            };
             if top.len() < k {
                 top.push((vid as u32, dot));
                 if dot < min_val { min_val = dot; min_idx = top.len() - 1; }
@@ -633,6 +895,76 @@ impl GemmaRunner {
             out[i] = f16::from_bits(row[i]).to_f32() * embed_scale;
         }
         Ok(())
+    }
+
+    fn prepare_gemma4_per_layer_inputs(
+        &mut self,
+        token: Option<u32>,
+        hidden_state: &[f32],
+    ) -> Result<Option<Vec<f32>>, CoreError> {
+        if !self.is_gemma4_text {
+            return Ok(None);
+        }
+        let Some(spec) = &self.per_layer_input else {
+            return Ok(None);
+        };
+        let per_total_dim = spec.per_total_dim;
+        let per_layer_dim = spec.per_layer_dim;
+        let token_embd_name = spec.token_embd_name.clone();
+        let model_proj_name = spec.model_proj_name.clone();
+        let proj_norm_name = spec.proj_norm_name.clone();
+        if hidden_state.len() != self.cfg.hidden_size {
+            return Err(CoreError::Backend(format!(
+                "gemma: hidden state len mismatch {} != {}",
+                hidden_state.len(),
+                self.cfg.hidden_size
+            )));
+        }
+
+        let mut per_token = vec![0.0f32; per_total_dim];
+        if let Some(tok) = token {
+            let t = (tok as usize) % self.cfg.vocab_size;
+            let te = self.tensor_f16_by_exact_name(&token_embd_name)?;
+            let te_row = &te[t * per_total_dim..(t + 1) * per_total_dim];
+            let scale = (per_layer_dim as f32).sqrt();
+            for i in 0..per_total_dim {
+                per_token[i] = f16::from_bits(te_row[i]).to_f32() * scale;
+            }
+        }
+
+        let mut projected = vec![0.0f32; per_total_dim];
+        self.linear_f16_out_in(
+            hidden_state,
+            &model_proj_name,
+            per_total_dim,
+            self.cfg.hidden_size,
+            &mut projected,
+        )?;
+        let proj_scale = 1.0f32 / (self.cfg.hidden_size as f32).sqrt();
+        for v in projected.iter_mut() {
+            *v *= proj_scale;
+        }
+
+        let pn = self.tensor_f16_by_exact_name(&proj_norm_name)?;
+        let mut pn_f = vec![0.0f32; per_layer_dim];
+        for i in 0..per_layer_dim {
+            pn_f[i] = f16::from_bits(pn[i]).to_f32();
+        }
+        for chunk in projected.chunks_mut(per_layer_dim) {
+            self.rms_norm_inplace_segment(chunk, &pn_f, self.cfg.rms_norm_eps);
+        }
+
+        if token.is_some() {
+            let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+            for i in 0..per_total_dim {
+                per_token[i] = (per_token[i] + projected[i]) * inv_sqrt2;
+            }
+        } else {
+            for i in 0..per_total_dim {
+                per_token[i] = projected[i];
+            }
+        }
+        Ok(Some(per_token))
     }
 
     fn rmsnorm_weight(&self, name: &str, out: &mut [f32]) -> Result<(), CoreError> {
@@ -917,6 +1249,104 @@ impl GemmaRunner {
             x[i] = x[i] * inv_rms * weight[i];
         }
     }
+
+    fn linear_qkv_f16_out_in(
+        &mut self,
+        x: &[f32],
+        q_weight_name: &str,
+        q_out_dim: usize,
+        k_weight_name: &str,
+        k_out_dim: usize,
+        v_weight_name: &str,
+        v_out_dim: usize,
+        in_dim: usize,
+        q_out: &mut [f32],
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> Result<bool, CoreError> {
+        if self.metal_ops.is_none() {
+            return Ok(false);
+        }
+        if x.len() != in_dim || q_out.len() != q_out_dim || k_out.len() != k_out_dim || v_out.len() != v_out_dim {
+            return Err(CoreError::Backend(format!(
+                "gemma qkv dims mismatch: x={} q={} k={} v={} expected in={} q_out={} k_out={} v_out={}",
+                x.len(), q_out.len(), k_out.len(), v_out.len(), in_dim, q_out_dim, k_out_dim, v_out_dim
+            )));
+        }
+
+        let q_resolved = self.resolve_name(q_weight_name)?;
+        let k_resolved = self.resolve_name(k_weight_name)?;
+        let v_resolved = self.resolve_name(v_weight_name)?;
+
+        let q_meta = self.tensor_meta_by_exact_name(&q_resolved).ok_or_else(|| {
+            CoreError::Backend(format!("unknown tensor {q_resolved}"))
+        })?;
+        let k_meta = self.tensor_meta_by_exact_name(&k_resolved).ok_or_else(|| {
+            CoreError::Backend(format!("unknown tensor {k_resolved}"))
+        })?;
+        let v_meta = self.tensor_meta_by_exact_name(&v_resolved).ok_or_else(|| {
+            CoreError::Backend(format!("unknown tensor {v_resolved}"))
+        })?;
+
+        if q_meta.shape.len() != 2 || k_meta.shape.len() != 2 || v_meta.shape.len() != 2 {
+            return Err(CoreError::Backend(format!(
+                "gemma qkv fused expects 2D weights, got q={:?} k={:?} v={:?}",
+                q_meta.shape, k_meta.shape, v_meta.shape
+            )));
+        }
+        if q_meta.shape != [q_out_dim, in_dim]
+            || k_meta.shape != [k_out_dim, in_dim]
+            || v_meta.shape != [v_out_dim, in_dim]
+        {
+            return Err(CoreError::Backend(format!(
+                "gemma qkv fused shape mismatch: q={:?} k={:?} v={:?} expected q=[{},{}] k=[{},{}] v=[{},{}]",
+                q_meta.shape, k_meta.shape, v_meta.shape, q_out_dim, in_dim, k_out_dim, in_dim, v_out_dim, in_dim
+            )));
+        }
+        if q_meta.dtype != "f16" || k_meta.dtype != "f16" || v_meta.dtype != "f16" {
+            return Ok(false);
+        }
+
+        let wq = self.tensor_f16_by_exact_name(&q_resolved)?;
+        let wk = self.tensor_f16_by_exact_name(&k_resolved)?;
+        let wv = self.tensor_f16_by_exact_name(&v_resolved)?;
+        let wq = unsafe { std::slice::from_raw_parts(wq.as_ptr(), wq.len()) };
+        let wk = unsafe { std::slice::from_raw_parts(wk.as_ptr(), wk.len()) };
+        let wv = unsafe { std::slice::from_raw_parts(wv.as_ptr(), wv.len()) };
+
+        self.metal_ops
+            .as_mut()
+            .unwrap()
+            .logits_qkv_f16(
+                x,
+                wq,
+                wk,
+                wv,
+                q_out_dim,
+                k_out_dim,
+                v_out_dim,
+                in_dim,
+                &q_resolved,
+                &k_resolved,
+                &v_resolved,
+                q_out,
+                k_out,
+                v_out,
+            )
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        Ok(true)
+    }
+
+    fn rms_norm_inplace_no_weight_segment(&self, x: &mut [f32], eps: f32) {
+        let mut sumsq = 0.0f32;
+        for &v in x.iter() {
+            sumsq += v * v;
+        }
+        let inv_rms = 1.0f32 / (sumsq / (x.len() as f32) + eps).sqrt();
+        for v in x.iter_mut() {
+            *v *= inv_rms;
+        }
+    }
 }
 
 fn gelu_tanh_f32(x: f32) -> f32 {
@@ -970,41 +1400,286 @@ fn detect_gemma_prefix(file: &CellmFile) -> Result<String, CoreError> {
     ))
 }
 
-fn infer_gemma_head_dims(
+fn infer_gemma_layer_attn_specs(
     file: &CellmFile,
     prefix: &str,
-    n_heads: usize,
-    n_kv_heads: usize,
-) -> Result<(usize, usize), CoreError> {
-    let q_name = format!("{prefix}model.layers.0.self_attn.q_proj.weight");
-    let k_name = format!("{prefix}model.layers.0.self_attn.k_proj.weight");
-    let q_meta = file
-        .tensor_index(&q_name)
-        .ok_or_else(|| CoreError::Backend(format!("gemma: missing tensor {q_name}")))?;
-    let k_meta = file
-        .tensor_index(&k_name)
-        .ok_or_else(|| CoreError::Backend(format!("gemma: missing tensor {k_name}")))?;
-    if q_meta.shape.len() != 2 || k_meta.shape.len() != 2 {
-        return Err(CoreError::Backend(
-            "gemma: expected 2D q_proj/k_proj weights".into(),
-        ));
-    }
-    let q_out = q_meta.shape[0];
-    let k_out = k_meta.shape[0];
-    if n_heads == 0 || n_kv_heads == 0 {
+    num_layers: usize,
+    default_n_heads: usize,
+    default_n_kv_heads: usize,
+) -> Result<(Vec<GemmaLayerAttnSpec>, usize, usize, usize), CoreError> {
+    if default_n_heads == 0 || default_n_kv_heads == 0 {
         return Err(CoreError::Backend(
             "gemma: num_attention_heads/num_key_value_heads must be > 0".into(),
         ));
     }
-    if q_out % n_heads != 0 {
+    let mut specs = Vec::with_capacity(num_layers);
+    let mut max_q_dim = 0usize;
+    let mut max_kv_dim = 0usize;
+    let mut max_ffn_dim = 0usize;
+    for layer in 0..num_layers {
+        let q_name = format!("{prefix}model.layers.{layer}.self_attn.q_proj.weight");
+        let k_name = format!("{prefix}model.layers.{layer}.self_attn.k_proj.weight");
+        let q_meta = file
+            .tensor_index(&q_name)
+            .ok_or_else(|| CoreError::Backend(format!("gemma: missing tensor {q_name}")))?;
+        let k_meta = file
+            .tensor_index(&k_name)
+            .ok_or_else(|| CoreError::Backend(format!("gemma: missing tensor {k_name}")))?;
+        if q_meta.shape.len() != 2 || k_meta.shape.len() != 2 {
+            return Err(CoreError::Backend(format!(
+                "gemma: expected 2D q_proj/k_proj weights at layer {layer}"
+            )));
+        }
+        let q_out = q_meta.shape[0];
+        let k_out = k_meta.shape[0];
+        let gate_name = format!("{prefix}model.layers.{layer}.mlp.gate_proj.weight");
+        let up_name = format!("{prefix}model.layers.{layer}.mlp.up_proj.weight");
+        let down_name = format!("{prefix}model.layers.{layer}.mlp.down_proj.weight");
+        let gate_meta = file
+            .tensor_index(&gate_name)
+            .ok_or_else(|| CoreError::Backend(format!("gemma: missing tensor {gate_name}")))?;
+        let up_meta = file
+            .tensor_index(&up_name)
+            .ok_or_else(|| CoreError::Backend(format!("gemma: missing tensor {up_name}")))?;
+        let down_meta = file
+            .tensor_index(&down_name)
+            .ok_or_else(|| CoreError::Backend(format!("gemma: missing tensor {down_name}")))?;
+
+        let q_norm_name = format!("{prefix}model.layers.{layer}.self_attn.q_norm.weight");
+        let k_norm_name = format!("{prefix}model.layers.{layer}.self_attn.k_norm.weight");
+        let q_norm_dim = file
+            .tensor_index(&q_norm_name)
+            .and_then(|t| (t.shape.len() == 1).then_some(t.shape[0]));
+        let k_norm_dim = file
+            .tensor_index(&k_norm_name)
+            .and_then(|t| (t.shape.len() == 1).then_some(t.shape[0]));
+
+        let mut n_heads = default_n_heads;
+        let mut n_kv_heads = default_n_kv_heads;
+
+        let head_dim = if let Some(d) = q_norm_dim {
+            if d == 0 || q_out % d != 0 {
+                return Err(CoreError::Backend(format!(
+                    "gemma: invalid q_norm dim at layer {layer}: q_out={q_out} q_norm_dim={d}"
+                )));
+            }
+            n_heads = q_out / d;
+            d
+        } else if q_out % n_heads == 0 {
+            q_out / n_heads
+        } else {
+            return Err(CoreError::Backend(format!(
+                "gemma: q_proj out_dim {q_out} not divisible by n_heads={n_heads} at layer {layer}"
+            )));
+        };
+
+        let kv_head_dim = if let Some(d) = k_norm_dim {
+            if d == 0 || k_out % d != 0 {
+                return Err(CoreError::Backend(format!(
+                    "gemma: invalid k_norm dim at layer {layer}: k_out={k_out} k_norm_dim={d}"
+                )));
+            }
+            n_kv_heads = k_out / d;
+            d
+        } else if k_out % n_kv_heads == 0 {
+            k_out / n_kv_heads
+        } else {
+            return Err(CoreError::Backend(format!(
+                "gemma: k_proj out_dim {k_out} not divisible by n_kv_heads={n_kv_heads} at layer {layer}"
+            )));
+        };
+
+        if head_dim != kv_head_dim {
+            return Err(CoreError::Backend(format!(
+                "gemma: mixed head_dim unsupported at layer {layer} (q_head_dim={head_dim}, kv_head_dim={kv_head_dim})"
+            )));
+        }
+
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * kv_head_dim;
+        if q_dim != q_out || kv_dim != k_out {
+            return Err(CoreError::Backend(format!(
+                "gemma: inferred dims mismatch at layer {layer} (q_dim={q_dim} q_out={q_out} kv_dim={kv_dim} k_out={k_out})"
+            )));
+        }
+        if gate_meta.shape.len() != 2
+            || up_meta.shape.len() != 2
+            || down_meta.shape.len() != 2
+        {
+            return Err(CoreError::Backend(format!(
+                "gemma: expected 2D MLP weights at layer {layer}"
+            )));
+        }
+        if gate_meta.shape[1] != k_meta.shape[1] || up_meta.shape[1] != k_meta.shape[1] {
+            return Err(CoreError::Backend(format!(
+                "gemma: MLP input dim mismatch at layer {layer} (gate={:?} up={:?} hidden={})",
+                gate_meta.shape,
+                up_meta.shape,
+                k_meta.shape[1]
+            )));
+        }
+        if down_meta.shape[0] != k_meta.shape[1] || down_meta.shape[1] != gate_meta.shape[0] {
+            return Err(CoreError::Backend(format!(
+                "gemma: down_proj shape mismatch at layer {layer} (down={:?} gate={:?} hidden={})",
+                down_meta.shape,
+                gate_meta.shape,
+                k_meta.shape[1]
+            )));
+        }
+        if up_meta.shape[0] != gate_meta.shape[0] {
+            return Err(CoreError::Backend(format!(
+                "gemma: gate/up out_dim mismatch at layer {layer} (gate={} up={})",
+                gate_meta.shape[0], up_meta.shape[0]
+            )));
+        }
+        let ffn_dim = gate_meta.shape[0];
+
+        max_q_dim = max_q_dim.max(q_dim);
+        max_kv_dim = max_kv_dim.max(kv_dim);
+        max_ffn_dim = max_ffn_dim.max(ffn_dim);
+        specs.push(GemmaLayerAttnSpec {
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_head_dim,
+            q_dim,
+            kv_dim,
+            ffn_dim,
+        });
+    }
+    Ok((specs, max_q_dim, max_kv_dim, max_ffn_dim))
+}
+
+fn infer_gemma_per_layer_input_spec(
+    file: &CellmFile,
+    prefix: &str,
+    vocab_size: usize,
+    hidden_size: usize,
+    num_layers: usize,
+) -> Result<Option<GemmaPerLayerInputSpec>, CoreError> {
+    let cand = |name: &str| -> Option<String> {
+        if file.tensor_index(name).is_some() {
+            Some(name.to_string())
+        } else if !prefix.is_empty() {
+            let p = format!("{prefix}{name}");
+            file.tensor_index(&p).map(|_| p)
+        } else {
+            None
+        }
+    };
+    let Some(token_embd_name) = cand("model.per_layer_token_embd.weight") else {
+        return Ok(None);
+    };
+    let model_proj_name = cand("model.per_layer_model_proj.weight").ok_or_else(|| {
+        CoreError::Backend("gemma: per_layer_token_embd present but per_layer_model_proj missing".into())
+    })?;
+    let proj_norm_name = cand("model.per_layer_proj_norm.weight").ok_or_else(|| {
+        CoreError::Backend("gemma: per_layer_token_embd present but per_layer_proj_norm missing".into())
+    })?;
+
+    let te = file
+        .tensor_index(&token_embd_name)
+        .ok_or_else(|| CoreError::Backend(format!("gemma: missing tensor {}", token_embd_name)))?;
+    let mp = file
+        .tensor_index(&model_proj_name)
+        .ok_or_else(|| CoreError::Backend(format!("gemma: missing tensor {}", model_proj_name)))?;
+    let pn = file
+        .tensor_index(&proj_norm_name)
+        .ok_or_else(|| CoreError::Backend(format!("gemma: missing tensor {}", proj_norm_name)))?;
+    if te.shape.len() != 2 || mp.shape.len() != 2 || pn.shape.len() != 1 {
+        return Err(CoreError::Backend(
+            "gemma: per_layer tensors must be 2D/2D/1D".into(),
+        ));
+    }
+    if te.shape[0] != vocab_size {
         return Err(CoreError::Backend(format!(
-            "gemma: q_proj out_dim {q_out} not divisible by n_heads={n_heads}"
+            "gemma: per_layer_token_embd vocab mismatch {} != {}",
+            te.shape[0], vocab_size
         )));
     }
-    if k_out % n_kv_heads != 0 {
+    let per_total_dim = te.shape[1];
+    let per_layer_dim = pn.shape[0];
+    if per_layer_dim == 0 || per_total_dim == 0 || per_total_dim % per_layer_dim != 0 {
         return Err(CoreError::Backend(format!(
-            "gemma: k_proj out_dim {k_out} not divisible by n_kv_heads={n_kv_heads}"
+            "gemma: invalid per-layer dims total={} per={}",
+            per_total_dim, per_layer_dim
         )));
     }
-    Ok((q_out / n_heads, k_out / n_kv_heads))
+    if per_total_dim / per_layer_dim != num_layers {
+        return Err(CoreError::Backend(format!(
+            "gemma: per-layer chunk count mismatch {} != num_layers {}",
+            per_total_dim / per_layer_dim,
+            num_layers
+        )));
+    }
+    if mp.shape[0] != per_total_dim || mp.shape[1] != hidden_size {
+        return Err(CoreError::Backend(format!(
+            "gemma: per_layer_model_proj shape mismatch {:?}, expected [{},{}]",
+            mp.shape, per_total_dim, hidden_size
+        )));
+    }
+    for layer in 0..num_layers {
+        let gate_name = cand(&format!("model.layers.{layer}.per_layer_input_gate.weight"))
+            .ok_or_else(|| CoreError::Backend(format!(
+                "gemma: missing model.layers.{layer}.per_layer_input_gate.weight"
+            )))?;
+        let gate_meta = file.tensor_index(&gate_name).ok_or_else(|| {
+            CoreError::Backend(format!("gemma: missing tensor {}", gate_name))
+        })?;
+        if gate_meta.shape != vec![per_layer_dim, hidden_size] {
+            return Err(CoreError::Backend(format!(
+                "gemma: per-layer gate shape mismatch at layer {}: {:?}, expected [{},{}]",
+                layer, gate_meta.shape, per_layer_dim, hidden_size
+            )));
+        }
+
+        let proj_name = cand(&format!("model.layers.{layer}.per_layer_projection.weight"))
+            .ok_or_else(|| CoreError::Backend(format!(
+                "gemma: missing model.layers.{layer}.per_layer_projection.weight"
+            )))?;
+        let proj_meta = file.tensor_index(&proj_name).ok_or_else(|| {
+            CoreError::Backend(format!("gemma: missing tensor {}", proj_name))
+        })?;
+        if proj_meta.shape != vec![hidden_size, per_layer_dim] {
+            return Err(CoreError::Backend(format!(
+                "gemma: per-layer projection shape mismatch at layer {}: {:?}, expected [{},{}]",
+                layer, proj_meta.shape, hidden_size, per_layer_dim
+            )));
+        }
+
+        let post_name = cand(&format!("model.layers.{layer}.post_per_layer_input_norm.weight"))
+            .ok_or_else(|| CoreError::Backend(format!(
+                "gemma: missing model.layers.{layer}.post_per_layer_input_norm.weight"
+            )))?;
+        let post_meta = file.tensor_index(&post_name).ok_or_else(|| {
+            CoreError::Backend(format!("gemma: missing tensor {}", post_name))
+        })?;
+        if post_meta.shape != vec![hidden_size] {
+            return Err(CoreError::Backend(format!(
+                "gemma: post per-layer norm shape mismatch at layer {}: {:?}, expected [{}]",
+                layer, post_meta.shape, hidden_size
+            )));
+        }
+
+        let scale_name = cand(&format!("model.layers.{layer}.layer_output_scale.weight"))
+            .ok_or_else(|| CoreError::Backend(format!(
+                "gemma: missing model.layers.{layer}.layer_output_scale.weight"
+            )))?;
+        let scale_meta = file.tensor_index(&scale_name).ok_or_else(|| {
+            CoreError::Backend(format!("gemma: missing tensor {}", scale_name))
+        })?;
+        if scale_meta.shape != vec![1] && scale_meta.shape != vec![hidden_size] {
+            return Err(CoreError::Backend(format!(
+                "gemma: layer_output_scale shape mismatch at layer {}: {:?}, expected [1] or [{}]",
+                layer, scale_meta.shape, hidden_size
+            )));
+        }
+    }
+    Ok(Some(GemmaPerLayerInputSpec {
+        token_embd_name,
+        model_proj_name,
+        proj_norm_name,
+        per_total_dim,
+        per_layer_dim,
+    }))
 }

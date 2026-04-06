@@ -493,6 +493,83 @@ kernel void mv_i8(
         acc += x[i] * float(row_ptr[i]);
     out[gid] = acc * scale;
 }
+
+// Fused QKV projection (f16 weights).
+// q_out[r] = dot(A_q[r], x), k_out[r] = dot(A_k[r], x), v_out[r] = dot(A_v[r], x)
+kernel void mv_qkv_f16(
+    device const ushort* A_q      [[buffer(0)]],
+    device const ushort* A_k      [[buffer(1)]],
+    device const ushort* A_v      [[buffer(2)]],
+    device const float*  x        [[buffer(3)]],
+    device       float*  q_out    [[buffer(4)]],
+    device       float*  k_out    [[buffer(5)]],
+    device       float*  v_out    [[buffer(6)]],
+    constant     uint&   rows_q   [[buffer(7)]],
+    constant     uint&   rows_kv  [[buffer(8)]],
+    constant     uint&   cols     [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = rows_q + rows_kv + rows_kv;
+    if (gid >= total) return;
+    if (gid < rows_q) {
+        device const ushort* row_ptr = A_q + gid * cols;
+        float acc = 0.0f;
+        for (uint i = 0; i < cols; ++i) {
+            acc += x[i] * float(as_type<half>(row_ptr[i]));
+        }
+        q_out[gid] = acc;
+        return;
+    }
+    uint off = gid - rows_q;
+    if (off < rows_kv) {
+        device const ushort* row_ptr = A_k + off * cols;
+        float acc = 0.0f;
+        for (uint i = 0; i < cols; ++i) {
+            acc += x[i] * float(as_type<half>(row_ptr[i]));
+        }
+        k_out[off] = acc;
+        return;
+    }
+    off -= rows_kv;
+    device const ushort* row_ptr = A_v + off * cols;
+    float acc = 0.0f;
+    for (uint i = 0; i < cols; ++i) {
+        acc += x[i] * float(as_type<half>(row_ptr[i]));
+    }
+    v_out[off] = acc;
+}
+
+// Fused dual matrix-vector (f16 weights): out0 and out1 in one launch.
+kernel void mv2_f16(
+    device const ushort* A0      [[buffer(0)]],
+    device const ushort* A1      [[buffer(1)]],
+    device const float*  x       [[buffer(2)]],
+    device       float*  out0    [[buffer(3)]],
+    device       float*  out1    [[buffer(4)]],
+    constant     uint&   rows0   [[buffer(5)]],
+    constant     uint&   rows1   [[buffer(6)]],
+    constant     uint&   cols    [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = rows0 + rows1;
+    if (gid >= total) return;
+    if (gid < rows0) {
+        device const ushort* row_ptr = A0 + gid * cols;
+        float acc = 0.0f;
+        for (uint i = 0; i < cols; ++i) {
+            acc += x[i] * float(as_type<half>(row_ptr[i]));
+        }
+        out0[gid] = acc;
+        return;
+    }
+    uint off = gid - rows0;
+    device const ushort* row_ptr = A1 + off * cols;
+    float acc = 0.0f;
+    for (uint i = 0; i < cols; ++i) {
+        acc += x[i] * float(as_type<half>(row_ptr[i]));
+    }
+    out1[off] = acc;
+}
 "#;
 
 // Apple platform implementation
@@ -507,6 +584,8 @@ pub struct MetalOps {
     pub pso_rope_half: ComputePipelineState,
     pub pso_mv_f16: ComputePipelineState,
     pub pso_mv_i8: ComputePipelineState,
+    pub pso_mv_qkv_f16: ComputePipelineState,
+    pub pso_mv2_f16: ComputePipelineState,
     pub pso_add_f32: ComputePipelineState,
     pub pso_silu_mul_f32: ComputePipelineState,
     x_buf: Option<Buffer>,
@@ -536,11 +615,13 @@ impl MetalOps {
         let pso_rope_half = build_pso_ops(&device, &lib, "rope_half_f32")?;
         let pso_mv_f16    = build_pso_ops(&device, &lib, "mv_f16")?;
         let pso_mv_i8     = build_pso_ops(&device, &lib, "mv_i8")?;
+        let pso_mv_qkv_f16= build_pso_ops(&device, &lib, "mv_qkv_f16")?;
+        let pso_mv2_f16   = build_pso_ops(&device, &lib, "mv2_f16")?;
         let pso_add_f32   = build_pso_ops(&device, &lib, "add_f32_inplace")?;
         let pso_silu_mul_f32 = build_pso_ops(&device, &lib, "silu_mul_f32_inplace")?;
         Ok(Self {
             device, queue, _lib: lib,
-            pso_rms_norm, pso_rope_adj, pso_rope_half, pso_mv_f16, pso_mv_i8,
+            pso_rms_norm, pso_rope_adj, pso_rope_half, pso_mv_f16, pso_mv_i8, pso_mv_qkv_f16, pso_mv2_f16,
             pso_add_f32, pso_silu_mul_f32,
             x_buf: None, w_buf: None, out_buf: None,
             tensor_cache: std::collections::HashMap::new(),
@@ -814,6 +895,101 @@ impl MetalOps {
         Ok(())
     }
 
+    pub fn logits_qkv_f16(
+        &mut self,
+        x: &[f32],
+        w_q_f16: &[u16],
+        w_k_f16: &[u16],
+        w_v_f16: &[u16],
+        rows_q: usize,
+        rows_k: usize,
+        rows_v: usize,
+        cols: usize,
+        cache_key_q: &str,
+        cache_key_k: &str,
+        cache_key_v: &str,
+        q_out: &mut [f32],
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> anyhow::Result<()> {
+        if rows_k != rows_v {
+            anyhow::bail!("logits_qkv_f16: rows_k ({rows_k}) must equal rows_v ({rows_v})");
+        }
+        if x.len() != cols || q_out.len() != rows_q || k_out.len() != rows_k || v_out.len() != rows_v {
+            anyhow::bail!(
+                "logits_qkv_f16 dims mismatch: x={} q_out={} k_out={} v_out={} expected cols={} rows_q={} rows_k={} rows_v={}",
+                x.len(),
+                q_out.len(),
+                k_out.len(),
+                v_out.len(),
+                cols,
+                rows_q,
+                rows_k,
+                rows_v
+            );
+        }
+        if w_q_f16.len() != rows_q * cols || w_k_f16.len() != rows_k * cols || w_v_f16.len() != rows_v * cols {
+            anyhow::bail!(
+                "logits_qkv_f16 weight dims mismatch: q={} k={} v={} expected q={} k={} v={}",
+                w_q_f16.len(),
+                w_k_f16.len(),
+                w_v_f16.len(),
+                rows_q * cols,
+                rows_k * cols,
+                rows_v * cols
+            );
+        }
+
+        if !self.tensor_cache.contains_key(cache_key_q) {
+            self.tensor_cache.insert(cache_key_q.to_string(), upload_u16(&self.device, w_q_f16)?);
+        }
+        if !self.tensor_cache.contains_key(cache_key_k) {
+            self.tensor_cache.insert(cache_key_k.to_string(), upload_u16(&self.device, w_k_f16)?);
+        }
+        if !self.tensor_cache.contains_key(cache_key_v) {
+            self.tensor_cache.insert(cache_key_v.to_string(), upload_u16(&self.device, w_v_f16)?);
+        }
+        let wq = self.tensor_cache.get(cache_key_q).unwrap();
+        let wk = self.tensor_cache.get(cache_key_k).unwrap();
+        let wv = self.tensor_cache.get(cache_key_v).unwrap();
+
+        ensure_buf_f32(&self.device, &mut self.x_buf, cols)?;
+        let xb = self.x_buf.as_ref().unwrap();
+        write_f32(xb, x)?;
+
+        let q_bytes = (rows_q * std::mem::size_of::<f32>()) as u64;
+        let kv_bytes = (rows_k * std::mem::size_of::<f32>()) as u64;
+        let q_buf = self.device.new_buffer(q_bytes, MTLResourceOptions::StorageModeShared);
+        let k_buf = self.device.new_buffer(kv_bytes, MTLResourceOptions::StorageModeShared);
+        let v_buf = self.device.new_buffer(kv_bytes, MTLResourceOptions::StorageModeShared);
+
+        autoreleasepool(|| {
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            self.encode_qkv_f16(
+                &enc,
+                wq,
+                wk,
+                wv,
+                xb,
+                &q_buf,
+                &k_buf,
+                &v_buf,
+                rows_q,
+                rows_k,
+                cols,
+            );
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        });
+
+        read_f32(&q_buf, q_out)?;
+        read_f32(&k_buf, k_out)?;
+        read_f32(&v_buf, v_out)?;
+        Ok(())
+    }
+
     pub fn encode_rms_norm_f16w(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -833,9 +1009,9 @@ impl MetalOps {
         enc.set_compute_pipeline_state(&self.pso_rms_norm);
         enc.set_buffer(0, Some(x_buf), 0);
         enc.set_buffer(1, Some(w_buf), 0);
-        enc.set_bytes(2, 4, n_ptr);
-        enc.set_bytes(3, 4, eps_ptr);
-        enc.set_buffer(4, Some(out_buf), 0);
+        enc.set_buffer(2, Some(out_buf), 0);
+        enc.set_bytes(3, 4, n_ptr);
+        enc.set_bytes(4, 4, eps_ptr);
         enc.set_bytes(5, 4, add_res_ptr);
         enc.set_threadgroup_memory_length(0, (tgsize * 4) as u64);
 
@@ -898,6 +1074,82 @@ impl MetalOps {
 
         let threads = rows as u64;
         let w = self.pso_mv_f16.thread_execution_width() as u64;
+        let tg = metal::MTLSize { width: w.min(threads), height: 1, depth: 1 };
+        let grid = metal::MTLSize { width: threads, height: 1, depth: 1 };
+        enc.dispatch_threads(grid, tg);
+    }
+
+    pub fn encode_qkv_f16(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w_q: &metal::BufferRef,
+        w_k: &metal::BufferRef,
+        w_v: &metal::BufferRef,
+        x_buf: &metal::BufferRef,
+        q_out: &metal::BufferRef,
+        k_out: &metal::BufferRef,
+        v_out: &metal::BufferRef,
+        rows_q: usize,
+        rows_kv: usize,
+        cols: usize,
+    ) {
+        let rq = rows_q as u32;
+        let rkv = rows_kv as u32;
+        let c = cols as u32;
+        let rq_ptr = (&rq as *const u32).cast();
+        let rkv_ptr = (&rkv as *const u32).cast();
+        let c_ptr = (&c as *const u32).cast();
+
+        enc.set_compute_pipeline_state(&self.pso_mv_qkv_f16);
+        enc.set_buffer(0, Some(w_q), 0);
+        enc.set_buffer(1, Some(w_k), 0);
+        enc.set_buffer(2, Some(w_v), 0);
+        enc.set_buffer(3, Some(x_buf), 0);
+        enc.set_buffer(4, Some(q_out), 0);
+        enc.set_buffer(5, Some(k_out), 0);
+        enc.set_buffer(6, Some(v_out), 0);
+        enc.set_bytes(7, 4, rq_ptr);
+        enc.set_bytes(8, 4, rkv_ptr);
+        enc.set_bytes(9, 4, c_ptr);
+
+        let threads = (rows_q + rows_kv + rows_kv) as u64;
+        let w = self.pso_mv_qkv_f16.thread_execution_width() as u64;
+        let tg = metal::MTLSize { width: w.min(threads), height: 1, depth: 1 };
+        let grid = metal::MTLSize { width: threads, height: 1, depth: 1 };
+        enc.dispatch_threads(grid, tg);
+    }
+
+    pub fn encode_mv2_f16(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w0: &metal::BufferRef,
+        w1: &metal::BufferRef,
+        x_buf: &metal::BufferRef,
+        out0: &metal::BufferRef,
+        out1: &metal::BufferRef,
+        rows0: usize,
+        rows1: usize,
+        cols: usize,
+    ) {
+        let r0 = rows0 as u32;
+        let r1 = rows1 as u32;
+        let c = cols as u32;
+        let r0_ptr = (&r0 as *const u32).cast();
+        let r1_ptr = (&r1 as *const u32).cast();
+        let c_ptr = (&c as *const u32).cast();
+
+        enc.set_compute_pipeline_state(&self.pso_mv2_f16);
+        enc.set_buffer(0, Some(w0), 0);
+        enc.set_buffer(1, Some(w1), 0);
+        enc.set_buffer(2, Some(x_buf), 0);
+        enc.set_buffer(3, Some(out0), 0);
+        enc.set_buffer(4, Some(out1), 0);
+        enc.set_bytes(5, 4, r0_ptr);
+        enc.set_bytes(6, 4, r1_ptr);
+        enc.set_bytes(7, 4, c_ptr);
+
+        let threads = (rows0 + rows1) as u64;
+        let w = self.pso_mv2_f16.thread_execution_width() as u64;
         let tg = metal::MTLSize { width: w.min(threads), height: 1, depth: 1 };
         let grid = metal::MTLSize { width: threads, height: 1, depth: 1 };
         enc.dispatch_threads(grid, tg);

@@ -175,13 +175,22 @@ impl LlamaGraphState {
             self.ops.encode_rms_norm_f16w(enc, &self.x_buf, w_in_norm, &self.x_norm_buf, hidden, cfg.rms_norm_eps, false);
 
             let w_q = self.get_weight(&format!("model.layers.{layer}.self_attn.q_proj.weight"), None);
-            self.ops.encode_mv_f16(enc, w_q, &self.x_norm_buf, &self.q_buf, hidden, hidden);
-
             let w_k = self.get_weight(&format!("model.layers.{layer}.self_attn.k_proj.weight"), None);
-            self.ops.encode_mv_f16(enc, w_k, &self.x_norm_buf, &self.k_buf, kv_dim, hidden);
-
             let w_v = self.get_weight(&format!("model.layers.{layer}.self_attn.v_proj.weight"), None);
-            self.ops.encode_mv_f16(enc, w_v, &self.x_norm_buf, &self.v_buf, kv_dim, hidden);
+            // Fused QKV projection: one kernel launch instead of three.
+            self.ops.encode_qkv_f16(
+                enc,
+                w_q,
+                w_k,
+                w_v,
+                &self.x_norm_buf,
+                &self.q_buf,
+                &self.k_buf,
+                &self.v_buf,
+                hidden,
+                kv_dim,
+                hidden,
+            );
 
             // MISSING ROPE!!!
             self.ops.encode_rope_adj_f32(enc, &self.q_buf, n_heads, head_dim, pos, cfg.rope_theta);
@@ -205,9 +214,8 @@ impl LlamaGraphState {
             self.ops.encode_rms_norm_f16w(enc, &self.x_buf, w_post, &self.x_norm_buf, hidden, cfg.rms_norm_eps, false);
 
             let w_gate = self.get_weight(&format!("model.layers.{layer}.mlp.gate_proj.weight"), None);
-            self.ops.encode_mv_f16(enc, w_gate, &self.x_norm_buf, &self.gate_buf, cfg.intermediate_size, hidden);
-
             let w_up = self.get_weight(&format!("model.layers.{layer}.mlp.up_proj.weight"), None);
+            self.ops.encode_mv_f16(enc, w_gate, &self.x_norm_buf, &self.gate_buf, cfg.intermediate_size, hidden);
             self.ops.encode_mv_f16(enc, w_up, &self.x_norm_buf, &self.up_buf, cfg.intermediate_size, hidden);
 
             self.ops.encode_silu_mul_f32_inplace(enc, &self.gate_buf, &self.up_buf, cfg.intermediate_size);

@@ -313,30 +313,29 @@ impl QwenRunner {
                     )));
                 }
                 q_raw.resize(q_shape[0], 0.0);
-                self.linear_f16_out_in(
-                    &x_norm,
-                    &format!("language_model.model.layers.{layer}.self_attn.q_proj.weight"),
-                    q_raw.len(),
-                    hidden,
-                    &mut q_raw,
-                )?;
-
                 k.resize(kv_dim, 0.0);
                 v.resize(kv_dim, 0.0);
-                self.linear_f16_out_in(
+                let q_name = format!("language_model.model.layers.{layer}.self_attn.q_proj.weight");
+                let k_name = format!("language_model.model.layers.{layer}.self_attn.k_proj.weight");
+                let v_name = format!("language_model.model.layers.{layer}.self_attn.v_proj.weight");
+                let fused_qkv = self.linear_qkv_f16_out_in(
                     &x_norm,
-                    &format!("language_model.model.layers.{layer}.self_attn.k_proj.weight"),
+                    &q_name,
+                    q_raw.len(),
+                    &k_name,
+                    kv_dim,
+                    &v_name,
                     kv_dim,
                     hidden,
+                    &mut q_raw,
                     &mut k,
-                )?;
-                self.linear_f16_out_in(
-                    &x_norm,
-                    &format!("language_model.model.layers.{layer}.self_attn.v_proj.weight"),
-                    kv_dim,
-                    hidden,
                     &mut v,
                 )?;
+                if !fused_qkv {
+                    self.linear_f16_out_in(&x_norm, &q_name, q_raw.len(), hidden, &mut q_raw)?;
+                    self.linear_f16_out_in(&x_norm, &k_name, kv_dim, hidden, &mut k)?;
+                    self.linear_f16_out_in(&x_norm, &v_name, kv_dim, hidden, &mut v)?;
+                }
 
                 // q and optional gate.
                 let q_main_dim = n_heads * head_dim;
@@ -1174,6 +1173,93 @@ impl QwenRunner {
             }
         }
         Ok(())
+    }
+
+    fn linear_qkv_f16_out_in(
+        &mut self,
+        x: &[f32],
+        q_weight_name: &str,
+        q_out_dim: usize,
+        k_weight_name: &str,
+        k_out_dim: usize,
+        v_weight_name: &str,
+        v_out_dim: usize,
+        in_dim: usize,
+        q_out: &mut [f32],
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> Result<bool, CoreError> {
+        if self.metal_ops.is_none() {
+            return Ok(false);
+        }
+        if x.len() != in_dim || q_out.len() != q_out_dim || k_out.len() != k_out_dim || v_out.len() != v_out_dim {
+            return Err(CoreError::Backend(format!(
+                "qwen qkv dims mismatch: x={} q={} k={} v={} expected in={} q_out={} k_out={} v_out={}",
+                x.len(), q_out.len(), k_out.len(), v_out.len(), in_dim, q_out_dim, k_out_dim, v_out_dim
+            )));
+        }
+
+        let q_resolved = self.resolve_tensor_name(q_weight_name);
+        let k_resolved = self.resolve_tensor_name(k_weight_name);
+        let v_resolved = self.resolve_tensor_name(v_weight_name);
+
+        let q_meta = self.file.tensor_index(&q_resolved).ok_or_else(|| {
+            CoreError::Backend(format!("unknown tensor {q_resolved}"))
+        })?;
+        let k_meta = self.file.tensor_index(&k_resolved).ok_or_else(|| {
+            CoreError::Backend(format!("unknown tensor {k_resolved}"))
+        })?;
+        let v_meta = self.file.tensor_index(&v_resolved).ok_or_else(|| {
+            CoreError::Backend(format!("unknown tensor {v_resolved}"))
+        })?;
+
+        if q_meta.shape.len() != 2 || k_meta.shape.len() != 2 || v_meta.shape.len() != 2 {
+            return Err(CoreError::Backend(format!(
+                "qwen qkv fused expects 2D weights, got q={:?} k={:?} v={:?}",
+                q_meta.shape, k_meta.shape, v_meta.shape
+            )));
+        }
+        if q_meta.shape != [q_out_dim, in_dim]
+            || k_meta.shape != [k_out_dim, in_dim]
+            || v_meta.shape != [v_out_dim, in_dim]
+        {
+            return Err(CoreError::Backend(format!(
+                "qwen qkv fused shape mismatch: q={:?} k={:?} v={:?} expected q=[{},{}] k=[{},{}] v=[{},{}]",
+                q_meta.shape, k_meta.shape, v_meta.shape, q_out_dim, in_dim, k_out_dim, in_dim, v_out_dim, in_dim
+            )));
+        }
+        if q_meta.dtype != "f16" || k_meta.dtype != "f16" || v_meta.dtype != "f16" {
+            return Ok(false);
+        }
+
+        let wq = self.tensor_f16(q_weight_name)?;
+        let wk = self.tensor_f16(k_weight_name)?;
+        let wv = self.tensor_f16(v_weight_name)?;
+        let wq = unsafe { std::slice::from_raw_parts(wq.as_ptr(), wq.len()) };
+        let wk = unsafe { std::slice::from_raw_parts(wk.as_ptr(), wk.len()) };
+        let wv = unsafe { std::slice::from_raw_parts(wv.as_ptr(), wv.len()) };
+
+        self.metal_ops
+            .as_mut()
+            .unwrap()
+            .logits_qkv_f16(
+                x,
+                wq,
+                wk,
+                wv,
+                q_out_dim,
+                k_out_dim,
+                v_out_dim,
+                in_dim,
+                &q_resolved,
+                &k_resolved,
+                &v_resolved,
+                q_out,
+                k_out,
+                v_out,
+            )
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        Ok(true)
     }
 }
 

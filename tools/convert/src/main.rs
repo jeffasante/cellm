@@ -526,7 +526,7 @@ fn handle_gguf_not_yet_supported(_args: &Args, gguf_path: &Path) -> Result<()> {
     summary.sort();
     let summary = summary.join(", ");
 
-    convert_gguf_llama_to_cellm(_args, gguf_path, &summary)
+    convert_gguf_to_cellm(_args, gguf_path, &summary)
 }
 
 #[derive(Debug)]
@@ -771,7 +771,7 @@ struct GgufOutTensor {
     layer_idx: Option<usize>,
 }
 
-fn convert_gguf_llama_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> Result<()> {
+fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> Result<()> {
     let f = File::open(gguf_path).with_context(|| format!("open {:?}", gguf_path))?;
     let mmap = unsafe { Mmap::map(&f).with_context(|| format!("mmap {:?}", gguf_path))? };
     let parsed = parse_gguf(&mmap)?;
@@ -781,12 +781,34 @@ fn convert_gguf_llama_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str
         .architecture
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-    if arch != "llama" {
-        anyhow::bail!(
-            "GGUF architecture {:?} is not supported yet. Current GGUF conversion path supports llama only.",
-            arch
-        );
-    }
+    let (model_type, source_model_type, map_fn, required_fn, ffn_gate_probe_name): (
+        &str,
+        &str,
+        fn(&str) -> Option<(String, bool, Option<usize>)>,
+        fn(usize) -> Vec<String>,
+        &str,
+    ) = match arch.as_str() {
+        "llama" => (
+            "llama",
+            "llama",
+            map_gguf_llama_tensor_name,
+            required_llama_tensor_names,
+            "blk.0.ffn_gate.weight",
+        ),
+        "gemma4" => (
+            "gemma4_text",
+            "gemma4",
+            map_gguf_gemma4_tensor_name,
+            required_gemma4_tensor_names,
+            "blk.0.ffn_gate.weight",
+        ),
+        _ => {
+            anyhow::bail!(
+                "GGUF architecture {:?} is not supported yet. Current GGUF conversion path supports llama and gemma4.",
+                arch
+            );
+        }
+    };
 
     let mut by_src_name: HashMap<&str, &GgufTensorInfo> = HashMap::new();
     for t in &parsed.tensors {
@@ -795,7 +817,7 @@ fn convert_gguf_llama_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str
 
     let mut out_tensors: Vec<GgufOutTensor> = Vec::new();
     for src in &parsed.tensors {
-        let Some((dst_name, reverse_2d, layer_idx)) = map_gguf_llama_tensor_name(&src.name) else {
+        let Some((dst_name, reverse_2d, layer_idx)) = map_fn(&src.name) else {
             continue;
         };
         let numel = src
@@ -856,7 +878,7 @@ fn convert_gguf_llama_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str
     out_tensors.sort_by(|a, b| a.name.cmp(&b.name));
 
     if out_tensors.is_empty() {
-        anyhow::bail!("no llama GGUF tensors were mapped from {:?}", gguf_path);
+        anyhow::bail!("no GGUF tensors were mapped for architecture={} from {:?}", arch, gguf_path);
     }
 
     let num_layers = parsed.meta.block_count.unwrap_or_else(|| {
@@ -868,13 +890,13 @@ fn convert_gguf_llama_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str
             .unwrap_or(0)
     });
     if num_layers == 0 {
-        anyhow::bail!("failed to infer llama layer count from GGUF");
+        anyhow::bail!("failed to infer layer count from GGUF (arch={})", arch);
     }
 
     let mapped_names: std::collections::HashSet<&str> =
         out_tensors.iter().map(|t| t.name.as_str()).collect();
     let mut missing: Vec<String> = Vec::new();
-    for req in required_llama_tensor_names(num_layers) {
+    for req in required_fn(num_layers) {
         if !mapped_names.contains(req.as_str()) {
             missing.push(req);
         }
@@ -888,7 +910,8 @@ fn convert_gguf_llama_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str
             .collect::<Vec<_>>()
             .join(", ");
         anyhow::bail!(
-            "mapped GGUF is missing required llama tensors (showing up to 20): {}{}",
+            "mapped GGUF is missing required tensors for {} (showing up to 20): {}{}",
+            arch,
             preview,
             if missing.len() > 20 { " ..." } else { "" }
         );
@@ -904,18 +927,18 @@ fn convert_gguf_llama_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str
     let hidden_dim = parsed.meta.embedding_length.unwrap_or(embed.dims[0]);
     let intermediate_size = parsed.meta.feed_forward_length.unwrap_or_else(|| {
         by_src_name
-            .get("blk.0.ffn_gate.weight")
+            .get(ffn_gate_probe_name)
             .and_then(|t| t.dims.get(1).copied())
             .unwrap_or(0)
     });
     if intermediate_size == 0 {
-        anyhow::bail!("failed to infer llama intermediate_size from GGUF");
+        anyhow::bail!("failed to infer intermediate_size from GGUF (arch={})", arch);
     }
 
     let num_heads = parsed
         .meta
         .head_count
-        .ok_or_else(|| anyhow::anyhow!("missing llama.attention.head_count in GGUF metadata"))?;
+        .ok_or_else(|| anyhow::anyhow!("missing attention.head_count in GGUF metadata (arch={})", arch))?;
     let num_kv_heads = parsed.meta.head_count_kv.unwrap_or(num_heads);
     let rms_norm_eps = parsed.meta.rms_norm_eps.unwrap_or(1e-5);
     let rope_theta = parsed.meta.rope_freq_base.unwrap_or(10000.0);
@@ -931,8 +954,8 @@ fn convert_gguf_llama_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str
 
     // Compute output offsets.
     let mut header = CellmHeader {
-        model_type: "llama".to_string(),
-        source_model_type: Some("llama".to_string()),
+        model_type: model_type.to_string(),
+        source_model_type: Some(source_model_type.to_string()),
         source_safetensors_format: None,
         text_tensor_prefix: None,
         vision_tensor_prefix: None,
@@ -949,7 +972,7 @@ fn convert_gguf_llama_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str
         eos_token_id: parsed.meta.eos_token_id,
         max_position_embeddings: parsed.meta.context_length,
         tie_word_embeddings,
-        source_torch_dtype: Some("mixed_f16_bf16_f32_from_gguf".to_string()),
+        source_torch_dtype: Some("mixed_f16_bf16_f32_qk_from_gguf".to_string()),
         source_architectures: Some(vec![arch.clone()]),
         source_quantization,
         source_quantization_config: None,
@@ -1055,6 +1078,42 @@ fn required_llama_tensor_names(num_layers: usize) -> Vec<String> {
     out
 }
 
+fn required_gemma_tensor_names(num_layers: usize) -> Vec<String> {
+    let mut out = Vec::with_capacity(2 + num_layers * 13);
+    out.push("model.embed_tokens.weight".to_string());
+    out.push("model.norm.weight".to_string());
+    for i in 0..num_layers {
+        out.push(format!("model.layers.{i}.input_layernorm.weight"));
+        out.push(format!("model.layers.{i}.self_attn.q_proj.weight"));
+        out.push(format!("model.layers.{i}.self_attn.k_proj.weight"));
+        out.push(format!("model.layers.{i}.self_attn.v_proj.weight"));
+        out.push(format!("model.layers.{i}.self_attn.o_proj.weight"));
+        out.push(format!("model.layers.{i}.self_attn.q_norm.weight"));
+        out.push(format!("model.layers.{i}.self_attn.k_norm.weight"));
+        out.push(format!("model.layers.{i}.post_attention_layernorm.weight"));
+        out.push(format!("model.layers.{i}.pre_feedforward_layernorm.weight"));
+        out.push(format!("model.layers.{i}.mlp.gate_proj.weight"));
+        out.push(format!("model.layers.{i}.mlp.up_proj.weight"));
+        out.push(format!("model.layers.{i}.mlp.down_proj.weight"));
+        out.push(format!("model.layers.{i}.post_feedforward_layernorm.weight"));
+    }
+    out
+}
+
+fn required_gemma4_tensor_names(num_layers: usize) -> Vec<String> {
+    let mut out = required_gemma_tensor_names(num_layers);
+    out.push("model.per_layer_token_embd.weight".to_string());
+    out.push("model.per_layer_model_proj.weight".to_string());
+    out.push("model.per_layer_proj_norm.weight".to_string());
+    for i in 0..num_layers {
+        out.push(format!("model.layers.{i}.per_layer_input_gate.weight"));
+        out.push(format!("model.layers.{i}.per_layer_projection.weight"));
+        out.push(format!("model.layers.{i}.post_per_layer_input_norm.weight"));
+        out.push(format!("model.layers.{i}.layer_output_scale.weight"));
+    }
+    out
+}
+
 fn map_gguf_llama_tensor_name(name: &str) -> Option<(String, bool, Option<usize>)> {
     match name {
         "token_embd.weight" => {
@@ -1077,6 +1136,54 @@ fn map_gguf_llama_tensor_name(name: &str) -> Option<(String, bool, Option<usize>
         "ffn_gate.weight" => ("mlp.gate_proj.weight", true),
         "ffn_up.weight" => ("mlp.up_proj.weight", true),
         "ffn_down.weight" => ("mlp.down_proj.weight", true),
+        _ => return None,
+    };
+    Some((
+        format!("model.layers.{layer_idx}.{}", mapped.0),
+        mapped.1,
+        Some(layer_idx),
+    ))
+}
+
+fn map_gguf_gemma4_tensor_name(name: &str) -> Option<(String, bool, Option<usize>)> {
+    match name {
+        "token_embd.weight" => {
+            return Some(("model.embed_tokens.weight".to_string(), true, None))
+        }
+        "per_layer_token_embd.weight" => {
+            return Some(("model.per_layer_token_embd.weight".to_string(), true, None))
+        }
+        "per_layer_model_proj.weight" => {
+            return Some(("model.per_layer_model_proj.weight".to_string(), true, None))
+        }
+        "per_layer_proj_norm.weight" => {
+            return Some(("model.per_layer_proj_norm.weight".to_string(), false, None))
+        }
+        "output_norm.weight" => return Some(("model.norm.weight".to_string(), false, None)),
+        "output.weight" => return Some(("lm_head.weight".to_string(), true, None)),
+        _ => {}
+    }
+    let rest = name.strip_prefix("blk.")?;
+    let (layer_s, suffix) = rest.split_once('.')?;
+    let layer_idx: usize = layer_s.parse().ok()?;
+    let mapped = match suffix {
+        "attn_norm.weight" => ("input_layernorm.weight", false),
+        "attn_q.weight" => ("self_attn.q_proj.weight", true),
+        "attn_k.weight" => ("self_attn.k_proj.weight", true),
+        "attn_v.weight" => ("self_attn.v_proj.weight", true),
+        "attn_output.weight" => ("self_attn.o_proj.weight", true),
+        "attn_q_norm.weight" => ("self_attn.q_norm.weight", false),
+        "attn_k_norm.weight" => ("self_attn.k_norm.weight", false),
+        "post_attention_norm.weight" => ("post_attention_layernorm.weight", false),
+        "ffn_norm.weight" => ("pre_feedforward_layernorm.weight", false),
+        "ffn_gate.weight" => ("mlp.gate_proj.weight", true),
+        "ffn_up.weight" => ("mlp.up_proj.weight", true),
+        "ffn_down.weight" => ("mlp.down_proj.weight", true),
+        "post_ffw_norm.weight" => ("post_feedforward_layernorm.weight", false),
+        "inp_gate.weight" => ("per_layer_input_gate.weight", true),
+        "proj.weight" => ("per_layer_projection.weight", true),
+        "post_norm.weight" => ("post_per_layer_input_norm.weight", false),
+        "layer_output_scale.weight" => ("layer_output_scale.weight", false),
         _ => return None,
     };
     Some((
@@ -1111,25 +1218,31 @@ fn parse_gguf(bytes: &[u8]) -> Result<ParsedGguf> {
                 meta.quant_version = Some(read_gguf_u64_typed(&mut c, t)?)
             }
             "general.alignment" => meta.alignment = Some(read_gguf_u64_typed(&mut c, t)?),
-            "llama.vocab_size" => meta.vocab_size = Some(read_gguf_u64_typed(&mut c, t)? as usize),
-            "llama.embedding_length" => {
+            "llama.vocab_size" | "gemma4.vocab_size" => {
+                meta.vocab_size = Some(read_gguf_u64_typed(&mut c, t)? as usize)
+            }
+            "llama.embedding_length" | "gemma4.embedding_length" => {
                 meta.embedding_length = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
-            "llama.block_count" => meta.block_count = Some(read_gguf_u64_typed(&mut c, t)? as usize),
-            "llama.feed_forward_length" => {
+            "llama.block_count" | "gemma4.block_count" => {
+                meta.block_count = Some(read_gguf_u64_typed(&mut c, t)? as usize)
+            }
+            "llama.feed_forward_length" | "gemma4.feed_forward_length" => {
                 meta.feed_forward_length = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
-            "llama.attention.head_count" => {
+            "llama.attention.head_count" | "gemma4.attention.head_count" => {
                 meta.head_count = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
-            "llama.attention.head_count_kv" => {
+            "llama.attention.head_count_kv" | "gemma4.attention.head_count_kv" => {
                 meta.head_count_kv = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
-            "llama.attention.layer_norm_rms_epsilon" => {
+            "llama.attention.layer_norm_rms_epsilon" | "gemma4.attention.layer_norm_rms_epsilon" => {
                 meta.rms_norm_eps = Some(read_gguf_f32_typed(&mut c, t)?)
             }
-            "llama.rope.freq_base" => meta.rope_freq_base = Some(read_gguf_f32_typed(&mut c, t)?),
-            "llama.context_length" => {
+            "llama.rope.freq_base" | "gemma4.rope.freq_base" => {
+                meta.rope_freq_base = Some(read_gguf_f32_typed(&mut c, t)?)
+            }
+            "llama.context_length" | "gemma4.context_length" => {
                 meta.context_length = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
             "tokenizer.ggml.bos_token_id" => {
@@ -1198,6 +1311,18 @@ fn read_gguf_u64_typed(c: &mut GgufCursor<'_>, t: u32) -> Result<u64> {
         3 => Ok(c.read_i16()? as i64 as u64),
         4 => Ok(c.read_u32()? as u64),
         5 => Ok(c.read_i32()? as i64 as u64),
+        9 => {
+            let elem_t = c.read_u32()?;
+            let n = c.read_u64()? as usize;
+            if n == 0 {
+                anyhow::bail!("expected non-empty GGUF numeric array, got empty array");
+            }
+            let first = read_gguf_u64_typed(c, elem_t)?;
+            for _ in 1..n {
+                skip_gguf_typed_value(c, elem_t)?;
+            }
+            Ok(first)
+        }
         10 => Ok(c.read_u64()?),
         11 => Ok(c.read_i64()? as u64),
         other => anyhow::bail!("expected GGUF integer scalar, got type={}", other),
@@ -1223,6 +1348,16 @@ fn ggml_type_elem_size(t: u32) -> Option<usize> {
 }
 
 fn ggml_tensor_nbytes(t: u32, numel: usize) -> Option<usize> {
+    // Legacy Q4_0 uses 32-element blocks.
+    if t == 2 || t == 3 {
+        let qk = 32usize;
+        if numel % qk != 0 {
+            return None;
+        }
+        let nblk = numel / qk;
+        let bs = if t == 2 { 18 } else { 20 };
+        return nblk.checked_mul(bs);
+    }
     if let Some(elem) = ggml_type_elem_size(t) {
         return numel.checked_mul(elem);
     }
@@ -1233,7 +1368,10 @@ fn ggml_tensor_nbytes(t: u32, numel: usize) -> Option<usize> {
     }
     let nblk = numel / qk;
     match t {
+        10 => nblk.checked_mul(84), // Q2_K block size
+        11 => nblk.checked_mul(110), // Q3_K block size
         12 => nblk.checked_mul(144), // Q4_K block size
+        13 => nblk.checked_mul(176), // Q5_K block size
         14 => nblk.checked_mul(210), // Q6_K block size
         _ => None,
     }
@@ -1246,6 +1384,12 @@ fn write_gguf_tensor_as_f16<W: Write>(
     w: &mut W,
 ) -> Result<()> {
     match src_type {
+        2 => {
+            dequant_q4_0_to_f16(src, numel, w)?;
+        }
+        3 => {
+            dequant_q4_1_to_f16(src, numel, w)?;
+        }
         1 => {
             w.write_all(src)?;
         }
@@ -1258,8 +1402,17 @@ fn write_gguf_tensor_as_f16<W: Write>(
         12 => {
             dequant_q4k_to_f16(src, numel, w)?;
         }
+        13 => {
+            dequant_q5k_to_f16(src, numel, w)?;
+        }
         14 => {
             dequant_q6k_to_f16(src, numel, w)?;
+        }
+        10 => {
+            dequant_q2k_to_f16(src, numel, w)?;
+        }
+        11 => {
+            dequant_q3k_to_f16(src, numel, w)?;
         }
         other => {
             anyhow::bail!(
@@ -1268,6 +1421,125 @@ fn write_gguf_tensor_as_f16<W: Write>(
                 ggml_type_name(other)
             );
         }
+    }
+    Ok(())
+}
+
+fn dequant_q4_0_to_f16<W: Write>(src: &[u8], numel: usize, w: &mut W) -> Result<()> {
+    let qk = 32usize;
+    if numel % qk != 0 {
+        anyhow::bail!("Q4_0 tensor numel {} is not divisible by {}", numel, qk);
+    }
+    let bs = 18usize; // fp16 scale + 16 packed nibbles for 32 values
+    let nblk = numel / qk;
+    if src.len() != nblk * bs {
+        anyhow::bail!(
+            "Q4_0 source size mismatch: got {} bytes, expected {}",
+            src.len(),
+            nblk * bs
+        );
+    }
+    let mut out_f16 = vec![0u16; qk];
+    for bi in 0..nblk {
+        let off = bi * bs;
+        let d = f16::from_bits(u16::from_le_bytes([src[off], src[off + 1]])).to_f32();
+        let qbytes = &src[off + 2..off + bs];
+        for i in 0..16 {
+            let b = qbytes[i];
+            let q0 = (b & 0x0F) as i32 - 8;
+            let q1 = (b >> 4) as i32 - 8;
+            out_f16[2 * i] = f16::from_f32(d * (q0 as f32)).to_bits();
+            out_f16[2 * i + 1] = f16::from_f32(d * (q1 as f32)).to_bits();
+        }
+        w.write_all(cast_slice(&out_f16))?;
+    }
+    Ok(())
+}
+
+fn dequant_q4_1_to_f16<W: Write>(src: &[u8], numel: usize, w: &mut W) -> Result<()> {
+    let qk = 32usize;
+    if numel % qk != 0 {
+        anyhow::bail!("Q4_1 tensor numel {} is not divisible by {}", numel, qk);
+    }
+    let bs = 20usize; // fp16 d + fp16 m + 16 packed nibbles
+    let nblk = numel / qk;
+    if src.len() != nblk * bs {
+        anyhow::bail!(
+            "Q4_1 source size mismatch: got {} bytes, expected {}",
+            src.len(),
+            nblk * bs
+        );
+    }
+    let mut out_f16 = vec![0u16; qk];
+    for bi in 0..nblk {
+        let off = bi * bs;
+        let d = f16::from_bits(u16::from_le_bytes([src[off], src[off + 1]])).to_f32();
+        let m = f16::from_bits(u16::from_le_bytes([src[off + 2], src[off + 3]])).to_f32();
+        let qbytes = &src[off + 4..off + bs];
+        for i in 0..16 {
+            let b = qbytes[i];
+            let q0 = (b & 0x0F) as f32;
+            let q1 = (b >> 4) as f32;
+            out_f16[2 * i] = f16::from_f32(d * q0 + m).to_bits();
+            out_f16[2 * i + 1] = f16::from_f32(d * q1 + m).to_bits();
+        }
+        w.write_all(cast_slice(&out_f16))?;
+    }
+    Ok(())
+}
+
+fn dequant_q2k_to_f16<W: Write>(src: &[u8], numel: usize, w: &mut W) -> Result<()> {
+    let qk = 256usize;
+    if numel % qk != 0 {
+        anyhow::bail!("Q2_K tensor numel {} is not divisible by {}", numel, qk);
+    }
+    let bs = 84usize;
+    let nblk = numel / qk;
+    if src.len() != nblk * bs {
+        anyhow::bail!(
+            "Q2_K source size mismatch: got {} bytes, expected {}",
+            src.len(),
+            nblk * bs
+        );
+    }
+    let mut out_f16 = vec![0u16; qk];
+    let mut vals = vec![0f32; qk];
+    for bi in 0..nblk {
+        let off = bi * bs;
+        let b = &src[off..off + bs];
+        dequantize_q2k_block(b, &mut vals)?;
+        for i in 0..qk {
+            out_f16[i] = f16::from_f32(vals[i]).to_bits();
+        }
+        w.write_all(cast_slice(&out_f16))?;
+    }
+    Ok(())
+}
+
+fn dequant_q3k_to_f16<W: Write>(src: &[u8], numel: usize, w: &mut W) -> Result<()> {
+    let qk = 256usize;
+    if numel % qk != 0 {
+        anyhow::bail!("Q3_K tensor numel {} is not divisible by {}", numel, qk);
+    }
+    let bs = 110usize;
+    let nblk = numel / qk;
+    if src.len() != nblk * bs {
+        anyhow::bail!(
+            "Q3_K source size mismatch: got {} bytes, expected {}",
+            src.len(),
+            nblk * bs
+        );
+    }
+    let mut out_f16 = vec![0u16; qk];
+    let mut vals = vec![0f32; qk];
+    for bi in 0..nblk {
+        let off = bi * bs;
+        let b = &src[off..off + bs];
+        dequantize_q3k_block(b, &mut vals)?;
+        for i in 0..qk {
+            out_f16[i] = f16::from_f32(vals[i]).to_bits();
+        }
+        w.write_all(cast_slice(&out_f16))?;
     }
     Ok(())
 }
@@ -1328,8 +1600,142 @@ fn dequant_q6k_to_f16<W: Write>(src: &[u8], numel: usize, w: &mut W) -> Result<(
     Ok(())
 }
 
+fn dequant_q5k_to_f16<W: Write>(src: &[u8], numel: usize, w: &mut W) -> Result<()> {
+    let qk = 256usize;
+    if numel % qk != 0 {
+        anyhow::bail!("Q5_K tensor numel {} is not divisible by {}", numel, qk);
+    }
+    let bs = 176usize;
+    let nblk = numel / qk;
+    if src.len() != nblk * bs {
+        anyhow::bail!(
+            "Q5_K source size mismatch: got {} bytes, expected {}",
+            src.len(),
+            nblk * bs
+        );
+    }
+    let mut out_f16 = vec![0u16; qk];
+    let mut vals = vec![0f32; qk];
+    for bi in 0..nblk {
+        let off = bi * bs;
+        let b = &src[off..off + bs];
+        dequantize_q5k_block(b, &mut vals)?;
+        for i in 0..qk {
+            out_f16[i] = f16::from_f32(vals[i]).to_bits();
+        }
+        w.write_all(cast_slice(&out_f16))?;
+    }
+    Ok(())
+}
+
 fn read_f16_le_as_f32(lo: u8, hi: u8) -> f32 {
     f16::from_bits(u16::from_le_bytes([lo, hi])).to_f32()
+}
+
+fn dequantize_q2k_block(block: &[u8], out: &mut [f32]) -> Result<()> {
+    if block.len() != 84 || out.len() != 256 {
+        anyhow::bail!(
+            "bad Q2_K block sizes: block={} out={}",
+            block.len(),
+            out.len()
+        );
+    }
+    let d = read_f16_le_as_f32(block[0], block[1]);
+    let dmin = read_f16_le_as_f32(block[2], block[3]);
+    let scales = &block[4..20];
+    let mut q = &block[20..84];
+    let mut y = 0usize;
+    let mut is = 0usize;
+    for _ in (0..256usize).step_by(128) {
+        let mut shift = 0usize;
+        for _ in 0..4usize {
+            let sc0 = scales[is];
+            is += 1;
+            let dl0 = d * ((sc0 & 0x0F) as f32);
+            let ml0 = dmin * ((sc0 >> 4) as f32);
+            for l in 0..16usize {
+                let qv = ((q[l] >> shift) & 0x03) as f32;
+                out[y] = dl0 * qv - ml0;
+                y += 1;
+            }
+
+            let sc1 = scales[is];
+            is += 1;
+            let dl1 = d * ((sc1 & 0x0F) as f32);
+            let ml1 = dmin * ((sc1 >> 4) as f32);
+            for l in 0..16usize {
+                let qv = ((q[l + 16] >> shift) & 0x03) as f32;
+                out[y] = dl1 * qv - ml1;
+                y += 1;
+            }
+            shift += 2;
+        }
+        q = &q[32..];
+    }
+    Ok(())
+}
+
+fn dequantize_q3k_block(block: &[u8], out: &mut [f32]) -> Result<()> {
+    if block.len() != 110 || out.len() != 256 {
+        anyhow::bail!(
+            "bad Q3_K block sizes: block={} out={}",
+            block.len(),
+            out.len()
+        );
+    }
+    let d_all = read_f16_le_as_f32(block[108], block[109]);
+    let mut q = &block[32..96];
+    let hm = &block[0..32];
+    let scales_raw = &block[96..108];
+
+    let kmask1: u32 = 0x03030303;
+    let kmask2: u32 = 0x0f0f0f0f;
+    let mut aux = [0u32; 4];
+    aux[0] = u32::from_le_bytes([scales_raw[0], scales_raw[1], scales_raw[2], scales_raw[3]]);
+    aux[1] = u32::from_le_bytes([scales_raw[4], scales_raw[5], scales_raw[6], scales_raw[7]]);
+    aux[2] = u32::from_le_bytes([scales_raw[8], scales_raw[9], scales_raw[10], scales_raw[11]]);
+    let tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    let mut scales = [0i8; 16];
+    for i in 0..4usize {
+        let b = aux[i].to_le_bytes();
+        for j in 0..4usize {
+            scales[i * 4 + j] = b[j] as i8;
+        }
+    }
+
+    let mut m: u8 = 1;
+    let mut is = 0usize;
+    let mut y = 0usize;
+    for _ in (0..256usize).step_by(128) {
+        let mut shift = 0usize;
+        for _ in 0..4usize {
+            let dl0 = d_all * ((scales[is] as f32) - 32.0);
+            is += 1;
+            for l in 0..16usize {
+                let qv = ((q[l] >> shift) & 0x03) as i8;
+                let h = if (hm[l] & m) != 0 { 0 } else { 4 };
+                out[y] = dl0 * ((qv - h) as f32);
+                y += 1;
+            }
+
+            let dl1 = d_all * ((scales[is] as f32) - 32.0);
+            is += 1;
+            for l in 0..16usize {
+                let qv = ((q[l + 16] >> shift) & 0x03) as i8;
+                let h = if (hm[l + 16] & m) != 0 { 0 } else { 4 };
+                out[y] = dl1 * ((qv - h) as f32);
+                y += 1;
+            }
+            shift += 2;
+            m = m.wrapping_shl(1);
+        }
+        q = &q[32..];
+    }
+    Ok(())
 }
 
 fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
@@ -1415,6 +1821,46 @@ fn dequantize_q6k_block(block: &[u8], out: &mut [f32]) -> Result<()> {
             out[n + l + 64] = d * s2 * (q2 as f32);
             out[n + l + 96] = d * s3 * (q3 as f32);
         }
+    }
+    Ok(())
+}
+
+fn dequantize_q5k_block(block: &[u8], out: &mut [f32]) -> Result<()> {
+    if block.len() != 176 || out.len() != 256 {
+        anyhow::bail!(
+            "bad Q5_K block sizes: block={} out={}",
+            block.len(),
+            out.len()
+        );
+    }
+    let d = read_f16_le_as_f32(block[0], block[1]);
+    let dmin = read_f16_le_as_f32(block[2], block[3]);
+    let scales = &block[4..16];
+    let qh = &block[16..48];
+    let qs = &block[48..176];
+
+    let mut is = 0usize;
+    let mut qoff = 0usize;
+    for j in (0..256usize).step_by(64) {
+        let (sc0, m0) = get_scale_min_k4(is, scales);
+        let (sc1, m1) = get_scale_min_k4(is + 1, scales);
+        let d1 = d * (sc0 as f32);
+        let d2 = d * (sc1 as f32);
+        let min1 = dmin * (m0 as f32);
+        let min2 = dmin * (m1 as f32);
+        for l in 0..32usize {
+            let q = qs[qoff + l];
+            let idx0 = j + l;
+            let idx1 = j + 32 + l;
+            let h0 = ((qh[idx0 >> 3] >> (idx0 & 7)) & 1) as u8;
+            let h1 = ((qh[idx1 >> 3] >> (idx1 & 7)) & 1) as u8;
+            let q0 = ((q & 0x0F) | (h0 << 4)) as f32;
+            let q1 = ((q >> 4) | (h1 << 4)) as f32;
+            out[idx0] = d1 * q0 - min1;
+            out[idx1] = d2 * q1 - min2;
+        }
+        qoff += 32;
+        is += 2;
     }
     Ok(())
 }

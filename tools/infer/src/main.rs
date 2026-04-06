@@ -17,6 +17,8 @@ enum ChatFormat {
     Chatml,
     /// Gemma turn-style: <start_of_turn>user ... <end_of_turn>
     Gemma,
+    /// Gemma 4 turn-style: <|turn>user ... <turn|>
+    Gemma4,
     /// Plain: "System: ...\nUser: ...\nAssistant:"
     Plain,
 }
@@ -258,6 +260,8 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
                 if let Some(tok_path) = args.tokenizer.as_ref() {
                     if tokenizer_config_chatml(tok_path) {
                         ChatFormat::Chatml
+                    } else if tokenizer_config_gemma4_turn(tok_path) {
+                        ChatFormat::Gemma4
                     } else if tokenizer_config_gemma_turn(tok_path) {
                         ChatFormat::Gemma
                     } else {
@@ -487,6 +491,7 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
     Ok(())
 }
 
+
 fn strip_think_blocks(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -554,15 +559,20 @@ fn infer_qwen_kv_head_dim(file: &CellmFile) -> Result<usize> {
 fn infer_gemma_kv_head_dim(file: &CellmFile) -> Result<usize> {
     let h = &file.header;
     let kv_heads = h.num_kv_heads.max(1);
+    let mut max_head_dim = 0usize;
     for t in &h.tensors {
         if t.name.contains(".self_attn.k_proj.weight") && t.shape.len() == 2 {
             let kv_dim = t.shape[0];
             if kv_dim % kv_heads == 0 {
-                return Ok(kv_dim / kv_heads);
+                max_head_dim = max_head_dim.max(kv_dim / kv_heads);
             }
         }
     }
-    anyhow::bail!("unable to infer gemma KV head_dim (no self_attn.k_proj.weight found in tensor list)")
+    if max_head_dim > 0 {
+        Ok(max_head_dim)
+    } else {
+        anyhow::bail!("unable to infer gemma KV head_dim (no self_attn.k_proj.weight found in tensor list)")
+    }
 }
 
 fn build_prompt_text(
@@ -608,6 +618,14 @@ fn build_prompt_text(
                 "<start_of_turn>user\n{user_text}<end_of_turn>\n<start_of_turn>model\n"
             )
         }
+        ChatFormat::Gemma4 => {
+            let user_text = if sys.is_empty() {
+                prompt.to_string()
+            } else {
+                format!("{sys}\n\n{prompt}")
+            };
+            format!("<|turn>user\n{user_text}<turn|>\n<|turn>model\n")
+        }
         ChatFormat::Auto | ChatFormat::Plain => match system {
             Some(sys) if !sys.trim().is_empty() => {
                 format!("System: {sys}\nUser: {prompt}\nAssistant:")
@@ -649,6 +667,23 @@ fn tokenizer_config_gemma_turn(tokenizer_json_path: &std::path::Path) -> bool {
         return false;
     };
     tpl.contains("<start_of_turn>") && tpl.contains("<end_of_turn>")
+}
+
+fn tokenizer_config_gemma4_turn(tokenizer_json_path: &std::path::Path) -> bool {
+    let Some(dir) = tokenizer_json_path.parent() else {
+        return false;
+    };
+    let cfg_path = dir.join("tokenizer_config.json");
+    let Ok(bytes) = std::fs::read(&cfg_path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let Some(tpl) = v.get("chat_template").and_then(|x| x.as_str()) else {
+        return false;
+    };
+    tpl.contains("<|turn>") && tpl.contains("<turn|>")
 }
 
 fn tokenizer_config_contains_think_prefill(tokenizer_json_path: &std::path::Path) -> bool {

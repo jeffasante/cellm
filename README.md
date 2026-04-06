@@ -17,6 +17,53 @@ Not a wrapper around `llama.cpp`. Not a port of `vLLM`. A new runtime designed f
 - [ ] **Android Integration**: Native Kotlin/JNI bindings and performance tuning (Coming Soon).
 - [ ] **Qwen iOS Porting**: Integrate and optimize Qwen inference path for native iOS deployment.
 
+## Mobile Inference Dataflow
+
+```mermaid
+flowchart LR
+    U["User Prompt"] --> API["App/UI Request Layer"]
+    API --> ORCH["CPU Orchestrator"]
+    ORCH --> TOK[Tokenizer]
+    TOK --> FMT["Prompt Formatter"]
+    FMT --> SCH["Decode Scheduler / Batcher"]
+
+    SCH -->|"prefill/decode jobs"| ENG["Engine Dispatcher"]
+    ENG -->|backend=CPU| CPUPATH["CPU Kernels"]
+    ENG -->|backend=Metal| METAL["Metal Kernels"]
+
+    METAL --> MATMUL["QKV / MLP MatMul"]
+    METAL --> ATTN["Attention + GroupKV Cache"]
+    METAL --> NORM["RMSNorm / RoPE / Logits"]
+    MATMUL --> SAMPLER
+    ATTN --> SAMPLER
+    NORM --> SAMPLER
+    CPUPATH --> SAMPLER["Sampler + Stop Rules"]
+
+    SAMPLER --> DETOK[Detokenizer]
+    DETOK --> STREAM["Streaming Output"]
+    STREAM --> API
+    API --> U
+
+    subgraph ModelAssets["Local Model Assets"]
+      W[".cellm / .cellmd mmap Weights"]
+      T["tokenizer.json + config"]
+    end
+
+    W --> ENG
+    T --> TOK
+
+    subgraph SessionState["Per-Session State"]
+      KV["KV Cache (GroupKV layout)"]
+      PT["Page Table / Sequence Cursor"]
+      TH["Thermal + QoS Policy"]
+    end
+
+    SCH --> KV
+    SCH --> PT
+    ORCH --> TH
+    TH --> SCH
+```
+
 ---
 
 ## Why cellm?
@@ -62,7 +109,7 @@ Notes:
 - `--chat` auto-detects ChatML-style tokens (for SmolLM2 this uses `<|im_start|>` / `<|im_end|>`). Without chat formatting, many base models behave like “text completion” and may not answer directly.
 - Use `--chat-format plain` to force the simpler `User:/Assistant:` style. `--chat-format auto` (default) only uses ChatML when the tokenizer advertises a chat template in `tokenizer_config.json`.
 - `--max-layers` is only for debugging; using fewer layers will significantly degrade quality.
-- `--backend metal` now performs a Metal kernel smoke check before inference, then falls back to current CPU math paths (full Metal forward kernels are still in progress).
+- Backend selection is strict in this build: `--backend cpu` runs CPU only, and `--backend metal` runs Metal only (no automatic fallback).
 
 Run with backend selection:
 ```bash
@@ -75,7 +122,7 @@ cargo run --release --bin infer -- \
   --gen 16 \
   --backend cpu
 
-# Metal (auto-falls back to CPU if unavailable)
+# Metal (strict: errors if Metal backend is unavailable)
 cargo run --release --bin infer -- \
   --model models/smollm2-135m-int8.cellm \
   --tokenizer models/hf/smollm2-135m/tokenizer.json \
@@ -84,6 +131,33 @@ cargo run --release --bin infer -- \
   --gen 16 \
   --backend metal
 ```
+
+### Fused Kernel Status (April 5, 2026)
+
+- Added fused Metal QKV kernel wiring (`q_proj + k_proj + v_proj` in one launch) in:
+  - Llama runtime path
+  - Gemma runtime path
+  - Qwen runtime path
+- Added a high-level MetalOps fused API (`logits_qkv_f16`) with cached GPU weights.
+- Llama graph path (`CELLM_LLAMA_ENABLE_GRAPH=1`) remains the fastest path for SmolLM2 in this repo.
+
+Quick benchmark snapshot (`--kv-encoding f16`, `temperature=0`):
+
+| Model | Backend | Config | Prefill | Decode |
+|---|---|---|---:|---:|
+| SmolLM2-135M | CPU | full layers, gen=12 | 50.20s | 33.32s |
+| SmolLM2-135M | Metal | full layers, gen=12 | 74.30s | 50.42s |
+| SmolLM2-135M | Metal + graph | `CELLM_LLAMA_ENABLE_GRAPH=1`, gen=12 | 0.48s | 0.32s |
+| Qwen3.5-0.8B-int8 | CPU | full layers, gen=8 | 322.27s | 26.26s |
+| Qwen3.5-0.8B-int8 | Metal | full layers, gen=8 | 100.08s | 8.15s |
+| Gemma-3-1B-it-int8 | CPU | full layers, gen=8 | 284.72s | 140.40s |
+| Gemma-3-1B-it-int8 | Metal | full layers, gen=8 | 4.97s | 2.36s |
+| Gemma-4-E2B-it-Q4_K_M-from-gguf | CPU | `--max-layers 8`, gen=4 | 250.33s | 66.64s |
+| Gemma-4-E2B-it-Q4_K_M-from-gguf | Metal | `--max-layers 8`, gen=4 | 4.48s | 0.86s |
+
+Notes:
+- Gemma-4 conversion quality is still unstable for this GGUF-converted checkpoint (latency is improved on Metal, output quality still needs parity fixes).
+- The tokenizer warning lines for missing special tokens do not block inference, but the tokenizer files should still be cleaned up for production.
 
 KV encoding selection (safe opt-in):
 - Default remains current behavior: `--kv-encoding f16`

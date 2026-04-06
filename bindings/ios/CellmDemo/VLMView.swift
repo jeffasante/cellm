@@ -233,12 +233,16 @@ struct VLMView: View {
                     self.output = prettyOutput(text)
                     self.activeBackend = eng.activeBackend
                     if let t = eng.lastTimings {
+                        let patchMs = finiteMs(t.patchMs)
+                        let encoderMs = finiteMs(t.encoderMs)
+                        let decodeMs = finiteMs(t.decodeMs)
+                        let totalMs = finiteMs(t.totalMs)
                         var summary = String(
                             format: "patch %.1f ms • encoder %.1f ms • decode %.1f ms • total %.1f ms",
-                            t.patchMs,
-                            t.encoderMs,
-                            t.decodeMs,
-                            t.totalMs
+                            patchMs,
+                            encoderMs,
+                            decodeMs,
+                            totalMs
                         )
                         if let maxPair = t.encoderLayerMs.enumerated().max(by: { $0.element < $1.element }) {
                             summary += String(
@@ -332,6 +336,11 @@ struct VLMView: View {
         imageBytes = nil
         image = nil
         downloadStatus = "Local sample files deleted."
+    }
+
+    private func finiteMs(_ x: Double) -> Double {
+        guard x.isFinite, x >= 0.0 else { return 0.0 }
+        return x
     }
 
     private func forceRedownload() {

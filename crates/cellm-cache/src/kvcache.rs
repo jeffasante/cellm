@@ -41,15 +41,431 @@ pub struct CpuKvStorage {
 
 #[derive(Debug)]
 pub struct CpuTurboQuantKvStorage {
-    k_q: Vec<i8>,
-    v_q: Vec<i8>,
+    k_q: Vec<u8>,
+    v_q: Vec<u8>,
     k_scale: Vec<f32>,
     v_scale: Vec<f32>,
+    k_res_sign: Vec<u8>,
+    v_res_sign: Vec<u8>,
+    k_res_scale: Vec<f32>,
+    v_res_scale: Vec<f32>,
+    row_bytes: usize,
     kv_dim: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    tq: TurboQuantParams,
+}
+
+#[derive(Debug, Clone)]
+struct TurboQuantParams {
+    rot_sign: Vec<f32>,
+    qjl_sign: Vec<f32>,
+    outlier_mask: Vec<bool>,
+    bit_offsets: Vec<u32>,
+    row_bits: u32,
+    row_bytes: usize,
+    inv_sqrt_head_dim: f32,
+}
+
+impl TurboQuantParams {
+    const BASE_BITS: u8 = 8;
+    const OUTLIER_BITS: u8 = 8;
+
+    fn new(kv_dim: usize, n_kv_heads: usize, head_dim: usize, seed: u64) -> Self {
+        let mut s1 = seed;
+        let mut s2 = seed ^ 0x9E37_79B9_7F4A_7C15u64;
+        let mut rot_sign = Vec::with_capacity(kv_dim);
+        let mut qjl_sign = Vec::with_capacity(kv_dim);
+        let mut outlier_mask = vec![false; kv_dim];
+        // Outlier mask is selected per head to avoid mixing cross-head statistics.
+        let outliers_per_head = (head_dim / 4).max(1);
+        for h in 0..n_kv_heads {
+            for i in 0..head_dim {
+                let g = h * head_dim + i;
+                let r1 = splitmix64_next(&mut s1);
+                let r2 = splitmix64_next(&mut s2);
+                rot_sign.push(if (r1 & 1) == 0 { 1.0 } else { -1.0 });
+                qjl_sign.push(if (r2 & 1) == 0 { 1.0 } else { -1.0 });
+                if i < outliers_per_head {
+                    outlier_mask[g] = true;
+                }
+            }
+        }
+        let mut bit_offsets = vec![0u32; kv_dim];
+        let mut running = 0u32;
+        for i in 0..kv_dim {
+            bit_offsets[i] = running;
+            running += if outlier_mask[i] {
+                Self::OUTLIER_BITS as u32
+            } else {
+                Self::BASE_BITS as u32
+            };
+        }
+        let row_bits = running;
+        let row_bytes = row_bits.div_ceil(8) as usize;
+        Self {
+            rot_sign,
+            qjl_sign,
+            outlier_mask,
+            bit_offsets,
+            row_bits,
+            row_bytes,
+            inv_sqrt_head_dim: 1.0f32 / (head_dim.max(1) as f32).sqrt(),
+        }
+    }
+
+    #[inline]
+    fn bits_for_dim(&self, dim: usize) -> u8 {
+        if self.outlier_mask.get(dim).copied().unwrap_or(false) {
+            Self::OUTLIER_BITS
+        } else {
+            Self::BASE_BITS
+        }
+    }
+
+    #[inline]
+    fn codebook(bits: u8) -> &'static [f32] {
+        // Lloyd-Max-like fixed centroids for near-Gaussian coordinates.
+        const CB3: [f32; 8] = [-1.874, -1.204, -0.675, -0.225, 0.225, 0.675, 1.204, 1.874];
+        const CB4: [f32; 16] = [
+            -2.300, -1.710, -1.290, -0.970, -0.700, -0.460, -0.240, -0.070,
+            0.070, 0.240, 0.460, 0.700, 0.970, 1.290, 1.710, 2.300,
+        ];
+        match bits {
+            4 => &CB4,
+            _ => &CB3,
+        }
+    }
+
+    #[inline]
+    fn nearest_codebook_index(bits: u8, value: f32) -> u8 {
+        if bits > 4 {
+            let levels = 1u32 << bits.min(8);
+            let min_v = -3.0f32;
+            let max_v = 3.0f32;
+            let step = (max_v - min_v) / (levels.saturating_sub(1) as f32);
+            let idx = ((value.clamp(min_v, max_v) - min_v) / step).round() as i32;
+            return idx.clamp(0, (levels as i32) - 1) as u8;
+        }
+        let cb = Self::codebook(bits);
+        let mut best_idx = 0usize;
+        let mut best_dist = f32::INFINITY;
+        for (i, &c) in cb.iter().enumerate() {
+            let d = (value - c).abs();
+            if d < best_dist {
+                best_dist = d;
+                best_idx = i;
+            }
+        }
+        best_idx as u8
+    }
+
+    #[inline]
+    fn dequant_centroid(bits: u8, idx: u8) -> f32 {
+        if bits > 4 {
+            let levels = 1u32 << bits.min(8);
+            let min_v = -3.0f32;
+            let max_v = 3.0f32;
+            let step = (max_v - min_v) / (levels.saturating_sub(1) as f32);
+            let i = (idx as u32).min(levels.saturating_sub(1));
+            return min_v + (i as f32) * step;
+        }
+        let cb = Self::codebook(bits);
+        cb[(idx as usize).min(cb.len().saturating_sub(1))]
+    }
+
+    #[inline]
+    fn get_q_idx(&self, row: &[u8], dim: usize) -> u8 {
+        let bits = self.bits_for_dim(dim) as u32;
+        let mut remain = bits;
+        let mut bit_pos = self.bit_offsets[dim] as usize;
+        let mut out = 0u32;
+        let mut out_shift = 0u32;
+        while remain > 0 {
+            let byte_idx = bit_pos / 8;
+            let intra = (bit_pos % 8) as u32;
+            let take = remain.min(8 - intra);
+            let mask = ((1u32 << take) - 1) << intra;
+            let chunk = ((row[byte_idx] as u32) & mask) >> intra;
+            out |= chunk << out_shift;
+            out_shift += take;
+            remain -= take;
+            bit_pos += take as usize;
+        }
+        out as u8
+    }
+
+    #[inline]
+    fn set_q_idx(&self, row: &mut [u8], dim: usize, val: u8) {
+        let bits = self.bits_for_dim(dim) as u32;
+        let mut remain = bits;
+        let mut bit_pos = self.bit_offsets[dim] as usize;
+        let mut in_shift = 0u32;
+        while remain > 0 {
+            let byte_idx = bit_pos / 8;
+            let intra = (bit_pos % 8) as u32;
+            let take = remain.min(8 - intra);
+            let mask = ((1u32 << take) - 1) << intra;
+            let chunk = ((val as u32) >> in_shift) & ((1u32 << take) - 1);
+            let cur = row[byte_idx] as u32;
+            row[byte_idx] = ((cur & !mask) | (chunk << intra)) as u8;
+            in_shift += take;
+            remain -= take;
+            bit_pos += take as usize;
+        }
+    }
+
+    #[inline]
+    fn is_uniform_8bit(&self, kv_dim: usize) -> bool {
+        self.row_bits as usize == kv_dim.saturating_mul(8)
+    }
+}
+
+#[inline]
+fn splitmix64_next(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15u64);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9u64);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EBu64);
+    z ^ (z >> 31)
+}
+
+#[inline]
+fn fwht_inplace(x: &mut [f32]) {
+    let n = x.len();
+    let mut h = 1usize;
+    while h < n {
+        let stride = h * 2;
+        let mut i = 0usize;
+        while i < n {
+            for j in 0..h {
+                let a = x[i + j];
+                let b = x[i + j + h];
+                x[i + j] = a + b;
+                x[i + j + h] = a - b;
+            }
+            i += stride;
+        }
+        h *= 2;
+    }
+}
+
+#[inline]
+fn rotate_head_forward(
+    src: &[f32],
+    rot_sign: &[f32],
+    out: &mut [f32],
+    inv_sqrt_head_dim: f32,
+) {
+    debug_assert_eq!(src.len(), rot_sign.len());
+    debug_assert_eq!(src.len(), out.len());
+    for i in 0..src.len() {
+        out[i] = src[i] * rot_sign[i];
+    }
+    if src.len().is_power_of_two() {
+        fwht_inplace(out);
+        for v in out.iter_mut() {
+            *v *= inv_sqrt_head_dim;
+        }
+    }
+}
+
+#[inline]
+fn rotate_head_inverse_inplace(x: &mut [f32], rot_sign: &[f32], inv_sqrt_head_dim: f32) {
+    debug_assert_eq!(x.len(), rot_sign.len());
+    if x.len().is_power_of_two() {
+        fwht_inplace(x);
+        for v in x.iter_mut() {
+            *v *= inv_sqrt_head_dim;
+        }
+    }
+    for i in 0..x.len() {
+        x[i] *= rot_sign[i];
+    }
+}
+
+#[inline]
+fn turboquant_compress_row_f32(
+    src: &[f32],
+    dst_q_packed: &mut [u8],
+    dst_res_sign: &mut [u8],
+    scale_out: &mut f32,
+    res_scale_out: &mut f32,
+    n_kv_heads: usize,
+    head_dim: usize,
+    tq: &TurboQuantParams,
+) {
+    debug_assert_eq!(src.len(), n_kv_heads * head_dim);
+    debug_assert_eq!(src.len(), dst_res_sign.len());
+    debug_assert_eq!(dst_q_packed.len(), tq.row_bytes);
+    let d = src.len();
+    if d == 0 {
+        *scale_out = 1.0;
+        *res_scale_out = 0.0;
+        return;
+    }
+    dst_q_packed.fill(0);
+    let mut rotated = vec![0.0f32; d];
+    for h in 0..n_kv_heads {
+        let off = h * head_dim;
+        rotate_head_forward(
+            &src[off..off + head_dim],
+            &tq.rot_sign[off..off + head_dim],
+            &mut rotated[off..off + head_dim],
+            tq.inv_sqrt_head_dim,
+        );
+    }
+    let mut norm2 = 0.0f32;
+    for &xr in rotated.iter() {
+        norm2 += xr * xr;
+    }
+    let scale = norm2.sqrt().max(1e-12);
+    *scale_out = scale;
+    let inv = 1.0f32 / scale;
+    let mut res2 = 0.0f32;
+    for (dim, &xr) in rotated.iter().enumerate() {
+        let xr_unit = xr * inv;
+        let bits = tq.bits_for_dim(dim);
+        let q_idx = TurboQuantParams::nearest_codebook_index(bits, xr_unit);
+        let deq = TurboQuantParams::dequant_centroid(bits, q_idx);
+        tq.set_q_idx(dst_q_packed, dim, q_idx);
+        let residual = xr_unit - deq;
+        let sketch = tq.qjl_sign[dim] * residual;
+        dst_res_sign[dim] = if sketch >= 0.0 { 1 } else { 0 };
+        res2 += residual * residual;
+    }
+    *res_scale_out = (res2 / d as f32).sqrt();
+}
+
+#[inline]
+fn turboquant_compress_row_f16(
+    src: &[f16],
+    dst_q_packed: &mut [u8],
+    dst_res_sign: &mut [u8],
+    scale_out: &mut f32,
+    res_scale_out: &mut f32,
+    n_kv_heads: usize,
+    head_dim: usize,
+    tq: &TurboQuantParams,
+) {
+    debug_assert_eq!(src.len(), n_kv_heads * head_dim);
+    debug_assert_eq!(src.len(), dst_res_sign.len());
+    debug_assert_eq!(dst_q_packed.len(), tq.row_bytes);
+    let d = src.len();
+    if d == 0 {
+        *scale_out = 1.0;
+        *res_scale_out = 0.0;
+        return;
+    }
+    dst_q_packed.fill(0);
+    let mut src_f32 = vec![0.0f32; d];
+    for i in 0..d {
+        src_f32[i] = src[i].to_f32();
+    }
+    let mut rotated = vec![0.0f32; d];
+    for h in 0..n_kv_heads {
+        let off = h * head_dim;
+        rotate_head_forward(
+            &src_f32[off..off + head_dim],
+            &tq.rot_sign[off..off + head_dim],
+            &mut rotated[off..off + head_dim],
+            tq.inv_sqrt_head_dim,
+        );
+    }
+    let mut norm2 = 0.0f32;
+    for &xr in rotated.iter() {
+        norm2 += xr * xr;
+    }
+    let scale = norm2.sqrt().max(1e-12);
+    *scale_out = scale;
+    let inv = 1.0f32 / scale;
+    let mut res2 = 0.0f32;
+    for (dim, &xr) in rotated.iter().enumerate() {
+        let xr_unit = xr * inv;
+        let bits = tq.bits_for_dim(dim);
+        let q_idx = TurboQuantParams::nearest_codebook_index(bits, xr_unit);
+        let deq = TurboQuantParams::dequant_centroid(bits, q_idx);
+        tq.set_q_idx(dst_q_packed, dim, q_idx);
+        let residual = xr_unit - deq;
+        let sketch = tq.qjl_sign[dim] * residual;
+        dst_res_sign[dim] = if sketch >= 0.0 { 1 } else { 0 };
+        res2 += residual * residual;
+    }
+    *res_scale_out = (res2 / d as f32).sqrt();
+}
+
+#[inline]
+fn turboquant_decode_rotated_value(row_packed: &[u8], scale: f32, dim: usize, tq: &TurboQuantParams) -> f32 {
+    debug_assert_eq!(row_packed.len(), tq.row_bytes);
+    debug_assert!((tq.bit_offsets[dim] + tq.bits_for_dim(dim) as u32) <= tq.row_bits);
+    let q_idx = tq.get_q_idx(row_packed, dim);
+    let bits = tq.bits_for_dim(dim);
+    TurboQuantParams::dequant_centroid(bits, q_idx) * scale
+}
+
+#[inline]
+fn turboquant_decode_head_to_original(
+    row_packed: &[u8],
+    scale: f32,
+    head: usize,
+    head_dim: usize,
+    tq: &TurboQuantParams,
+    out: &mut [f32],
+) {
+    let off = head * head_dim;
+    for i in 0..head_dim {
+        out[i] = turboquant_decode_rotated_value(row_packed, scale, off + i, tq);
+    }
+    rotate_head_inverse_inplace(out, &tq.rot_sign[off..off + head_dim], tq.inv_sqrt_head_dim);
+}
+
+#[inline]
+fn quantize_symmetric_i8(src: &[f32], dst: &mut [i8]) -> f32 {
+    debug_assert_eq!(src.len(), dst.len());
+    let mut max_abs = 0.0f32;
+    for &v in src {
+        let a = v.abs();
+        if a > max_abs {
+            max_abs = a;
+        }
+    }
+    let scale = (max_abs / 127.0).max(1e-8);
+    let inv = 1.0f32 / scale;
+    for i in 0..src.len() {
+        dst[i] = (src[i] * inv).round().clamp(-127.0, 127.0) as i8;
+    }
+    scale
+}
+
+#[inline]
+fn turboquant_dot_rotated_head_int8_uniform8(
+    row_packed: &[u8],
+    kv_h: usize,
+    head_dim: usize,
+    q_i8: &[i8],
+    q_scale: f32,
+    k_scale: f32,
+) -> f32 {
+    // For uniform-8 packing, centroid(idx) = -3 + idx * (6/255).
+    // Compute in integer domain with exact affine reconstruction to minimize bias.
+    let off = kv_h.saturating_mul(head_dim);
+    let mut sum_qidx = 0i32;
+    let mut sum_q = 0i32;
+    for i in 0..head_dim {
+        let qi = q_i8[i] as i32;
+        let idx = row_packed[off + i] as i32;
+        sum_qidx += qi * idx;
+        sum_q += qi;
+    }
+    let min_v = -3.0f32;
+    let k_step = 6.0f32 / 255.0f32;
+    let acc = (sum_qidx as f32) * k_step + (sum_q as f32) * min_v;
+    acc * q_scale * k_scale
 }
 
 impl CpuTurboQuantKvStorage {
-    fn new(total_elems: usize, kv_dim: usize) -> Result<Self, CoreError> {
+    fn new(total_elems: usize, n_kv_heads: usize, head_dim: usize) -> Result<Self, CoreError> {
+        let kv_dim = n_kv_heads.saturating_mul(head_dim);
         if kv_dim == 0 {
             return Err(CoreError::Backend(
                 "kv cache cpu turboquant: kv_dim must be > 0".into(),
@@ -62,12 +478,22 @@ impl CpuTurboQuantKvStorage {
             )));
         }
         let tokens = total_elems / kv_dim;
+        let tq = TurboQuantParams::new(kv_dim, n_kv_heads, head_dim, 0xCE11_6D4Bu64);
+        let row_bytes = tq.row_bytes;
         Ok(Self {
-            k_q: vec![0i8; total_elems],
-            v_q: vec![0i8; total_elems],
+            k_q: vec![0u8; tokens.saturating_mul(row_bytes)],
+            v_q: vec![0u8; tokens.saturating_mul(row_bytes)],
             k_scale: vec![1.0f32; tokens],
             v_scale: vec![1.0f32; tokens],
+            k_res_sign: vec![1u8; total_elems],
+            v_res_sign: vec![1u8; total_elems],
+            k_res_scale: vec![0.0f32; tokens],
+            v_res_scale: vec![0.0f32; tokens],
+            row_bytes,
             kv_dim,
+            n_kv_heads,
+            head_dim,
+            tq,
         })
     }
 
@@ -85,13 +511,6 @@ impl CpuTurboQuantKvStorage {
                 base, self.kv_dim
             )));
         }
-        let end = base.saturating_add(len);
-        if end > self.k_q.len() || end > self.v_q.len() {
-            return Err(CoreError::Backend(format!(
-                "kv cache cpu turboquant: out of bounds base={base} len={len} cap={}",
-                self.k_q.len()
-            )));
-        }
         let tok = base / self.kv_dim;
         if tok >= self.k_scale.len() || tok >= self.v_scale.len() {
             return Err(CoreError::Backend(format!(
@@ -104,50 +523,31 @@ impl CpuTurboQuantKvStorage {
     }
 
     #[inline]
-    fn quantize_row(src: &[f32], dst: &mut [i8]) -> f32 {
-        debug_assert_eq!(src.len(), dst.len());
-        let mut max_abs = 0.0f32;
-        for &x in src {
-            let ax = x.abs();
-            if ax > max_abs {
-                max_abs = ax;
-            }
+    fn row_slice_mut<'a>(buf: &'a mut [u8], tok: usize, row_bytes: usize) -> Result<&'a mut [u8], CoreError> {
+        let off = tok.saturating_mul(row_bytes);
+        let end = off.saturating_add(row_bytes);
+        if end > buf.len() {
+            return Err(CoreError::Backend(format!(
+                "kv cache cpu turboquant: row out of bounds tok={} row_bytes={} cap={}",
+                tok, row_bytes, buf.len()
+            )));
         }
-        if max_abs <= 0.0 {
-            dst.fill(0);
-            return 1.0;
-        }
-        let scale = max_abs / 127.0f32;
-        let inv = 1.0f32 / scale;
-        for (s, d) in src.iter().zip(dst.iter_mut()) {
-            let q = (s * inv).round().clamp(-127.0, 127.0);
-            *d = q as i8;
-        }
-        scale
+        Ok(&mut buf[off..end])
     }
 
     #[inline]
-    fn quantize_row_f16(src: &[f16], dst: &mut [i8]) -> f32 {
-        debug_assert_eq!(src.len(), dst.len());
-        let mut max_abs = 0.0f32;
-        for &x in src {
-            let ax = x.to_f32().abs();
-            if ax > max_abs {
-                max_abs = ax;
-            }
+    fn row_slice<'a>(buf: &'a [u8], tok: usize, row_bytes: usize) -> Result<&'a [u8], CoreError> {
+        let off = tok.saturating_mul(row_bytes);
+        let end = off.saturating_add(row_bytes);
+        if end > buf.len() {
+            return Err(CoreError::Backend(format!(
+                "kv cache cpu turboquant: row out of bounds tok={} row_bytes={} cap={}",
+                tok, row_bytes, buf.len()
+            )));
         }
-        if max_abs <= 0.0 {
-            dst.fill(0);
-            return 1.0;
-        }
-        let scale = max_abs / 127.0f32;
-        let inv = 1.0f32 / scale;
-        for (s, d) in src.iter().zip(dst.iter_mut()) {
-            let q = (s.to_f32() * inv).round().clamp(-127.0, 127.0);
-            *d = q as i8;
-        }
-        scale
+        Ok(&buf[off..end])
     }
+
 }
 
 impl DeviceKvStorage for CpuKvStorage {
@@ -398,10 +798,39 @@ impl DeviceKvStorage for CpuTurboQuantKvStorage {
             )));
         }
         let tok = self.token_index(base, len)?;
-        let k_dst = &mut self.k_q[base..base + len];
-        let v_dst = &mut self.v_q[base..base + len];
-        self.k_scale[tok] = Self::quantize_row_f16(k_src, k_dst);
-        self.v_scale[tok] = Self::quantize_row_f16(v_src, v_dst);
+        let row_bytes = self.row_bytes;
+        let k_dst = Self::row_slice_mut(&mut self.k_q, tok, row_bytes)?;
+        let v_dst = Self::row_slice_mut(&mut self.v_q, tok, row_bytes)?;
+        let k_res = &mut self.k_res_sign[base..base + len];
+        let v_res = &mut self.v_res_sign[base..base + len];
+        let mut k_scale = 1.0f32;
+        let mut v_scale = 1.0f32;
+        let mut k_res_scale = 0.0f32;
+        let mut v_res_scale = 0.0f32;
+        turboquant_compress_row_f16(
+            k_src,
+            k_dst,
+            k_res,
+            &mut k_scale,
+            &mut k_res_scale,
+            self.n_kv_heads,
+            self.head_dim,
+            &self.tq,
+        );
+        turboquant_compress_row_f16(
+            v_src,
+            v_dst,
+            v_res,
+            &mut v_scale,
+            &mut v_res_scale,
+            self.n_kv_heads,
+            self.head_dim,
+            &self.tq,
+        );
+        self.k_scale[tok] = k_scale;
+        self.v_scale[tok] = v_scale;
+        self.k_res_scale[tok] = k_res_scale;
+        self.v_res_scale[tok] = v_res_scale;
         Ok(())
     }
 
@@ -420,10 +849,39 @@ impl DeviceKvStorage for CpuTurboQuantKvStorage {
             )));
         }
         let tok = self.token_index(base, len)?;
-        let k_dst = &mut self.k_q[base..base + len];
-        let v_dst = &mut self.v_q[base..base + len];
-        self.k_scale[tok] = Self::quantize_row(k_src, k_dst);
-        self.v_scale[tok] = Self::quantize_row(v_src, v_dst);
+        let row_bytes = self.row_bytes;
+        let k_dst = Self::row_slice_mut(&mut self.k_q, tok, row_bytes)?;
+        let v_dst = Self::row_slice_mut(&mut self.v_q, tok, row_bytes)?;
+        let k_res = &mut self.k_res_sign[base..base + len];
+        let v_res = &mut self.v_res_sign[base..base + len];
+        let mut k_scale = 1.0f32;
+        let mut v_scale = 1.0f32;
+        let mut k_res_scale = 0.0f32;
+        let mut v_res_scale = 0.0f32;
+        turboquant_compress_row_f32(
+            k_src,
+            k_dst,
+            k_res,
+            &mut k_scale,
+            &mut k_res_scale,
+            self.n_kv_heads,
+            self.head_dim,
+            &self.tq,
+        );
+        turboquant_compress_row_f32(
+            v_src,
+            v_dst,
+            v_res,
+            &mut v_scale,
+            &mut v_res_scale,
+            self.n_kv_heads,
+            self.head_dim,
+            &self.tq,
+        );
+        self.k_scale[tok] = k_scale;
+        self.v_scale[tok] = v_scale;
+        self.k_res_scale[tok] = k_res_scale;
+        self.v_res_scale[tok] = v_res_scale;
         Ok(())
     }
 
@@ -444,11 +902,19 @@ impl DeviceKvStorage for CpuTurboQuantKvStorage {
         let tok = self.token_index(base, len)?;
         let ks = self.k_scale[tok];
         let vs = self.v_scale[tok];
-        let k_src = &self.k_q[base..base + len];
-        let v_src = &self.v_q[base..base + len];
-        for i in 0..len {
-            k_out[i] = f16::from_f32(k_src[i] as f32 * ks);
-            v_out[i] = f16::from_f32(v_src[i] as f32 * vs);
+        let k_row = Self::row_slice(&self.k_q, tok, self.row_bytes)?;
+        let v_row = Self::row_slice(&self.v_q, tok, self.row_bytes)?;
+        for h in 0..self.n_kv_heads {
+            let off = h * self.head_dim;
+            let mut tmp = vec![0.0f32; self.head_dim];
+            turboquant_decode_head_to_original(k_row, ks, h, self.head_dim, &self.tq, &mut tmp);
+            for i in 0..self.head_dim {
+                k_out[off + i] = f16::from_f32(tmp[i]);
+            }
+            turboquant_decode_head_to_original(v_row, vs, h, self.head_dim, &self.tq, &mut tmp);
+            for i in 0..self.head_dim {
+                v_out[off + i] = f16::from_f32(tmp[i]);
+            }
         }
         Ok(())
     }
@@ -470,11 +936,19 @@ impl DeviceKvStorage for CpuTurboQuantKvStorage {
         let tok = self.token_index(base, len)?;
         let ks = self.k_scale[tok];
         let vs = self.v_scale[tok];
-        let k_src = &self.k_q[base..base + len];
-        let v_src = &self.v_q[base..base + len];
-        for i in 0..len {
-            k_out[i] = k_src[i] as f32 * ks;
-            v_out[i] = v_src[i] as f32 * vs;
+        let k_row = Self::row_slice(&self.k_q, tok, self.row_bytes)?;
+        let v_row = Self::row_slice(&self.v_q, tok, self.row_bytes)?;
+        for h in 0..self.n_kv_heads {
+            let off = h * self.head_dim;
+            let mut tmp = vec![0.0f32; self.head_dim];
+            turboquant_decode_head_to_original(k_row, ks, h, self.head_dim, &self.tq, &mut tmp);
+            for i in 0..self.head_dim {
+                k_out[off + i] = tmp[i];
+            }
+            turboquant_decode_head_to_original(v_row, vs, h, self.head_dim, &self.tq, &mut tmp);
+            for i in 0..self.head_dim {
+                v_out[off + i] = tmp[i];
+            }
         }
         Ok(())
     }
@@ -512,9 +986,19 @@ impl DeviceKvStorage for CpuTurboQuantKvStorage {
             let ks = self.k_scale[tok];
             let vs = self.v_scale[tok];
             let dst = t * kv_dim;
-            for i in 0..kv_dim {
-                k_out[dst + i] = self.k_q[base + i] as f32 * ks;
-                v_out[dst + i] = self.v_q[base + i] as f32 * vs;
+            let k_row = Self::row_slice(&self.k_q, tok, self.row_bytes)?;
+            let v_row = Self::row_slice(&self.v_q, tok, self.row_bytes)?;
+            for h in 0..self.n_kv_heads {
+                let off = h * self.head_dim;
+                let mut tmp = vec![0.0f32; self.head_dim];
+                turboquant_decode_head_to_original(k_row, ks, h, self.head_dim, &self.tq, &mut tmp);
+                for i in 0..self.head_dim {
+                    k_out[dst + off + i] = tmp[i];
+                }
+                turboquant_decode_head_to_original(v_row, vs, h, self.head_dim, &self.tq, &mut tmp);
+                for i in 0..self.head_dim {
+                    v_out[dst + off + i] = tmp[i];
+                }
             }
         }
         Ok(())
@@ -549,42 +1033,134 @@ impl DeviceKvStorage for CpuTurboQuantKvStorage {
         if seq == 0 {
             return Ok(());
         }
-        let kv_dim = n_kv_heads.saturating_mul(head_dim);
+        if n_kv_heads > self.n_kv_heads || head_dim > self.head_dim {
+            return Err(CoreError::Backend(format!(
+                "kv cache cpu turboquant: attention shape mismatch n_kv_heads={} > {} or head_dim={} > {}",
+                n_kv_heads, self.n_kv_heads, head_dim, self.head_dim
+            )));
+        }
         for &base in bases {
-            let _ = self.token_index(base, kv_dim)?;
+            if base % self.kv_dim != 0 {
+                return Err(CoreError::Backend(format!(
+                    "kv cache cpu turboquant: base {} is not token-aligned (kv_dim={})",
+                    base, self.kv_dim
+                )));
+            }
+            let end = base.saturating_add(self.kv_dim);
+            if end > self.k_res_sign.len() {
+                return Err(CoreError::Backend(format!(
+                    "kv cache cpu turboquant: attention base out of bounds base={} kv_dim={} cap={}",
+                    base, self.kv_dim, self.k_res_sign.len()
+                )));
+            }
         }
 
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let group_size = (n_heads / n_kv_heads).max(1);
         let mut scores = vec![0.0f32; seq];
+        let mut q_i8 = vec![0i8; head_dim];
+        let use_int8_dot = self.tq.is_uniform_8bit(self.kv_dim)
+            && std::env::var("CELLM_TURBOQ_INT8_DOT")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+        let use_qjl_corr = std::env::var("CELLM_TURBOQ_QJL_CORR")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        let use_uniform8_decode = self.tq.is_uniform_8bit(self.kv_dim);
+        let q8_min = -3.0f32;
+        let q8_step = 6.0f32 / 255.0f32;
+        let mut q_rot = vec![0.0f32; head_dim];
+        let mut v_acc_rot = vec![0.0f32; head_dim];
+        let mut k_scales = vec![0.0f32; seq];
+        let mut v_scales = vec![0.0f32; seq];
+        let mut k_res_scales = vec![0.0f32; seq];
+        let mut row_offs = vec![0usize; seq];
+        let mut sign_bases = vec![0usize; seq];
+        for (t, &base) in bases.iter().enumerate() {
+            let tok = base / self.kv_dim;
+            k_scales[t] = self.k_scale[tok];
+            v_scales[t] = self.v_scale[tok];
+            k_res_scales[t] = self.k_res_scale[tok];
+            row_offs[t] = tok.saturating_mul(self.row_bytes);
+            sign_bases[t] = base;
+        }
 
         for h in 0..n_heads {
             let kv_h = (h / group_size).min(n_kv_heads.saturating_sub(1));
             let qh = &q[h * head_dim..(h + 1) * head_dim];
+            rotate_head_forward(
+                qh,
+                &self.tq.rot_sign[kv_h * head_dim..(kv_h + 1) * head_dim],
+                &mut q_rot,
+                self.tq.inv_sqrt_head_dim,
+            );
+            let q_scale = if use_int8_dot {
+                quantize_symmetric_i8(&q_rot, &mut q_i8)
+            } else {
+                1.0
+            };
             for (t, &base) in bases.iter().enumerate() {
-                let tok = base / self.kv_dim;
-                let ks = self.k_scale[tok];
-                let kt_base = base + kv_h * head_dim;
-                let kt = &self.k_q[kt_base..kt_base + head_dim];
-                let mut dot = 0.0f32;
-                for i in 0..head_dim {
-                    dot += qh[i] * (kt[i] as f32 * ks);
+                let _ = base;
+                let ks = k_scales[t];
+                let row_off = row_offs[t];
+                let k_row = &self.k_q[row_off..row_off + self.row_bytes];
+                let mut dot = if use_int8_dot {
+                    turboquant_dot_rotated_head_int8_uniform8(k_row, kv_h, head_dim, &q_i8, q_scale, ks)
+                } else {
+                    0.0f32
+                };
+                if !use_int8_dot {
+                    for i in 0..head_dim {
+                        let dim = kv_h * head_dim + i;
+                        let rot_q = q_rot[i];
+                        if use_uniform8_decode {
+                            let idx = k_row[dim] as f32;
+                            let deq = (q8_min + idx * q8_step) * ks;
+                            dot += rot_q * deq;
+                        } else {
+                            let deq = turboquant_decode_rotated_value(k_row, ks, dim, &self.tq);
+                            dot += rot_q * deq;
+                        }
+                    }
+                }
+                if use_qjl_corr {
+                    let sign_base = sign_bases[t] + kv_h * head_dim;
+                    let mut corr = 0.0f32;
+                    for i in 0..head_dim {
+                        let dim = kv_h * head_dim + i;
+                        let sign = if self.k_res_sign[sign_base + i] == 0 { -1.0 } else { 1.0 };
+                        corr += (self.tq.qjl_sign[dim] * q_rot[i]) * sign;
+                    }
+                    dot += (k_res_scales[t] / head_dim as f32) * corr;
                 }
                 scores[t] = dot * scale;
             }
             softmax_f32_inplace_cpu_local(&mut scores);
 
             let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
-            for (t, &base) in bases.iter().enumerate() {
-                let tok = base / self.kv_dim;
-                let vs = self.v_scale[tok];
-                let vt_base = base + kv_h * head_dim;
-                let vt = &self.v_q[vt_base..vt_base + head_dim];
+            v_acc_rot.fill(0.0);
+            for t in 0..seq {
+                let vs = v_scales[t];
+                let row_off = row_offs[t];
+                let v_row = &self.v_q[row_off..row_off + self.row_bytes];
                 let w = scores[t];
                 for i in 0..head_dim {
-                    out_h[i] += w * (vt[i] as f32 * vs);
+                    let dim = kv_h * head_dim + i;
+                    let v_rot = if use_uniform8_decode {
+                        let idx = v_row[dim] as f32;
+                        (q8_min + idx * q8_step) * vs
+                    } else {
+                        turboquant_decode_rotated_value(v_row, vs, dim, &self.tq)
+                    };
+                    v_acc_rot[i] += w * v_rot;
                 }
             }
+            rotate_head_inverse_inplace(
+                &mut v_acc_rot,
+                &self.tq.rot_sign[kv_h * head_dim..(kv_h + 1) * head_dim],
+                self.tq.inv_sqrt_head_dim,
+            );
+            out_h.copy_from_slice(&v_acc_rot);
         }
         Ok(())
     }
@@ -613,57 +1189,14 @@ fn softmax_f32_inplace_cpu_local(x: &mut [f32]) {
     }
 }
 
-#[inline]
-fn quantize_row_f32_to_i8_scale(src: &[f32], dst: &mut [i8]) -> f32 {
-    debug_assert_eq!(src.len(), dst.len());
-    let mut max_abs = 0.0f32;
-    for &x in src {
-        let ax = x.abs();
-        if ax > max_abs {
-            max_abs = ax;
-        }
-    }
-    if max_abs <= 0.0 {
-        dst.fill(0);
-        return 1.0;
-    }
-    let scale = max_abs / 127.0f32;
-    let inv = 1.0f32 / scale;
-    for (s, d) in src.iter().zip(dst.iter_mut()) {
-        let q = (s * inv).round().clamp(-127.0, 127.0);
-        *d = q as i8;
-    }
-    scale
-}
-
-#[inline]
-fn quantize_row_f16_to_i8_scale(src: &[f16], dst: &mut [i8]) -> f32 {
-    debug_assert_eq!(src.len(), dst.len());
-    let mut max_abs = 0.0f32;
-    for &x in src {
-        let ax = x.to_f32().abs();
-        if ax > max_abs {
-            max_abs = ax;
-        }
-    }
-    if max_abs <= 0.0 {
-        dst.fill(0);
-        return 1.0;
-    }
-    let scale = max_abs / 127.0f32;
-    let inv = 1.0f32 / scale;
-    for (s, d) in src.iter().zip(dst.iter_mut()) {
-        let q = (s.to_f32() * inv).round().clamp(-127.0, 127.0);
-        *d = q as i8;
-    }
-    scale
-}
-
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 #[derive(Debug)]
 pub struct MetalKvStorage {
     encoding: KvEncodingKind,
     kv_dim: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    row_bytes: usize,
     queue: CommandQueue,
     _lib: Library,
     pso_write_f16: ComputePipelineState,
@@ -672,13 +1205,18 @@ pub struct MetalKvStorage {
     pso_read_f32: ComputePipelineState,
     pso_gather_f32: ComputePipelineState,
     pso_attn_single_gqa_f32: ComputePipelineState,
-    pso_attn_single_gqa_q8_f32: ComputePipelineState,
+    _pso_attn_single_gqa_q8_f32: ComputePipelineState,
     k: Buffer,
     v: Buffer,
     k_q: Option<Buffer>,
     v_q: Option<Buffer>,
     k_scale: Option<Buffer>,
     v_scale: Option<Buffer>,
+    k_res_sign: Option<Buffer>,
+    v_res_sign: Option<Buffer>,
+    k_res_scale: Option<Buffer>,
+    v_res_scale: Option<Buffer>,
+    tq: Option<TurboQuantParams>,
     len: usize,
     scratch: Mutex<MetalScratch>,
 }
@@ -697,7 +1235,13 @@ struct MetalScratch {
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 impl MetalKvStorage {
-    pub fn new(total_elems: usize, kv_dim: usize, encoding: KvEncodingKind) -> Result<Self, CoreError> {
+    pub fn new(
+        total_elems: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        encoding: KvEncodingKind,
+    ) -> Result<Self, CoreError> {
+        let kv_dim = n_kv_heads.saturating_mul(head_dim);
         if kv_dim == 0 {
             return Err(CoreError::Backend("kv cache metal storage: kv_dim must be > 0".into()));
         }
@@ -944,36 +1488,87 @@ impl MetalKvStorage {
         let v_slice = unsafe { std::slice::from_raw_parts_mut(v_ptr, total_elems) };
         k_slice.fill(z);
         v_slice.fill(z);
-        let (k_q, v_q, k_scale, v_scale) = if encoding == KvEncodingKind::TurboQuant {
-            let bytes_q = total_elems as u64;
+        let (k_q, v_q, k_scale, v_scale, k_res_sign, v_res_sign, k_res_scale, v_res_scale, tq, row_bytes) =
+            if encoding == KvEncodingKind::TurboQuant {
             let tokens = total_elems / kv_dim;
+            let tq = TurboQuantParams::new(kv_dim, n_kv_heads, head_dim, 0xCE11_6D4Bu64);
+            let row_bytes = tq.row_bytes;
+            let bytes_q = (tokens.saturating_mul(row_bytes)) as u64;
             let bytes_s = (tokens * std::mem::size_of::<f32>()) as u64;
             let kq = device.new_buffer(bytes_q, MTLResourceOptions::StorageModeShared);
             let vq = device.new_buffer(bytes_q, MTLResourceOptions::StorageModeShared);
+            let bytes_sign = total_elems as u64;
+            let krs = device.new_buffer(bytes_sign, MTLResourceOptions::StorageModeShared);
+            let vrs = device.new_buffer(bytes_sign, MTLResourceOptions::StorageModeShared);
             let ks = device.new_buffer(bytes_s, MTLResourceOptions::StorageModeShared);
             let vs = device.new_buffer(bytes_s, MTLResourceOptions::StorageModeShared);
-            let kq_ptr = kq.contents() as *mut i8;
-            let vq_ptr = vq.contents() as *mut i8;
+            let krs_scale = device.new_buffer(bytes_s, MTLResourceOptions::StorageModeShared);
+            let vrs_scale = device.new_buffer(bytes_s, MTLResourceOptions::StorageModeShared);
+            let kq_ptr = kq.contents() as *mut u8;
+            let vq_ptr = vq.contents() as *mut u8;
+            let krs_ptr = krs.contents() as *mut u8;
+            let vrs_ptr = vrs.contents() as *mut u8;
             let ks_ptr = ks.contents() as *mut f32;
             let vs_ptr = vs.contents() as *mut f32;
-            if kq_ptr.is_null() || vq_ptr.is_null() || ks_ptr.is_null() || vs_ptr.is_null() {
+            let krs_scale_ptr = krs_scale.contents() as *mut f32;
+            let vrs_scale_ptr = vrs_scale.contents() as *mut f32;
+            if kq_ptr.is_null()
+                || vq_ptr.is_null()
+                || krs_ptr.is_null()
+                || vrs_ptr.is_null()
+                || ks_ptr.is_null()
+                || vs_ptr.is_null()
+                || krs_scale_ptr.is_null()
+                || vrs_scale_ptr.is_null()
+            {
                 return Err(CoreError::Backend(
                     "kv cache metal storage: null turboquant buffer contents".into(),
                 ));
             }
+            if (kq.length() as usize) < tokens.saturating_mul(row_bytes)
+                || (vq.length() as usize) < tokens.saturating_mul(row_bytes)
+                || (krs.length() as usize) < total_elems
+                || (vrs.length() as usize) < total_elems
+                || (ks.length() as usize) < tokens.saturating_mul(std::mem::size_of::<f32>())
+                || (vs.length() as usize) < tokens.saturating_mul(std::mem::size_of::<f32>())
+                || (krs_scale.length() as usize) < tokens.saturating_mul(std::mem::size_of::<f32>())
+                || (vrs_scale.length() as usize) < tokens.saturating_mul(std::mem::size_of::<f32>())
+            {
+                return Err(CoreError::Backend(
+                    "kv cache metal storage: turboquant buffer length mismatch".into(),
+                ));
+            }
             unsafe {
-                std::slice::from_raw_parts_mut(kq_ptr, total_elems).fill(0);
-                std::slice::from_raw_parts_mut(vq_ptr, total_elems).fill(0);
+                std::slice::from_raw_parts_mut(kq_ptr, tokens.saturating_mul(row_bytes)).fill(0);
+                std::slice::from_raw_parts_mut(vq_ptr, tokens.saturating_mul(row_bytes)).fill(0);
+                std::slice::from_raw_parts_mut(krs_ptr, total_elems).fill(1u8);
+                std::slice::from_raw_parts_mut(vrs_ptr, total_elems).fill(1u8);
                 std::slice::from_raw_parts_mut(ks_ptr, tokens).fill(1.0f32);
                 std::slice::from_raw_parts_mut(vs_ptr, tokens).fill(1.0f32);
+                std::slice::from_raw_parts_mut(krs_scale_ptr, tokens).fill(0.0f32);
+                std::slice::from_raw_parts_mut(vrs_scale_ptr, tokens).fill(0.0f32);
             }
-            (Some(kq), Some(vq), Some(ks), Some(vs))
+            (
+                Some(kq),
+                Some(vq),
+                Some(ks),
+                Some(vs),
+                Some(krs),
+                Some(vrs),
+                Some(krs_scale),
+                Some(vrs_scale),
+                Some(tq),
+                row_bytes,
+            )
         } else {
-            (None, None, None, None)
+            (None, None, None, None, None, None, None, None, None, 0usize)
         };
         Ok(Self {
             encoding,
             kv_dim,
+            n_kv_heads,
+            head_dim,
+            row_bytes,
             queue,
             _lib: lib,
             pso_write_f16,
@@ -982,13 +1577,18 @@ impl MetalKvStorage {
             pso_read_f32,
             pso_gather_f32,
             pso_attn_single_gqa_f32,
-            pso_attn_single_gqa_q8_f32,
+            _pso_attn_single_gqa_q8_f32: pso_attn_single_gqa_q8_f32,
             k,
             v,
             k_q,
             v_q,
             k_scale,
             v_scale,
+            k_res_sign,
+            v_res_sign,
+            k_res_scale,
+            v_res_scale,
+            tq,
             len: total_elems,
             scratch: Mutex::new(MetalScratch::default()),
         })
@@ -1041,24 +1641,68 @@ impl DeviceKvStorage for MetalKvStorage {
                 )));
             }
             let tok = base / self.kv_dim;
+            let row_off = tok.saturating_mul(self.row_bytes);
             let kq = self.k_q.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing k_q".into()))?;
             let vq = self.v_q.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing v_q".into()))?;
+            let krs = self.k_res_sign.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing k_res_sign".into()))?;
+            let vrs = self.v_res_sign.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing v_res_sign".into()))?;
             let ks = self.k_scale.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing k_scale".into()))?;
             let vs = self.v_scale.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing v_scale".into()))?;
-            let k_ptr = kq.contents() as *mut i8;
-            let v_ptr = vq.contents() as *mut i8;
+            let krs_scale = self.k_res_scale.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing k_res_scale".into()))?;
+            let vrs_scale = self.v_res_scale.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing v_res_scale".into()))?;
+            let tq = self.tq.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing params".into()))?;
+            let k_ptr = kq.contents() as *mut u8;
+            let v_ptr = vq.contents() as *mut u8;
+            let krs_ptr = krs.contents() as *mut u8;
+            let vrs_ptr = vrs.contents() as *mut u8;
             let ks_ptr = ks.contents() as *mut f32;
             let vs_ptr = vs.contents() as *mut f32;
-            if k_ptr.is_null() || v_ptr.is_null() || ks_ptr.is_null() || vs_ptr.is_null() {
+            let krs_scale_ptr = krs_scale.contents() as *mut f32;
+            let vrs_scale_ptr = vrs_scale.contents() as *mut f32;
+            if k_ptr.is_null()
+                || v_ptr.is_null()
+                || krs_ptr.is_null()
+                || vrs_ptr.is_null()
+                || ks_ptr.is_null()
+                || vs_ptr.is_null()
+                || krs_scale_ptr.is_null()
+                || vrs_scale_ptr.is_null()
+            {
                 return Err(CoreError::Backend("kv cache metal turboquant: null buffer contents".into()));
             }
-            let k_dst = unsafe { std::slice::from_raw_parts_mut(k_ptr.add(base), k_src.len()) };
-            let v_dst = unsafe { std::slice::from_raw_parts_mut(v_ptr.add(base), v_src.len()) };
-            let k_scale = quantize_row_f16_to_i8_scale(k_src, k_dst);
-            let v_scale = quantize_row_f16_to_i8_scale(v_src, v_dst);
+            let k_dst = unsafe { std::slice::from_raw_parts_mut(k_ptr.add(row_off), self.row_bytes) };
+            let v_dst = unsafe { std::slice::from_raw_parts_mut(v_ptr.add(row_off), self.row_bytes) };
+            let k_res_dst = unsafe { std::slice::from_raw_parts_mut(krs_ptr.add(base), k_src.len()) };
+            let v_res_dst = unsafe { std::slice::from_raw_parts_mut(vrs_ptr.add(base), v_src.len()) };
+            let mut k_scale = 1.0f32;
+            let mut v_scale = 1.0f32;
+            let mut k_residual_scale = 0.0f32;
+            let mut v_residual_scale = 0.0f32;
+            turboquant_compress_row_f16(
+                k_src,
+                k_dst,
+                k_res_dst,
+                &mut k_scale,
+                &mut k_residual_scale,
+                self.n_kv_heads,
+                self.head_dim,
+                tq,
+            );
+            turboquant_compress_row_f16(
+                v_src,
+                v_dst,
+                v_res_dst,
+                &mut v_scale,
+                &mut v_residual_scale,
+                self.n_kv_heads,
+                self.head_dim,
+                tq,
+            );
             unsafe {
                 *ks_ptr.add(tok) = k_scale;
                 *vs_ptr.add(tok) = v_scale;
+                *krs_scale_ptr.add(tok) = k_residual_scale;
+                *vrs_scale_ptr.add(tok) = v_residual_scale;
             }
             return Ok(());
         }
@@ -1125,24 +1769,68 @@ impl DeviceKvStorage for MetalKvStorage {
                 )));
             }
             let tok = base / self.kv_dim;
+            let row_off = tok.saturating_mul(self.row_bytes);
             let kq = self.k_q.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing k_q".into()))?;
             let vq = self.v_q.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing v_q".into()))?;
+            let krs = self.k_res_sign.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing k_res_sign".into()))?;
+            let vrs = self.v_res_sign.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing v_res_sign".into()))?;
             let ks = self.k_scale.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing k_scale".into()))?;
             let vs = self.v_scale.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing v_scale".into()))?;
-            let k_ptr = kq.contents() as *mut i8;
-            let v_ptr = vq.contents() as *mut i8;
+            let krs_scale = self.k_res_scale.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing k_res_scale".into()))?;
+            let vrs_scale = self.v_res_scale.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing v_res_scale".into()))?;
+            let tq = self.tq.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing params".into()))?;
+            let k_ptr = kq.contents() as *mut u8;
+            let v_ptr = vq.contents() as *mut u8;
+            let krs_ptr = krs.contents() as *mut u8;
+            let vrs_ptr = vrs.contents() as *mut u8;
             let ks_ptr = ks.contents() as *mut f32;
             let vs_ptr = vs.contents() as *mut f32;
-            if k_ptr.is_null() || v_ptr.is_null() || ks_ptr.is_null() || vs_ptr.is_null() {
+            let krs_scale_ptr = krs_scale.contents() as *mut f32;
+            let vrs_scale_ptr = vrs_scale.contents() as *mut f32;
+            if k_ptr.is_null()
+                || v_ptr.is_null()
+                || krs_ptr.is_null()
+                || vrs_ptr.is_null()
+                || ks_ptr.is_null()
+                || vs_ptr.is_null()
+                || krs_scale_ptr.is_null()
+                || vrs_scale_ptr.is_null()
+            {
                 return Err(CoreError::Backend("kv cache metal turboquant: null buffer contents".into()));
             }
-            let k_dst = unsafe { std::slice::from_raw_parts_mut(k_ptr.add(base), k_src.len()) };
-            let v_dst = unsafe { std::slice::from_raw_parts_mut(v_ptr.add(base), v_src.len()) };
-            let k_scale = quantize_row_f32_to_i8_scale(k_src, k_dst);
-            let v_scale = quantize_row_f32_to_i8_scale(v_src, v_dst);
+            let k_dst = unsafe { std::slice::from_raw_parts_mut(k_ptr.add(row_off), self.row_bytes) };
+            let v_dst = unsafe { std::slice::from_raw_parts_mut(v_ptr.add(row_off), self.row_bytes) };
+            let k_res_dst = unsafe { std::slice::from_raw_parts_mut(krs_ptr.add(base), k_src.len()) };
+            let v_res_dst = unsafe { std::slice::from_raw_parts_mut(vrs_ptr.add(base), v_src.len()) };
+            let mut k_scale = 1.0f32;
+            let mut v_scale = 1.0f32;
+            let mut k_residual_scale = 0.0f32;
+            let mut v_residual_scale = 0.0f32;
+            turboquant_compress_row_f32(
+                k_src,
+                k_dst,
+                k_res_dst,
+                &mut k_scale,
+                &mut k_residual_scale,
+                self.n_kv_heads,
+                self.head_dim,
+                tq,
+            );
+            turboquant_compress_row_f32(
+                v_src,
+                v_dst,
+                v_res_dst,
+                &mut v_scale,
+                &mut v_residual_scale,
+                self.n_kv_heads,
+                self.head_dim,
+                tq,
+            );
             unsafe {
                 *ks_ptr.add(tok) = k_scale;
                 *vs_ptr.add(tok) = v_scale;
+                *krs_scale_ptr.add(tok) = k_residual_scale;
+                *vrs_scale_ptr.add(tok) = v_residual_scale;
             }
             return Ok(());
         }
@@ -1209,24 +1897,34 @@ impl DeviceKvStorage for MetalKvStorage {
                 )));
             }
             let tok = base / self.kv_dim;
+            let row_off = tok.saturating_mul(self.row_bytes);
             let kq = self.k_q.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing k_q".into()))?;
             let vq = self.v_q.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing v_q".into()))?;
             let ks = self.k_scale.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing k_scale".into()))?;
             let vs = self.v_scale.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing v_scale".into()))?;
-            let k_ptr = kq.contents() as *const i8;
-            let v_ptr = vq.contents() as *const i8;
+            let tq = self.tq.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing params".into()))?;
+            let k_ptr = kq.contents() as *const u8;
+            let v_ptr = vq.contents() as *const u8;
             let ks_ptr = ks.contents() as *const f32;
             let vs_ptr = vs.contents() as *const f32;
             if k_ptr.is_null() || v_ptr.is_null() || ks_ptr.is_null() || vs_ptr.is_null() {
                 return Err(CoreError::Backend("kv cache metal turboquant: null buffer contents".into()));
             }
-            let k_src = unsafe { std::slice::from_raw_parts(k_ptr.add(base), len) };
-            let v_src = unsafe { std::slice::from_raw_parts(v_ptr.add(base), len) };
+            let k_row = unsafe { std::slice::from_raw_parts(k_ptr.add(row_off), self.row_bytes) };
+            let v_row = unsafe { std::slice::from_raw_parts(v_ptr.add(row_off), self.row_bytes) };
             let ks_val = unsafe { *ks_ptr.add(tok) };
             let vs_val = unsafe { *vs_ptr.add(tok) };
-            for i in 0..len {
-                k_out[i] = f16::from_f32(k_src[i] as f32 * ks_val);
-                v_out[i] = f16::from_f32(v_src[i] as f32 * vs_val);
+            for h in 0..self.n_kv_heads {
+                let off = h * self.head_dim;
+                let mut tmp = vec![0.0f32; self.head_dim];
+                turboquant_decode_head_to_original(k_row, ks_val, h, self.head_dim, tq, &mut tmp);
+                for i in 0..self.head_dim {
+                    k_out[off + i] = f16::from_f32(tmp[i]);
+                }
+                turboquant_decode_head_to_original(v_row, vs_val, h, self.head_dim, tq, &mut tmp);
+                for i in 0..self.head_dim {
+                    v_out[off + i] = f16::from_f32(tmp[i]);
+                }
             }
             return Ok(());
         }
@@ -1294,24 +1992,34 @@ impl DeviceKvStorage for MetalKvStorage {
                 )));
             }
             let tok = base / self.kv_dim;
+            let row_off = tok.saturating_mul(self.row_bytes);
             let kq = self.k_q.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing k_q".into()))?;
             let vq = self.v_q.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing v_q".into()))?;
             let ks = self.k_scale.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing k_scale".into()))?;
             let vs = self.v_scale.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing v_scale".into()))?;
-            let k_ptr = kq.contents() as *const i8;
-            let v_ptr = vq.contents() as *const i8;
+            let tq = self.tq.as_ref().ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing params".into()))?;
+            let k_ptr = kq.contents() as *const u8;
+            let v_ptr = vq.contents() as *const u8;
             let ks_ptr = ks.contents() as *const f32;
             let vs_ptr = vs.contents() as *const f32;
             if k_ptr.is_null() || v_ptr.is_null() || ks_ptr.is_null() || vs_ptr.is_null() {
                 return Err(CoreError::Backend("kv cache metal turboquant: null buffer contents".into()));
             }
-            let k_src = unsafe { std::slice::from_raw_parts(k_ptr.add(base), len) };
-            let v_src = unsafe { std::slice::from_raw_parts(v_ptr.add(base), len) };
+            let k_row = unsafe { std::slice::from_raw_parts(k_ptr.add(row_off), self.row_bytes) };
+            let v_row = unsafe { std::slice::from_raw_parts(v_ptr.add(row_off), self.row_bytes) };
             let ks_val = unsafe { *ks_ptr.add(tok) };
             let vs_val = unsafe { *vs_ptr.add(tok) };
-            for i in 0..len {
-                k_out[i] = k_src[i] as f32 * ks_val;
-                v_out[i] = v_src[i] as f32 * vs_val;
+            for h in 0..self.n_kv_heads {
+                let off = h * self.head_dim;
+                let mut tmp = vec![0.0f32; self.head_dim];
+                turboquant_decode_head_to_original(k_row, ks_val, h, self.head_dim, tq, &mut tmp);
+                for i in 0..self.head_dim {
+                    k_out[off + i] = tmp[i];
+                }
+                turboquant_decode_head_to_original(v_row, vs_val, h, self.head_dim, tq, &mut tmp);
+                for i in 0..self.head_dim {
+                    v_out[off + i] = tmp[i];
+                }
             }
             return Ok(());
         }
@@ -1399,8 +2107,11 @@ impl DeviceKvStorage for MetalKvStorage {
             let vs = self.v_scale.as_ref().ok_or_else(|| {
                 CoreError::Backend("kv cache metal turboquant: missing v_scale".into())
             })?;
-            let k_ptr = kq.contents() as *const i8;
-            let v_ptr = vq.contents() as *const i8;
+            let tq = self.tq.as_ref().ok_or_else(|| {
+                CoreError::Backend("kv cache metal turboquant: missing params".into())
+            })?;
+            let k_ptr = kq.contents() as *const u8;
+            let v_ptr = vq.contents() as *const u8;
             let ks_ptr = ks.contents() as *const f32;
             let vs_ptr = vs.contents() as *const f32;
             if k_ptr.is_null() || v_ptr.is_null() || ks_ptr.is_null() || vs_ptr.is_null() {
@@ -1411,14 +2122,23 @@ impl DeviceKvStorage for MetalKvStorage {
             for (t, &base) in bases.iter().enumerate() {
                 self.check_range(base, kv_dim)?;
                 let tok = base / kv_dim;
+                let row_off = tok.saturating_mul(self.row_bytes);
                 let k_scale = unsafe { *ks_ptr.add(tok) };
                 let v_scale = unsafe { *vs_ptr.add(tok) };
                 let dst = t * kv_dim;
-                for i in 0..kv_dim {
-                    let kqv = unsafe { *k_ptr.add(base + i) } as f32;
-                    let vqv = unsafe { *v_ptr.add(base + i) } as f32;
-                    k_out[dst + i] = kqv * k_scale;
-                    v_out[dst + i] = vqv * v_scale;
+                let k_row = unsafe { std::slice::from_raw_parts(k_ptr.add(row_off), self.row_bytes) };
+                let v_row = unsafe { std::slice::from_raw_parts(v_ptr.add(row_off), self.row_bytes) };
+                for h in 0..self.n_kv_heads {
+                    let off = h * self.head_dim;
+                    let mut tmp = vec![0.0f32; self.head_dim];
+                    turboquant_decode_head_to_original(k_row, k_scale, h, self.head_dim, tq, &mut tmp);
+                    for i in 0..self.head_dim {
+                        k_out[dst + off + i] = tmp[i];
+                    }
+                    turboquant_decode_head_to_original(v_row, v_scale, h, self.head_dim, tq, &mut tmp);
+                    for i in 0..self.head_dim {
+                        v_out[dst + off + i] = tmp[i];
+                    }
                 }
             }
             return Ok(());
@@ -1557,43 +2277,152 @@ impl DeviceKvStorage for MetalKvStorage {
         let head_dim_ptr = (&head_dim_u32 as *const u32).cast();
         let scale_ptr = (&scale as *const f32).cast();
         if self.encoding == KvEncodingKind::TurboQuant {
-            let kv_dim_u32 = self.check_u32(self.kv_dim, "kv_dim")?;
-            let kv_dim_ptr = (&kv_dim_u32 as *const u32).cast();
-            let k_q = self
-                .k_q
-                .as_ref()
-                .ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing k_q".into()))?;
-            let v_q = self
-                .v_q
-                .as_ref()
-                .ok_or_else(|| CoreError::Backend("kv cache metal turboquant: missing v_q".into()))?;
+            let group_size = (n_heads / n_kv_heads).max(1);
+            let tq = self.tq.as_ref().ok_or_else(|| {
+                CoreError::Backend("kv cache metal turboquant: missing params".into())
+            })?;
+            let k_q = self.k_q.as_ref().ok_or_else(|| {
+                CoreError::Backend("kv cache metal turboquant: missing k_q".into())
+            })?;
+            let v_q = self.v_q.as_ref().ok_or_else(|| {
+                CoreError::Backend("kv cache metal turboquant: missing v_q".into())
+            })?;
             let k_scale = self.k_scale.as_ref().ok_or_else(|| {
                 CoreError::Backend("kv cache metal turboquant: missing k_scale".into())
             })?;
             let v_scale = self.v_scale.as_ref().ok_or_else(|| {
                 CoreError::Backend("kv cache metal turboquant: missing v_scale".into())
             })?;
-            dispatch_1d(
-                &self.queue,
-                &self.pso_attn_single_gqa_q8_f32,
-                n_heads as u64,
-                |enc| {
-                    enc.set_buffer(0, Some(k_q), 0);
-                    enc.set_buffer(1, Some(v_q), 0);
-                    enc.set_buffer(2, Some(k_scale), 0);
-                    enc.set_buffer(3, Some(v_scale), 0);
-                    enc.set_buffer(4, Some(&bases_buf), 0);
-                    enc.set_buffer(5, Some(&q_buf), 0);
-                    enc.set_buffer(6, Some(&out_buf), 0);
-                    enc.set_bytes(7, std::mem::size_of::<u32>() as u64, seq_ptr);
-                    enc.set_bytes(8, std::mem::size_of::<u32>() as u64, n_heads_ptr);
-                    enc.set_bytes(9, std::mem::size_of::<u32>() as u64, n_kv_heads_ptr);
-                    enc.set_bytes(10, std::mem::size_of::<u32>() as u64, head_dim_ptr);
-                    enc.set_bytes(11, std::mem::size_of::<u32>() as u64, kv_dim_ptr);
-                    enc.set_bytes(12, std::mem::size_of::<f32>() as u64, scale_ptr);
-                },
-            )
-            .map_err(|e| CoreError::Backend(format!("kv cache metal attn gqa q8 failed: {e}")))?;
+            let k_res_sign = self.k_res_sign.as_ref().ok_or_else(|| {
+                CoreError::Backend("kv cache metal turboquant: missing k_res_sign".into())
+            })?;
+            let k_res_scale = self.k_res_scale.as_ref().ok_or_else(|| {
+                CoreError::Backend("kv cache metal turboquant: missing k_res_scale".into())
+            })?;
+            let kq_ptr = k_q.contents() as *const u8;
+            let vq_ptr = v_q.contents() as *const u8;
+            let ks_ptr = k_scale.contents() as *const f32;
+            let vs_ptr = v_scale.contents() as *const f32;
+            let ksgn_ptr = k_res_sign.contents() as *const u8;
+            let krs_ptr = k_res_scale.contents() as *const f32;
+            if kq_ptr.is_null()
+                || vq_ptr.is_null()
+                || ks_ptr.is_null()
+                || vs_ptr.is_null()
+                || ksgn_ptr.is_null()
+                || krs_ptr.is_null()
+            {
+                return Err(CoreError::Backend(
+                    "kv cache metal turboquant: null attention buffer contents".into(),
+                ));
+            }
+            let mut scores = vec![0.0f32; seq];
+            let mut q_i8 = vec![0i8; head_dim];
+            let use_int8_dot = tq.is_uniform_8bit(self.kv_dim)
+                && std::env::var("CELLM_TURBOQ_INT8_DOT")
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(true);
+            let use_qjl_corr = std::env::var("CELLM_TURBOQ_QJL_CORR")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+            let use_uniform8_decode = tq.is_uniform_8bit(self.kv_dim);
+            let q8_min = -3.0f32;
+            let q8_step = 6.0f32 / 255.0f32;
+            let mut q_rot = vec![0.0f32; head_dim];
+            let mut v_acc_rot = vec![0.0f32; head_dim];
+            let mut k_scales = vec![0.0f32; seq];
+            let mut v_scales = vec![0.0f32; seq];
+            let mut k_res_scales = vec![0.0f32; seq];
+            let mut row_offs = vec![0usize; seq];
+            let mut sign_bases = vec![0usize; seq];
+            for (t, &base) in bases.iter().enumerate() {
+                let tok = base / self.kv_dim;
+                k_scales[t] = unsafe { *ks_ptr.add(tok) };
+                v_scales[t] = unsafe { *vs_ptr.add(tok) };
+                k_res_scales[t] = unsafe { *krs_ptr.add(tok) };
+                row_offs[t] = tok.saturating_mul(self.row_bytes);
+                sign_bases[t] = base;
+            }
+            out.fill(0.0);
+            for h in 0..n_heads {
+                let kv_h = (h / group_size).min(n_kv_heads.saturating_sub(1));
+                let qh = &q[h * head_dim..(h + 1) * head_dim];
+                rotate_head_forward(
+                    qh,
+                    &tq.rot_sign[kv_h * head_dim..(kv_h + 1) * head_dim],
+                    &mut q_rot,
+                    tq.inv_sqrt_head_dim,
+                );
+                let q_scale = if use_int8_dot {
+                    quantize_symmetric_i8(&q_rot, &mut q_i8)
+                } else {
+                    1.0
+                };
+                for (t, &base) in bases.iter().enumerate() {
+                    let _ = base;
+                    let ks = k_scales[t];
+                    let row_off = row_offs[t];
+                    let k_row = unsafe { std::slice::from_raw_parts(kq_ptr.add(row_off), self.row_bytes) };
+                    let mut dot = if use_int8_dot {
+                        turboquant_dot_rotated_head_int8_uniform8(k_row, kv_h, head_dim, &q_i8, q_scale, ks)
+                    } else {
+                        0.0f32
+                    };
+                    if !use_int8_dot {
+                        for i in 0..head_dim {
+                            let dim = kv_h * head_dim + i;
+                            let rot_q = q_rot[i];
+                            let deq = if use_uniform8_decode {
+                                let idx = k_row[dim] as f32;
+                                (q8_min + idx * q8_step) * ks
+                            } else {
+                                turboquant_decode_rotated_value(k_row, ks, dim, tq)
+                            };
+                            dot += rot_q * deq;
+                        }
+                    }
+                    if use_qjl_corr {
+                        let sign_base = sign_bases[t] + kv_h * head_dim;
+                        let mut corr = 0.0f32;
+                        for i in 0..head_dim {
+                            let dim = kv_h * head_dim + i;
+                            let sign = if unsafe { *ksgn_ptr.add(sign_base + i) } == 0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            corr += (tq.qjl_sign[dim] * q_rot[i]) * sign;
+                        }
+                        dot += (k_res_scales[t] / head_dim as f32) * corr;
+                    }
+                    scores[t] = dot * scale;
+                }
+                softmax_f32_inplace_cpu_local(&mut scores);
+                let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
+                v_acc_rot.fill(0.0);
+                for t in 0..seq {
+                    let vs = v_scales[t];
+                    let row_off = row_offs[t];
+                    let v_row = unsafe { std::slice::from_raw_parts(vq_ptr.add(row_off), self.row_bytes) };
+                    let w = scores[t];
+                    for i in 0..head_dim {
+                        let dim = kv_h * head_dim + i;
+                        let v_rot = if use_uniform8_decode {
+                            let idx = v_row[dim] as f32;
+                            (q8_min + idx * q8_step) * vs
+                        } else {
+                            turboquant_decode_rotated_value(v_row, vs, dim, tq)
+                        };
+                        v_acc_rot[i] += w * v_rot;
+                    }
+                }
+                rotate_head_inverse_inplace(
+                    &mut v_acc_rot,
+                    &tq.rot_sign[kv_h * head_dim..(kv_h + 1) * head_dim],
+                    tq.inv_sqrt_head_dim,
+                );
+                out_h.copy_from_slice(&v_acc_rot);
+            }
         } else {
             dispatch_1d(&self.queue, &self.pso_attn_single_gqa_f32, n_heads as u64, |enc| {
                 enc.set_buffer(0, Some(&self.k), 0);
@@ -1610,7 +2439,9 @@ impl DeviceKvStorage for MetalKvStorage {
             .map_err(|e| CoreError::Backend(format!("kv cache metal attn gqa failed: {e}")))?;
         }
 
-        read_buf_f32(out_buf, out, "out_f32")?;
+        if self.encoding != KvEncodingKind::TurboQuant {
+            read_buf_f32(out_buf, out, "out_f32")?;
+        }
         Ok(())
     }
 }
@@ -1809,7 +2640,12 @@ pub struct MetalKvStorage;
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 impl MetalKvStorage {
-    pub fn new(_total_elems: usize, _kv_dim: usize, _encoding: KvEncodingKind) -> Result<Self, CoreError> {
+    pub fn new(
+        _total_elems: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _encoding: KvEncodingKind,
+    ) -> Result<Self, CoreError> {
         Err(CoreError::Backend(
             "kv cache metal storage is only supported on Apple platforms".into(),
         ))
@@ -1859,9 +2695,18 @@ impl KVCache {
                 v: vec![f16::from_f32(0.0); total_elems],
             }),
             (KvStorageKind::Cpu, KvEncodingKind::TurboQuant) => {
-                Box::new(CpuTurboQuantKvStorage::new(total_elems, layout.kv_dim())?)
+                Box::new(CpuTurboQuantKvStorage::new(
+                    total_elems,
+                    layout.num_kv_heads,
+                    layout.head_dim,
+                )?)
             }
-            (KvStorageKind::Metal, enc) => Box::new(MetalKvStorage::new(total_elems, layout.kv_dim(), enc)?),
+            (KvStorageKind::Metal, enc) => Box::new(MetalKvStorage::new(
+                total_elems,
+                layout.num_kv_heads,
+                layout.head_dim,
+                enc,
+            )?),
         };
 
         Ok(Self {

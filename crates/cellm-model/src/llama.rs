@@ -308,27 +308,27 @@ impl LlamaRunner {
             }
 
             // QKV projections (HF weights are [out, in]).
-            self.linear_f16_out_in(
+            let q_name = format!("model.layers.{layer}.self_attn.q_proj.weight");
+            let k_name = format!("model.layers.{layer}.self_attn.k_proj.weight");
+            let v_name = format!("model.layers.{layer}.self_attn.v_proj.weight");
+            let fused_qkv = self.linear_qkv_f16_out_in(
                 &x_norm,
-                &format!("model.layers.{layer}.self_attn.q_proj.weight"),
+                &q_name,
                 hidden,
+                &k_name,
+                kv_dim,
+                &v_name,
+                kv_dim,
                 hidden,
                 &mut q,
-            )?;
-            self.linear_f16_out_in(
-                &x_norm,
-                &format!("model.layers.{layer}.self_attn.k_proj.weight"),
-                kv_dim,
-                hidden,
                 &mut k,
-            )?;
-            self.linear_f16_out_in(
-                &x_norm,
-                &format!("model.layers.{layer}.self_attn.v_proj.weight"),
-                kv_dim,
-                hidden,
                 &mut v,
             )?;
+            if !fused_qkv {
+                self.linear_f16_out_in(&x_norm, &q_name, hidden, hidden, &mut q)?;
+                self.linear_f16_out_in(&x_norm, &k_name, kv_dim, hidden, &mut k)?;
+                self.linear_f16_out_in(&x_norm, &v_name, kv_dim, hidden, &mut v)?;
+            }
 
             if use_metal_rope {
                 let ops = self.metal_ops.as_mut().unwrap();
@@ -810,6 +810,93 @@ impl LlamaRunner {
             }
         }
         Ok(())
+    }
+
+    fn linear_qkv_f16_out_in(
+        &mut self,
+        x: &[f32],
+        q_weight_name: &str,
+        q_out_dim: usize,
+        k_weight_name: &str,
+        k_out_dim: usize,
+        v_weight_name: &str,
+        v_out_dim: usize,
+        in_dim: usize,
+        q_out: &mut [f32],
+        k_out: &mut [f32],
+        v_out: &mut [f32],
+    ) -> Result<bool, CoreError> {
+        if self.metal_ops.is_none() {
+            return Ok(false);
+        }
+        if x.len() != in_dim || q_out.len() != q_out_dim || k_out.len() != k_out_dim || v_out.len() != v_out_dim {
+            return Err(CoreError::Backend(format!(
+                "linear qkv dims mismatch: x={} q={} k={} v={} expected in={} q_out={} k_out={} v_out={}",
+                x.len(), q_out.len(), k_out.len(), v_out.len(), in_dim, q_out_dim, k_out_dim, v_out_dim
+            )));
+        }
+
+        let q_resolved = self.resolve_name(q_weight_name)?;
+        let k_resolved = self.resolve_name(k_weight_name)?;
+        let v_resolved = self.resolve_name(v_weight_name)?;
+
+        let q_meta = self.tensor_meta_by_exact_name(&q_resolved).ok_or_else(|| {
+            CoreError::Backend(format!("unknown tensor {q_resolved}"))
+        })?;
+        let k_meta = self.tensor_meta_by_exact_name(&k_resolved).ok_or_else(|| {
+            CoreError::Backend(format!("unknown tensor {k_resolved}"))
+        })?;
+        let v_meta = self.tensor_meta_by_exact_name(&v_resolved).ok_or_else(|| {
+            CoreError::Backend(format!("unknown tensor {v_resolved}"))
+        })?;
+
+        if q_meta.shape.len() != 2 || k_meta.shape.len() != 2 || v_meta.shape.len() != 2 {
+            return Err(CoreError::Backend(format!(
+                "qkv fused expects 2D weights, got q={:?} k={:?} v={:?}",
+                q_meta.shape, k_meta.shape, v_meta.shape
+            )));
+        }
+        if q_meta.shape != [q_out_dim, in_dim]
+            || k_meta.shape != [k_out_dim, in_dim]
+            || v_meta.shape != [v_out_dim, in_dim]
+        {
+            return Err(CoreError::Backend(format!(
+                "qkv fused shape mismatch: q={:?} k={:?} v={:?} expected q=[{},{}] k=[{},{}] v=[{},{}]",
+                q_meta.shape, k_meta.shape, v_meta.shape, q_out_dim, in_dim, k_out_dim, in_dim, v_out_dim, in_dim
+            )));
+        }
+        if q_meta.dtype != "f16" || k_meta.dtype != "f16" || v_meta.dtype != "f16" {
+            return Ok(false);
+        }
+
+        let wq = self.tensor_f16_by_exact_name(&q_resolved)?;
+        let wk = self.tensor_f16_by_exact_name(&k_resolved)?;
+        let wv = self.tensor_f16_by_exact_name(&v_resolved)?;
+        let wq = unsafe { std::slice::from_raw_parts(wq.as_ptr(), wq.len()) };
+        let wk = unsafe { std::slice::from_raw_parts(wk.as_ptr(), wk.len()) };
+        let wv = unsafe { std::slice::from_raw_parts(wv.as_ptr(), wv.len()) };
+
+        self.metal_ops
+            .as_mut()
+            .unwrap()
+            .logits_qkv_f16(
+                x,
+                wq,
+                wk,
+                wv,
+                q_out_dim,
+                k_out_dim,
+                v_out_dim,
+                in_dim,
+                &q_resolved,
+                &k_resolved,
+                &v_resolved,
+                q_out,
+                k_out,
+                v_out,
+            )
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+        Ok(true)
     }
 
     fn resolve_name(&self, name: &str) -> Result<String, CoreError> {

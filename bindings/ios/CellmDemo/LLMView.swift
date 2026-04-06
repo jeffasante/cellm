@@ -3,6 +3,58 @@ import UniformTypeIdentifiers
 import Dispatch
 
 struct LLMView: View {
+    private struct ChatTurn: Identifiable {
+        let id = UUID()
+        let role: String
+        let text: String
+    }
+
+    private final class LoadedRuntime {
+        let key: String
+        let tokenizer: CellmTokenizer
+        let engine: CellmEngine
+        let initLines: [String]
+
+        init(key: String, tokenizer: CellmTokenizer, engine: CellmEngine, initLines: [String]) {
+            self.key = key
+            self.tokenizer = tokenizer
+            self.engine = engine
+            self.initLines = initLines
+        }
+    }
+
+    private final class RuntimeCache {
+        static let shared = RuntimeCache()
+        private let lock = NSLock()
+        private var loaded: LoadedRuntime?
+        private init() {}
+
+        func clear() {
+            lock.lock()
+            loaded = nil
+            lock.unlock()
+        }
+
+        func getOrCreate(
+            key: String,
+            build: () throws -> LoadedRuntime
+        ) throws -> (runtime: LoadedRuntime, created: Bool) {
+            lock.lock()
+            if let loaded, loaded.key == key {
+                lock.unlock()
+                return (loaded, false)
+            }
+            lock.unlock()
+
+            let newRuntime = try build()
+
+            lock.lock()
+            loaded = newRuntime
+            lock.unlock()
+            return (newRuntime, true)
+        }
+    }
+
     private enum GenerationPreset: String, CaseIterable, Identifiable {
         case chat = "Chat"
         case balanced = "Balanced"
@@ -44,9 +96,9 @@ struct LLMView: View {
 
         var maxTokens: Int {
             switch self {
-            case .chat: return 32
-            case .balanced: return 64
-            case .strict: return 32
+            case .chat: return 96
+            case .balanced: return 128
+            case .strict: return 64
             }
         }
     }
@@ -69,6 +121,9 @@ struct LLMView: View {
     @State private var backendWarning: String?
     @State private var selectedPreset: GenerationPreset = .chat
     @State private var selectedSampleLabel: String = ""
+    @State private var chatInput: String = ""
+    @State private var chatTurns: [ChatTurn] = []
+    @State private var runtimeStatus: String = "Runtime: not loaded"
 
     @State private var showModelPicker = false
     @State private var showTokenizerPicker = false
@@ -108,6 +163,7 @@ struct LLMView: View {
                 filesCard
                 storageCard
                 promptCard
+                conversationCard
                 presetCard
                 backendCard
                 generateButton
@@ -196,9 +252,9 @@ struct LLMView: View {
                 Text(downloadStatus).font(.footnote).foregroundStyle(.secondary)
             }
             if isDownloading {
-                ProgressView(value: downloadProgress)
+                ProgressView(value: safeUnitProgress(downloadProgress))
                     .progressViewStyle(.linear)
-                Text("\(Int((downloadProgress * 100.0).rounded()))%")
+                Text("\(Int((safeUnitProgress(downloadProgress) * 100.0).rounded()))%")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 if !currentDownloadFile.isEmpty {
@@ -227,6 +283,53 @@ struct LLMView: View {
                 .padding(8)
                 .background(Color(.systemBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 10))
+        }
+    }
+
+    private var conversationCard: some View {
+        card("Conversation") {
+            HStack(spacing: 8) {
+                Button("Load Runtime") { preloadRuntime() }
+                    .buttonStyle(.bordered)
+                    .disabled(isRunning || modelURL == nil || tokenizerURL == nil)
+                Button("Unload Runtime") { unloadRuntime() }
+                    .buttonStyle(.bordered)
+                    .disabled(isRunning)
+                Button("Clear Chat") { chatTurns.removeAll() }
+                    .buttonStyle(.bordered)
+                    .disabled(isRunning || chatTurns.isEmpty)
+            }
+            Text(runtimeStatus)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            if chatTurns.isEmpty {
+                Text("No conversation yet.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(chatTurns) { turn in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(turn.role)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(turn.text)
+                            .font(.body)
+                    }
+                    .padding(10)
+                    .background(Color(.systemBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+            }
+            TextField("Type a message…", text: $chatInput)
+                .textFieldStyle(.roundedBorder)
+            Button(isRunning ? "Sending…" : "Send Message") { sendConversationMessage() }
+                .buttonStyle(.borderedProminent)
+                .disabled(
+                    isRunning ||
+                    modelURL == nil ||
+                    tokenizerURL == nil ||
+                    chatInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                )
         }
     }
 
@@ -375,7 +478,12 @@ struct LLMView: View {
         .opacity(disabled ? 0.6 : 1.0)
     }
 
-    private func run(exerciseSuspendResume: Bool = false, maxTokensOverride: Int? = nil) {
+    private func run(
+        exerciseSuspendResume: Bool = false,
+        maxTokensOverride: Int? = nil,
+        promptOverride: String? = nil,
+        onFinalText: ((String) -> Void)? = nil
+    ) {
         // Dismiss keyboard
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
 
@@ -393,7 +501,7 @@ struct LLMView: View {
             errorText = "Selected tokenizer file is missing. Re-pick tokenizer.json or download tokenizer assets."
             return
         }
-        let promptText = prompt
+        let promptText = promptOverride ?? prompt
         let backend = selectedBackend
         let thermal = selectedThermalLevel
         let shouldForceStrictForExperimentalQwen = (qwenVariant == .experimental && selectedPreset != .strict)
@@ -412,56 +520,84 @@ struct LLMView: View {
         isRunning = true
         Task.detached(priority: .userInitiated) {
             do {
-                let initStart = Date()
                 var initLogLines: [String] = []
                 if backend == .metal, let metalErr = CellmFFI.metalSmokeError() {
                     throw CellmError.message("Metal requested but unavailable: \(metalErr)")
                 }
-                let afterPreflight = Date()
-                initLogLines.append(
-                    String(
-                        format: "init_preflight=%.1fms",
-                        afterPreflight.timeIntervalSince(initStart) * 1000.0
-                    )
-                )
-
-                let tokStart = Date()
-                let tok = try CellmTokenizer(tokenizerURL: tokenizerURL)
-                let tokEnd = Date()
-                initLogLines.append(
-                    String(
-                        format: "init_tokenizer=%.1fms",
-                        tokEnd.timeIntervalSince(tokStart) * 1000.0
-                    )
-                )
-
-                let engineStart = Date()
-                let eng = try CellmEngine(
+                let runtimeKey = runtimeCacheKey(
                     modelURL: modelURL,
-                    tokenizer: tok,
+                    tokenizerURL: tokenizerURL,
+                    backend: backend,
                     tokensPerBlock: tokensPerBlock,
                     totalBlocks: totalBlocks,
                     topK: runtimeTopK,
                     temperature: runtimeTemperature,
                     repeatPenalty: runtimeRepeatPenalty,
-                    repeatWindow: runtimeRepeatWindow,
-                    seed: UInt64(Date().timeIntervalSince1970 * 1000.0),
-                    backend: backend
+                    repeatWindow: runtimeRepeatWindow
                 )
-                let engineEnd = Date()
-                initLogLines.append(
-                    String(
-                        format: "init_engine=%.1fms",
-                        engineEnd.timeIntervalSince(engineStart) * 1000.0
+                let runtimeResult = try RuntimeCache.shared.getOrCreate(key: runtimeKey) {
+                    let initStart = Date()
+                    var lines: [String] = []
+
+                    let afterPreflight = Date()
+                    lines.append(
+                        String(
+                            format: "init_preflight=%.1fms",
+                            afterPreflight.timeIntervalSince(initStart) * 1000.0
+                        )
                     )
-                )
-                initLogLines.append(
-                    String(
-                        format: "init_total=%.1fms",
-                        engineEnd.timeIntervalSince(initStart) * 1000.0
+
+                    let tokStart = Date()
+                    let tok = try CellmTokenizer(tokenizerURL: tokenizerURL)
+                    let tokEnd = Date()
+                    lines.append(
+                        String(
+                            format: "init_tokenizer=%.1fms",
+                            tokEnd.timeIntervalSince(tokStart) * 1000.0
+                        )
                     )
-                )
-                initLogLines.append("requested_backend=\(backend.label.lowercased()) active_backend=\(eng.activeBackend)")
+
+                    let engineStart = Date()
+                    let eng = try CellmEngine(
+                        modelURL: modelURL,
+                        tokenizer: tok,
+                        tokensPerBlock: tokensPerBlock,
+                        totalBlocks: totalBlocks,
+                        topK: runtimeTopK,
+                        temperature: runtimeTemperature,
+                        repeatPenalty: runtimeRepeatPenalty,
+                        repeatWindow: runtimeRepeatWindow,
+                        seed: UInt64(Date().timeIntervalSince1970 * 1000.0),
+                        backend: backend
+                    )
+                    let engineEnd = Date()
+                    lines.append(
+                        String(
+                            format: "init_engine=%.1fms",
+                            engineEnd.timeIntervalSince(engineStart) * 1000.0
+                        )
+                    )
+                    lines.append(
+                        String(
+                            format: "init_total=%.1fms",
+                            engineEnd.timeIntervalSince(initStart) * 1000.0
+                        )
+                    )
+                    lines.append("requested_backend=\(backend.label.lowercased()) active_backend=\(eng.activeBackend)")
+                    return LoadedRuntime(key: runtimeKey, tokenizer: tok, engine: eng, initLines: lines)
+                }
+
+                let eng = runtimeResult.runtime.engine
+                if runtimeResult.created {
+                    initLogLines.append(contentsOf: runtimeResult.runtime.initLines)
+                    print("[CellmDebug] runtime cache: created key=\(runtimeKey)")
+                } else {
+                    initLogLines.append("init_runtime=reused")
+                    initLogLines.append("requested_backend=\(backend.label.lowercased()) active_backend=\(eng.activeBackend)")
+                    print("[CellmDebug] runtime cache: reused key=\(runtimeKey)")
+                }
+                try eng.resetSession()
+                initLogLines.append("session=reset")
 
                 let text = try eng.generate(
                     prompt: promptText,
@@ -476,6 +612,7 @@ struct LLMView: View {
                 )
                 await MainActor.run {
                     self.output = prettyOutput(text)
+                    onFinalText?(text)
                     if let stats = eng.lastGenerationStats {
                         initLogLines.append("prompt_style=\(eng.lastPromptStyle)")
                         if !eng.lastDebugTrace.isEmpty {
@@ -502,6 +639,9 @@ struct LLMView: View {
                     }
                     warnings.append("Mobile KV cache tuned for latency (block=\(tokensPerBlock), total=\(totalBlocks)).")
                     self.backendWarning = warnings.isEmpty ? nil : warnings.joined(separator: " ")
+                    self.runtimeStatus = runtimeResult.created
+                        ? "Runtime: loaded and ready (\(eng.activeBackend))"
+                        : "Runtime: reused (\(eng.activeBackend))"
                     self.isRunning = false
                 }
             } catch {
@@ -517,10 +657,67 @@ struct LLMView: View {
                     preset=\(preset.rawValue)
                     max_tokens=\(effectiveMaxTokens)
                     """
+                    self.runtimeStatus = "Runtime: error"
                     self.isRunning = false
                 }
             }
         }
+    }
+
+    private func runtimeCacheKey(
+        modelURL: URL,
+        tokenizerURL: URL,
+        backend: CellmBackend,
+        tokensPerBlock: UInt32,
+        totalBlocks: UInt32,
+        topK: UInt32,
+        temperature: Float,
+        repeatPenalty: Float,
+        repeatWindow: UInt32
+    ) -> String {
+        "\(modelURL.path)|\(tokenizerURL.path)|\(backend.rawValue)|\(tokensPerBlock)|\(totalBlocks)|\(topK)|\(temperature)|\(repeatPenalty)|\(repeatWindow)"
+    }
+
+    private func preloadRuntime() {
+        runtimeStatus = "Runtime: loading..."
+        run(maxTokensOverride: 1, promptOverride: "Return exactly one uppercase letter: R")
+    }
+
+    private func unloadRuntime() {
+        RuntimeCache.shared.clear()
+        runtimeStatus = "Runtime: unloaded"
+    }
+
+    private func sendConversationMessage() {
+        let msg = chatInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !msg.isEmpty else { return }
+        chatTurns.append(ChatTurn(role: "User", text: msg))
+        chatInput = ""
+        let transcript = conversationPrompt(from: chatTurns, maxTurns: 6, maxChars: 1200)
+        run(maxTokensOverride: 48, promptOverride: transcript) { finalText in
+            let assistantText = prettyOutput(finalText).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !assistantText.isEmpty {
+                chatTurns.append(ChatTurn(role: "Assistant", text: assistantText))
+            }
+        }
+    }
+
+    private func conversationPrompt(from turns: [ChatTurn], maxTurns: Int, maxChars: Int) -> String {
+        let recentTurns = Array(turns.suffix(maxTurns))
+        var lines: [String] = []
+        var total = 0
+        for turn in recentTurns.reversed() {
+            let line = "\(turn.role): \(turn.text)"
+            total += line.count + 1
+            if total > maxChars { break }
+            lines.append(line)
+        }
+        let convo = lines.reversed().joined(separator: "\n")
+        return """
+You are a concise helpful assistant.
+\(convo)
+Assistant:
+"""
     }
 
     private func downloadQwenSampleAssets() {
@@ -1098,14 +1295,22 @@ struct LLMView: View {
     }
 
     private func setDownloadProgress(completedFiles: Double, progress: RemoteAssets.DownloadProgress, totalFiles: Double, label: String, fileName: String) {
-        let clamped = min(1.0, max(0.0, progress.fraction))
-        let overall = min(1.0, max(0.0, (completedFiles + clamped) / totalFiles))
+        let clamped = safeUnitProgress(progress.fraction)
+        let safeTotal = (totalFiles.isFinite && totalFiles > 0.0) ? totalFiles : 1.0
+        let overall = safeUnitProgress((completedFiles + clamped) / safeTotal)
         DispatchQueue.main.async {
             self.downloadProgress = overall
             self.downloadStatus = "Downloading \(label) sample files... \(Int((overall * 100).rounded()))%"
             self.currentDownloadFile = URL(fileURLWithPath: fileName).lastPathComponent
             self.currentDownloadSizeText = self.formatSizeProgress(received: progress.bytesReceived, expected: progress.bytesExpected)
         }
+    }
+
+    private func safeUnitProgress(_ x: Double) -> Double {
+        guard x.isFinite else { return 0.0 }
+        if x < 0.0 { return 0.0 }
+        if x > 1.0 { return 1.0 }
+        return x
     }
 
     private func formatSizeProgress(received: Int64, expected: Int64) -> String {

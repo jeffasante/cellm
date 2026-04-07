@@ -87,7 +87,7 @@ The app normalizes GitHub `blob` URLs to raw-download URLs before fetching.
 
 To reduce long decode stalls and memory churn on iPhone when using Qwen with Metal selected, we patched the KV cache Metal path in:
 
-- `/Users/jeff/Desktop/cellm/crates/cellm-cache/src/kvcache.rs`
+- `crates/cellm-cache/src/kvcache.rs`
 
 ### What we changed
 

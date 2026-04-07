@@ -12,11 +12,13 @@ struct ChatView: View {
         case llmModel
         case tokenizer
         case vlmModel
+        case audioFile
 
         var id: String { rawValue }
         var allowedTypes: [UTType] {
             switch self {
             case .tokenizer: return [.json]
+            case .audioFile: return [.audio]
             case .llmModel, .vlmModel: return [.item]
             }
         }
@@ -27,6 +29,7 @@ struct ChatView: View {
         let role: String
         let text: String
         let imageData: Data?
+        let audioFileName: String?
     }
 
     @State private var messages: [ChatMessage] = []
@@ -41,6 +44,7 @@ struct ChatView: View {
     @State private var selectedImageItem: PhotosPickerItem?
     @State private var pendingImageData: Data?
     @State private var pendingImage: Image?
+    @State private var pendingAudioURL: URL?
 
     @State private var selectedBackend: CellmBackend = .metal
     @State private var activeBackend: String = ""
@@ -76,6 +80,8 @@ struct ChatView: View {
                     llmTokenizerURL = persistPickedFile(url, subdir: "picked/chat/tokenizer")
                 case .vlmModel:
                     vlmModelURL = persistPickedFile(url, subdir: "picked/chat/vlm")
+                case .audioFile:
+                    pendingAudioURL = persistPickedFile(url, subdir: "picked/chat/audio")
                 }
             }
         }
@@ -213,6 +219,23 @@ struct ChatView: View {
                 .background(Color(.secondarySystemGroupedBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 12))
             }
+            if let audioURL = pendingAudioURL {
+                HStack(spacing: 10) {
+                    Image(systemName: "waveform")
+                        .foregroundStyle(.blue)
+                    Text("Audio attached: \(audioURL.lastPathComponent)")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Remove") {
+                        pendingAudioURL = nil
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(10)
+                .background(Color(.secondarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+            }
 
             HStack(alignment: .bottom, spacing: 8) {
                 PhotosPicker(selection: $selectedImageItem, matching: .images) {
@@ -222,6 +245,16 @@ struct ChatView: View {
                         .background(Color(.secondarySystemGroupedBackground))
                         .clipShape(Circle())
                 }
+                Button {
+                    pickerTarget = .audioFile
+                } label: {
+                    Image(systemName: "waveform")
+                        .font(.title3)
+                        .padding(10)
+                        .background(Color(.secondarySystemGroupedBackground))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
                 TextField("Message", text: $inputText, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
                     .lineLimit(1...5)
@@ -249,6 +282,11 @@ struct ChatView: View {
                     .frame(maxWidth: 220)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
             }
+            if let audioFileName = msg.audioFileName {
+                Label("Audio: \(audioFileName)", systemImage: "waveform")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
             Text(msg.text)
                 .padding(10)
                 .background(msg.role == "User" ? Color.blue.opacity(0.12) : Color(.secondarySystemGroupedBackground))
@@ -265,15 +303,24 @@ struct ChatView: View {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
 
-        let attached = pendingImageData
-        messages.append(ChatMessage(role: "User", text: text, imageData: attached))
+        let attachedImage = pendingImageData
+        let attachedAudio = pendingAudioURL
+        messages.append(
+            ChatMessage(
+                role: "User",
+                text: text,
+                imageData: attachedImage,
+                audioFileName: attachedAudio?.lastPathComponent
+            )
+        )
         inputText = ""
         pendingImage = nil
         pendingImageData = nil
         selectedImageItem = nil
+        pendingAudioURL = nil
 
         isRunning = true
-        messages.append(ChatMessage(role: "Assistant", text: "", imageData: nil))
+        messages.append(ChatMessage(role: "Assistant", text: "", imageData: nil, audioFileName: nil))
         let assistantIndex = messages.count - 1
 
         let backend = selectedBackend
@@ -282,17 +329,56 @@ struct ChatView: View {
         let currentVLMModelURL = vlmModelURL
         let currentLLMModelURL = llmModelURL
         let currentLLMTokenizerURL = llmTokenizerURL
+        let currentAudioURL = attachedAudio
 
         Task.detached(priority: .userInitiated) {
             do {
                 let initStart = Date()
                 var diag: [String] = []
-                if let imageBytes = attached {
+                guard let llmModelURL = currentLLMModelURL,
+                      let llmTokenizerURL = currentLLMTokenizerURL else {
+                    throw CellmError.message("Pick LLM model + tokenizer for chat.")
+                }
+                let initTokenizerStart = Date()
+                let tok = try CellmTokenizer(tokenizerURL: llmTokenizerURL)
+                let initTokenizerMs = Date().timeIntervalSince(initTokenizerStart) * 1000.0
+                let initEngineStart = Date()
+                let eng = try CellmEngine(
+                    modelURL: llmModelURL,
+                    tokenizer: tok,
+                    topK: 20,
+                    temperature: 0.2,
+                    repeatPenalty: 1.08,
+                    repeatWindow: 96,
+                    backend: backend
+                )
+                let initEngineMs = Date().timeIntervalSince(initEngineStart) * 1000.0
+                let initTotalMs = Date().timeIntervalSince(initStart) * 1000.0
+                diag.append(String(format: "init_tokenizer=%.1fms init_engine=%.1fms init_total=%.1fms", initTokenizerMs, initEngineMs, initTotalMs))
+                diag.append("requested_backend=\(backend.label.lowercased()) active_backend=\(eng.activeBackend)")
+
+                if eng.isLiteRtProxy, (attachedImage != nil || currentAudioURL != nil) {
+                    let tempImageURL = attachedImage.flatMap { writeTempImageForLiteRt($0) }
+                    let reply = try eng.generate(
+                        prompt: text,
+                        maxNewTokens: 128,
+                        imageURL: tempImageURL,
+                        audioURL: currentAudioURL
+                    )
+                    await MainActor.run {
+                        activeBackend = eng.activeBackend
+                        runDiagnostics = (diag + ["mode=litert_multimodal"]).joined(separator: "\n")
+                        messages[assistantIndex] = ChatMessage(role: "Assistant", text: prettyOutput(reply), imageData: nil, audioFileName: nil)
+                        isRunning = false
+                    }
+                    return
+                }
+
+                if let imageBytes = attachedImage {
                     guard let vlmModelURL = currentVLMModelURL else {
                         throw CellmError.message("Attach a VLM model to use image chat.")
                     }
-                    let initEngineStart = Date()
-                    let eng = try CellmVLMEngine(
+                    let vlmEng = try CellmVLMEngine(
                         modelURL: vlmModelURL,
                         topK: 20,
                         temperature: 0.2,
@@ -300,87 +386,52 @@ struct ChatView: View {
                         repeatWindow: 64,
                         backend: backend
                     )
-                    let initEngineMs = Date().timeIntervalSince(initEngineStart) * 1000.0
-                    let reply = try eng.describe(imageBytes: imageBytes, prompt: imagePrompt)
-                    let initTotalMs = Date().timeIntervalSince(initStart) * 1000.0
-                    diag.append(String(format: "init_engine=%.1fms init_total=%.1fms", initEngineMs, initTotalMs))
-                    diag.append("requested_backend=\(backend.label.lowercased()) active_backend=\(eng.activeBackend)")
-                    if let t = eng.lastTimings {
+                    let reply = try vlmEng.describe(imageBytes: imageBytes, prompt: imagePrompt)
+                    await MainActor.run {
+                        activeBackend = vlmEng.activeBackend
+                        runDiagnostics = (diag + ["mode=vlm_image"]).joined(separator: "\n")
+                        messages[assistantIndex] = ChatMessage(role: "Assistant", text: sanitizeVlmOutput(reply), imageData: nil, audioFileName: nil)
+                        isRunning = false
+                    }
+                    return
+                }
+
+                let reply = try eng.generate(
+                    prompt: textTranscript,
+                    maxNewTokens: 128,
+                    thermalLevel: .nominal,
+                    exerciseSuspendResume: false,
+                    onToken: { piece in
+                        Task { @MainActor in
+                            let existing = messages[assistantIndex].text
+                            messages[assistantIndex] = ChatMessage(role: "Assistant", text: existing + piece, imageData: nil, audioFileName: nil)
+                        }
+                    }
+                )
+                await MainActor.run {
+                    activeBackend = eng.activeBackend
+                    if let stats = eng.lastGenerationStats {
                         diag.append(
                             String(
-                                format: "vlm patch=%.1fms encoder=%.1fms decode=%.1fms total=%.1fms",
-                                finiteMs(t.patchMs),
-                                finiteMs(t.encoderMs),
-                                finiteMs(t.decodeMs),
-                                finiteMs(t.totalMs)
+                                format: "prompt_tokens=%d generated_tokens=%d prefill=%.1fms decode=%.1fms total=%.1fms stop_reason=%@",
+                                stats.promptTokenCount,
+                                stats.generatedTokenCount,
+                                finiteMs(stats.prefillMs),
+                                finiteMs(stats.decodeMs),
+                                finiteMs(stats.totalMs),
+                                stats.stopReason
                             )
                         )
                     }
-                    await MainActor.run {
-                        activeBackend = eng.activeBackend
-                        runDiagnostics = diag.joined(separator: "\n")
-                        messages[assistantIndex] = ChatMessage(role: "Assistant", text: sanitizeVlmOutput(reply), imageData: nil)
-                        isRunning = false
-                    }
-                } else {
-                    guard let llmModelURL = currentLLMModelURL,
-                          let llmTokenizerURL = currentLLMTokenizerURL else {
-                        throw CellmError.message("Pick LLM model + tokenizer for text chat (or attach image + VLM model).")
-                    }
-                    let initTokenizerStart = Date()
-                    let tok = try CellmTokenizer(tokenizerURL: llmTokenizerURL)
-                    let initTokenizerMs = Date().timeIntervalSince(initTokenizerStart) * 1000.0
-                    let initEngineStart = Date()
-                    let eng = try CellmEngine(
-                        modelURL: llmModelURL,
-                        tokenizer: tok,
-                        topK: 20,
-                        temperature: 0.2,
-                        repeatPenalty: 1.08,
-                        repeatWindow: 96,
-                        backend: backend
-                    )
-                    let initEngineMs = Date().timeIntervalSince(initEngineStart) * 1000.0
-                    let initTotalMs = Date().timeIntervalSince(initStart) * 1000.0
-                    diag.append(String(format: "init_tokenizer=%.1fms init_engine=%.1fms init_total=%.1fms", initTokenizerMs, initEngineMs, initTotalMs))
-                    diag.append("requested_backend=\(backend.label.lowercased()) active_backend=\(eng.activeBackend)")
-                    let reply = try eng.generate(
-                        prompt: textTranscript,
-                        maxNewTokens: 128,
-                        thermalLevel: .nominal,
-                        exerciseSuspendResume: false,
-                        onToken: { piece in
-                            Task { @MainActor in
-                                let existing = messages[assistantIndex].text
-                                messages[assistantIndex] = ChatMessage(role: "Assistant", text: existing + piece, imageData: nil)
-                            }
-                        }
-                    )
-                    await MainActor.run {
-                        activeBackend = eng.activeBackend
-                        if let stats = eng.lastGenerationStats {
-                            diag.append(
-                                String(
-                                    format: "prompt_tokens=%d generated_tokens=%d prefill=%.1fms decode=%.1fms total=%.1fms stop_reason=%@",
-                                    stats.promptTokenCount,
-                                    stats.generatedTokenCount,
-                                    finiteMs(stats.prefillMs),
-                                    finiteMs(stats.decodeMs),
-                                    finiteMs(stats.totalMs),
-                                    stats.stopReason
-                                )
-                            )
-                        }
-                        runDiagnostics = diag.joined(separator: "\n")
-                        messages[assistantIndex] = ChatMessage(role: "Assistant", text: prettyOutput(reply), imageData: nil)
-                        isRunning = false
-                    }
+                    runDiagnostics = diag.joined(separator: "\n")
+                    messages[assistantIndex] = ChatMessage(role: "Assistant", text: prettyOutput(reply), imageData: nil, audioFileName: nil)
+                    isRunning = false
                 }
             } catch {
                 await MainActor.run {
                     errorText = String(describing: error)
                     if assistantIndex < messages.count {
-                        messages[assistantIndex] = ChatMessage(role: "Assistant", text: "", imageData: nil)
+                        messages[assistantIndex] = ChatMessage(role: "Assistant", text: "", imageData: nil, audioFileName: nil)
                     }
                     isRunning = false
                 }
@@ -481,6 +532,18 @@ struct ChatView: View {
         return rendered.jpegData(compressionQuality: 0.95)
     }
 
+    private func writeTempImageForLiteRt(_ data: Data) -> URL? {
+        do {
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("cellm_chat_litert_\(UUID().uuidString)")
+                .appendingPathExtension("jpg")
+            try data.write(to: url, options: .atomic)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
     private func restoreDefaults() {
         if let modelPath = UserDefaults.standard.string(forKey: SharedSelection.llmModelPath),
            let tokPath = UserDefaults.standard.string(forKey: SharedSelection.llmTokenizerPath) {
@@ -508,10 +571,10 @@ struct ChatView: View {
         }
         if messages.isEmpty {
             messages = [
-                ChatMessage(role: "Assistant", text: "Hi. You can chat with text, or attach an image and ask about it.", imageData: nil)
+                ChatMessage(role: "Assistant", text: "Hi. You can chat with text, attach an image, or attach audio (LiteRT Gemma).", imageData: nil, audioFileName: nil)
             ]
         }
-        infoText = "Text turns use LLM model/tokenizer. Image turns use VLM model."
+        infoText = "Text uses LLM model/tokenizer. Image uses LiteRT (if selected) or VLM. Audio uses LiteRT."
     }
 
     private func persistSharedSelection() {
@@ -524,14 +587,18 @@ struct ChatView: View {
     }
 
     private func selectGemmaPreset(silentOnMissing: Bool = false) {
-        let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3FileName)
+        let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bFileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3FileName)
             ?? RemoteAssets.existingDocumentsFile(fileName: "gemma-3-1b-it-int8.cellmd")
-        let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerFileName)
+        let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bTokenizerFileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerFileName)
             ?? RemoteAssets.existingDocumentsFile(fileName: "tokenizer-gemma-3-1b-it.json")
         if let model, let tok {
             llmModelURL = model
             llmTokenizerURL = tok
-            selectedSampleLabel = "Gemma3-1B-IT"
+            selectedSampleLabel = model.lastPathComponent.contains("gemma-4-2p3b-it")
+                ? "Gemma-4-2P3B-IT (LiteRT)"
+                : "Gemma3-1B-IT"
             errorText = nil
         } else if !silentOnMissing {
             errorText = "Gemma files not found in Documents/samples."

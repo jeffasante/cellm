@@ -41,6 +41,11 @@ pub struct GemmaRunner {
     use_metal_norm: bool,
     use_metal_rope: bool,
     use_metal_logits: bool,
+    gemma4_disable_q_prescale: bool,
+    gemma4_disable_per_layer_input: bool,
+    gemma4_disable_layer_output_scale: bool,
+    gemma4_disable_embed_scale: bool,
+    gemma4_disable_per_token_embed_scale: bool,
 }
 
 enum GemmaLinearBackend {
@@ -103,7 +108,13 @@ impl GemmaRunner {
             || source_model_type.is_some_and(|mt| mt.starts_with("gemma3"));
         let is_gemma4_text = h.model_type.starts_with("gemma4")
             || source_model_type.is_some_and(|mt| mt.starts_with("gemma4"));
-        let rmsnorm_weight_is_offset = !is_gemma4_text;
+        let mut rmsnorm_weight_is_offset = !is_gemma4_text;
+        if std::env::var("CELLM_GEMMA_FORCE_RMS_OFFSET_ONE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            rmsnorm_weight_is_offset = true;
+        }
         // Gemma3 uses mixed attention: sliding layers use local RoPE base 10k, while
         // periodic full-attention layers use the global RoPE theta from config.
         let (sliding_window, sliding_window_pattern, gemma4_sliding_mask, gemma4_shared_kv_layers, rope_theta_sliding) =
@@ -115,8 +126,15 @@ impl GemmaRunner {
                 // Infer sliding mask directly from layer attention shape: smaller q_dim layers are SWA.
                 let max_q = max_q_dim.max(1);
                 let mask = layer_attn.iter().map(|s| s.q_dim < max_q).collect::<Vec<_>>();
-                // Gemma4 E2B uses shared KV layers (20 in published configs).
-                (512usize, usize::MAX, mask, 20usize, 10_000.0f32)
+                // Shared-KV layout varies by checkpoint/export. Prefer explicit metadata,
+                // then infer from missing trailing K/V projection tensors; otherwise disable.
+                let shared_kv = infer_gemma4_shared_kv_layers(
+                    &file,
+                    &tensor_prefix,
+                    cfg.num_hidden_layers,
+                    h.source_text_config.as_ref(),
+                );
+                (512usize, usize::MAX, mask, shared_kv, 10_000.0f32)
             } else {
                 (usize::MAX, usize::MAX, Vec::new(), 0usize, cfg.rope_theta)
             };
@@ -159,6 +177,21 @@ impl GemmaRunner {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             use_metal_logits: std::env::var("CELLM_GEMMA_USE_METAL_LOGITS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            gemma4_disable_q_prescale: std::env::var("CELLM_GEMMA4_DISABLE_Q_PRESCALE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            gemma4_disable_per_layer_input: std::env::var("CELLM_GEMMA4_DISABLE_PER_LAYER_INPUT")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            gemma4_disable_layer_output_scale: std::env::var("CELLM_GEMMA4_DISABLE_LAYER_OUTPUT_SCALE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            gemma4_disable_embed_scale: std::env::var("CELLM_GEMMA4_DISABLE_EMBED_SCALE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            gemma4_disable_per_token_embed_scale: std::env::var("CELLM_GEMMA4_DISABLE_PER_TOKEN_EMBED_SCALE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
         })
@@ -573,7 +606,7 @@ impl GemmaRunner {
             }
             // Gemma4 attention uses scaling=1.0 in HF; KV kernel applies 1/sqrt(head_dim),
             // so pre-scale queries by sqrt(head_dim) to match Gemma4 behavior.
-            let q_attn_scaled: Option<Vec<f32>> = if self.is_gemma4_text {
+            let q_attn_scaled: Option<Vec<f32>> = if self.is_gemma4_text && !self.gemma4_disable_q_prescale {
                 let s = (head_dim as f32).sqrt();
                 Some(q_slice.iter().map(|&v| v * s).collect())
             } else {
@@ -680,6 +713,7 @@ impl GemmaRunner {
                 for i in 0..hidden { x[i] = x_norm[i] + x_residual[i]; }
             }
 
+            if !self.gemma4_disable_per_layer_input {
             if let (Some(spec), Some(per_input_all)) = (&self.per_layer_input, per_layer_input) {
                 let per_layer_dim = spec.per_layer_dim;
                 let l0 = layer * per_layer_dim;
@@ -721,8 +755,9 @@ impl GemmaRunner {
                     x[i] = residual[i] + x_norm[i];
                 }
             }
+            }
 
-            if self.is_gemma4_text {
+            if self.is_gemma4_text && !self.gemma4_disable_layer_output_scale {
                 let scale_name = self.resolve_name(&format!("model.layers.{layer}.layer_output_scale.weight"))?;
                 let scale = self.tensor_f16_by_exact_name(&scale_name)?;
                 if scale.len() == 1 {
@@ -890,7 +925,11 @@ impl GemmaRunner {
         let vocab = self.cfg.vocab_size;
         let t = (token as usize) % vocab;
         let row = &embed[t * hidden..(t + 1) * hidden];
-        let embed_scale = (hidden as f32).sqrt();
+        let embed_scale = if self.is_gemma4_text && self.gemma4_disable_embed_scale {
+            1.0
+        } else {
+            (hidden as f32).sqrt()
+        };
         for i in 0..hidden {
             out[i] = f16::from_bits(row[i]).to_f32() * embed_scale;
         }
@@ -926,7 +965,11 @@ impl GemmaRunner {
             let t = (tok as usize) % self.cfg.vocab_size;
             let te = self.tensor_f16_by_exact_name(&token_embd_name)?;
             let te_row = &te[t * per_total_dim..(t + 1) * per_total_dim];
-            let scale = (per_layer_dim as f32).sqrt();
+            let scale = if self.gemma4_disable_per_token_embed_scale {
+                1.0
+            } else {
+                (per_layer_dim as f32).sqrt()
+            };
             for i in 0..per_total_dim {
                 per_token[i] = f16::from_bits(te_row[i]).to_f32() * scale;
             }
@@ -1682,4 +1725,87 @@ fn infer_gemma_per_layer_input_spec(
         per_total_dim,
         per_layer_dim,
     }))
+}
+
+fn has_tensor_with_gemma_aliases(file: &CellmFile, tensor_prefix: &str, name: &str) -> bool {
+    if file.tensor_index(name).is_some() {
+        return true;
+    }
+    if !tensor_prefix.is_empty() {
+        let prefixed = format!("{}{}", tensor_prefix, name);
+        if file.tensor_index(&prefixed).is_some() {
+            return true;
+        }
+    }
+    if let Some(suffix) = name.strip_prefix("model.") {
+        let text_model = format!("model.text_model.{suffix}");
+        if file.tensor_index(&text_model).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+fn source_text_cfg_usize(cfg: Option<&Value>, keys: &[&str]) -> Option<usize> {
+    let Value::Object(obj) = cfg? else {
+        return None;
+    };
+    for key in keys {
+        match obj.get(*key) {
+            Some(Value::Number(n)) => {
+                if let Some(v) = n.as_u64() {
+                    return Some(v as usize);
+                }
+            }
+            Some(Value::String(s)) => {
+                if let Ok(v) = s.parse::<usize>() {
+                    return Some(v);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn infer_gemma4_shared_kv_layers(
+    file: &CellmFile,
+    tensor_prefix: &str,
+    num_layers: usize,
+    source_text_config: Option<&Value>,
+) -> usize {
+    if let Ok(v) = std::env::var("CELLM_GEMMA4_SHARED_KV_LAYERS") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n.min(num_layers);
+        }
+    }
+    if let Some(n) = source_text_cfg_usize(
+        source_text_config,
+        &[
+            "num_kv_shared_layers",
+            "kv_shared_layers",
+            "shared_kv_layers",
+            "num_shared_kv_layers",
+        ],
+    ) {
+        return n.min(num_layers);
+    }
+
+    // Infer trailing shared layers from absent K/V projection tensors.
+    // If all layers have explicit K/V projection weights, use 0.
+    let mut first_missing = num_layers;
+    for layer in 0..num_layers {
+        let k_name = format!("model.layers.{layer}.self_attn.k_proj.weight");
+        let v_name = format!("model.layers.{layer}.self_attn.v_proj.weight");
+        let has_k = has_tensor_with_gemma_aliases(file, tensor_prefix, &k_name);
+        let has_v = has_tensor_with_gemma_aliases(file, tensor_prefix, &v_name);
+        if !(has_k && has_v) {
+            first_missing = first_missing.min(layer);
+        }
+    }
+    if first_missing >= num_layers {
+        0
+    } else {
+        num_layers - first_missing
+    }
 }

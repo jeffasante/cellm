@@ -51,6 +51,14 @@ struct Args {
     #[arg(long)]
     prompt: Option<String>,
 
+    /// Optional image path (LiteRT proxy models only)
+    #[arg(long)]
+    image: Option<PathBuf>,
+
+    /// Optional audio path (LiteRT proxy models only)
+    #[arg(long)]
+    audio: Option<PathBuf>,
+
     /// Wrap `--prompt` as a simple chat turn: `User: ...\nAssistant:`
     #[arg(long, default_value_t = false)]
     chat: bool,
@@ -160,6 +168,13 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
 
     let text_model_type = effective_text_model_type(&header);
     if text_model_type == "litertlm_proxy" {
+        if !allow_litert_proxy() {
+            anyhow::bail!(
+                "model_type=litertlm_proxy is disabled in Python-free mode. \
+This model requires external litert-lm process execution. \
+Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PROXY=1 to opt in explicitly."
+            );
+        }
         run_litertlm_proxy(&file, &args)?;
         return Ok(());
     }
@@ -1019,30 +1034,36 @@ fn run_litertlm_proxy(file: &CellmFile, args: &Args) -> Result<()> {
     std::fs::write(&temp_path, litert_bytes)
         .map_err(|e| anyhow::anyhow!("failed to write temporary litert model {:?}: {e}", temp_path))?;
 
-    let default_bin = PathBuf::from("/Users/jeff/Desktop/cellm/.venv-hf/bin/litert-lm");
-    let litert_bin = std::env::var("CELLM_LITERT_LM_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            if default_bin.exists() {
-                default_bin
-            } else {
-                PathBuf::from("litert-lm")
-            }
-        });
+    let litert_bin = resolve_tool_bin("CELLM_LITERT_LM_BIN", ".venv-hf/bin/litert-lm", "litert-lm");
     let backend = match args.backend {
         BackendKind::Cpu => "cpu",
-        BackendKind::Metal => "gpu",
+        BackendKind::Metal => {
+            let _ = std::fs::remove_file(&temp_path);
+            anyhow::bail!(
+                "litertlm_proxy gpu backend is disabled in cellm CLI because it routes through WebGPU. Use --backend cpu for litert proxy models, or use native non-proxy .cellm models for strict Metal execution."
+            );
+        }
     };
 
     println!("LLM backend: litert-lm ({backend})");
     println!("Model: {:?}", args.model);
-    let output = Command::new(&litert_bin)
-        .arg("run")
+
+    if args.image.is_some() || args.audio.is_some() {
+        let _ = std::fs::remove_file(&temp_path);
+        anyhow::bail!(
+            "litertlm_proxy multimodal is not supported in Rust-only mode yet. Use text-only prompt for this model."
+        );
+    }
+
+    let mut cmd = Command::new(&litert_bin);
+    cmd.arg("run")
         .arg(&temp_path)
         .arg("--prompt")
         .arg(prompt)
         .arg("-b")
-        .arg(backend)
+        .arg(backend);
+    apply_litert_cpu_thread_tuning(&mut cmd, backend);
+    let output = cmd
         .output()
         .map_err(|e| anyhow::anyhow!("failed to execute {:?}: {e}", litert_bin))?;
     let _ = std::fs::remove_file(&temp_path);
@@ -1058,4 +1079,49 @@ fn run_litertlm_proxy(file: &CellmFile, args: &Args) -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     println!("{}", stdout.trim_end());
     Ok(())
+}
+
+fn allow_litert_proxy() -> bool {
+    matches!(
+        std::env::var("CELLM_ALLOW_LITERT_PROXY").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+fn resolve_tool_bin(env_var: &str, local_rel_path: &str, fallback: &str) -> PathBuf {
+    if let Ok(p) = std::env::var(env_var) {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return pb;
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join(local_rel_path);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from(fallback)
+}
+
+fn apply_litert_cpu_thread_tuning(cmd: &mut Command, backend: &str) {
+    if backend != "cpu" {
+        return;
+    }
+    let has_tflite_threads = std::env::var_os("TFLITE_NUM_THREADS").is_some();
+    let has_omp_threads = std::env::var_os("OMP_NUM_THREADS").is_some();
+    if has_tflite_threads && has_omp_threads {
+        return;
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(4, 32)
+        .to_string();
+    if !has_tflite_threads {
+        cmd.env("TFLITE_NUM_THREADS", &threads);
+    }
+    if !has_omp_threads {
+        cmd.env("OMP_NUM_THREADS", &threads);
+    }
 }

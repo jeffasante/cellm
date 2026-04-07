@@ -192,12 +192,14 @@ final class CellmEngine {
     func generate(
         prompt: String,
         maxNewTokens: Int,
+        imageURL: URL? = nil,
+        audioURL: URL? = nil,
         thermalLevel: CellmThermalLevel = .nominal,
         exerciseSuspendResume: Bool = false,
         onToken: ((String) -> Void)? = nil
     ) throws -> String {
         if isLiteRtProxy {
-            let text = try generateWithLiteRt(prompt: prompt)
+            let text = try generateWithLiteRt(prompt: prompt, imageURL: imageURL, audioURL: audioURL)
             onToken?(text)
             let totalMs = 0.0
             lastGenerationStats = LlmGenerationStats(
@@ -404,9 +406,31 @@ final class CellmEngine {
         return out
     }
 
-    private func generateWithLiteRt(prompt: String) throws -> String {
+    private func generateWithLiteRt(prompt: String, imageURL: URL? = nil, audioURL: URL? = nil) throws -> String {
+        #if os(iOS)
+        throw CellmError.message("LiteRT proxy models are desktop-only in this build. Use native .cellm/.cellmd models on iOS.")
+        #else
+        let needsMultimodal = (imageURL != nil || audioURL != nil)
         let needed = prompt.withCString { cPrompt in
-            cellm_engine_generate_text(handle, cPrompt, nil, 0)
+            if needsMultimodal {
+                if let imageURL {
+                    return imageURL.path.withCString { cImage in
+                        if let audioURL {
+                            return audioURL.path.withCString { cAudio in
+                                cellm_engine_generate_multimodal(handle, cPrompt, cImage, cAudio, nil, 0)
+                            }
+                        }
+                        return cellm_engine_generate_multimodal(handle, cPrompt, cImage, nil, nil, 0)
+                    }
+                }
+                if let audioURL {
+                    return audioURL.path.withCString { cAudio in
+                        cellm_engine_generate_multimodal(handle, cPrompt, nil, cAudio, nil, 0)
+                    }
+                }
+                return cellm_engine_generate_multimodal(handle, cPrompt, nil, nil, nil, 0)
+            }
+            return cellm_engine_generate_text(handle, cPrompt, nil, 0)
         }
         if needed == 0 {
             throw CellmError.message(CellmFFI.lastError())
@@ -414,13 +438,32 @@ final class CellmEngine {
         var bytes = [CChar](repeating: 0, count: needed + 1)
         let written = prompt.withCString { cPrompt in
             bytes.withUnsafeMutableBufferPointer { out in
-                cellm_engine_generate_text(handle, cPrompt, out.baseAddress, out.count)
+                if needsMultimodal {
+                    if let imageURL {
+                        return imageURL.path.withCString { cImage in
+                            if let audioURL {
+                                return audioURL.path.withCString { cAudio in
+                                    cellm_engine_generate_multimodal(handle, cPrompt, cImage, cAudio, out.baseAddress, out.count)
+                                }
+                            }
+                            return cellm_engine_generate_multimodal(handle, cPrompt, cImage, nil, out.baseAddress, out.count)
+                        }
+                    }
+                    if let audioURL {
+                        return audioURL.path.withCString { cAudio in
+                            cellm_engine_generate_multimodal(handle, cPrompt, nil, cAudio, out.baseAddress, out.count)
+                        }
+                    }
+                    return cellm_engine_generate_multimodal(handle, cPrompt, nil, nil, out.baseAddress, out.count)
+                }
+                return cellm_engine_generate_text(handle, cPrompt, out.baseAddress, out.count)
             }
         }
         if written == 0 {
             throw CellmError.message(CellmFFI.lastError())
         }
         return String(cString: bytes)
+        #endif
     }
 
     private static func debugLog(_ message: String) {
@@ -600,6 +643,78 @@ enum CellmFFI {
         if rc == 0 { return nil }
         let msg = lastError()
         return msg.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "metal smoke test failed" : msg
+    }
+
+    static func runLiteRtMultimodalOnce(
+        modelURL: URL,
+        prompt: String,
+        imageURL: URL?,
+        audioURL: URL?,
+        backend: CellmBackend
+    ) throws -> (text: String, activeBackend: String) {
+        let h = modelURL.path.withCString { cModel in
+            cellm_engine_create_v4(
+                cModel,
+                16,
+                256,
+                40,
+                0.2,
+                1.08,
+                96,
+                UInt64(Date().timeIntervalSince1970 * 1000.0),
+                backend.rawValue,
+                CellmKvEncoding.f16.rawValue,
+                1,
+                1
+            )
+        }
+        guard h != 0 else { throw CellmError.message(lastError()) }
+        defer { cellm_engine_destroy(h) }
+
+        let sid = cellm_session_create(h)
+        if sid != 0 {
+            defer { _ = cellm_session_cancel(h, sid) }
+        }
+
+        guard cellm_engine_is_litert_proxy(h) != 0 else {
+            throw CellmError.message("Selected model is not a LiteRT proxy model.")
+        }
+
+        let active = engineBackendName(h)
+
+        func call(_ outBuf: UnsafeMutablePointer<CChar>?, _ outLen: Int) -> Int {
+            prompt.withCString { cPrompt in
+                if let imageURL {
+                    return imageURL.path.withCString { cImage in
+                        if let audioURL {
+                            return audioURL.path.withCString { cAudio in
+                                Int(cellm_engine_generate_multimodal(h, cPrompt, cImage, cAudio, outBuf, outLen))
+                            }
+                        }
+                        return Int(cellm_engine_generate_multimodal(h, cPrompt, cImage, nil, outBuf, outLen))
+                    }
+                }
+                if let audioURL {
+                    return audioURL.path.withCString { cAudio in
+                        Int(cellm_engine_generate_multimodal(h, cPrompt, nil, cAudio, outBuf, outLen))
+                    }
+                }
+                return Int(cellm_engine_generate_multimodal(h, cPrompt, nil, nil, outBuf, outLen))
+            }
+        }
+
+        let needed = call(nil, 0)
+        if needed <= 0 {
+            throw CellmError.message(lastError())
+        }
+        var out = [CChar](repeating: 0, count: needed + 1)
+        let written = out.withUnsafeMutableBufferPointer { buf in
+            call(buf.baseAddress, buf.count)
+        }
+        if written <= 0 {
+            throw CellmError.message(lastError())
+        }
+        return (String(cString: out), active)
     }
 
     static func vlmLastTimings() throws -> VlmTimings {

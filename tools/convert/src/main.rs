@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use bytemuck::cast_slice;
 use clap::Parser;
+use cellm_model::CellmFile;
 use half::f16;
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
@@ -54,6 +55,22 @@ struct Args {
     /// Keep only text-stack tensors (drop vision/projector tensors).
     #[arg(long, default_value_t = false)]
     text_only: bool,
+
+    /// Validate GGUF -> cellm conversion with tensor checks and logits parity.
+    #[arg(long, default_value_t = false)]
+    validate_gguf: bool,
+
+    /// Number of leading f16 values to compare per tensor during validation.
+    #[arg(long, default_value_t = 64)]
+    validate_tensor_values: usize,
+
+    /// Number of logits rows to sample for parity checks.
+    #[arg(long, default_value_t = 128)]
+    validate_logits_rows: usize,
+
+    /// Validate a GGUF source against an existing .cellm file without writing output.
+    #[arg(long)]
+    validate_against: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -877,6 +894,8 @@ struct ParsedGguf {
 
 #[derive(Debug, Clone)]
 struct GgufOutTensor {
+    src_name: String,
+    src_dims: Vec<usize>,
     name: String,
     shape: Vec<usize>,
     src_type: u32,
@@ -885,6 +904,7 @@ struct GgufOutTensor {
     out_nbytes: usize,
     out_offset: u64,
     layer_idx: Option<usize>,
+    reverse_2d: bool,
 }
 
 fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> Result<()> {
@@ -980,6 +1000,8 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
             .ok_or_else(|| anyhow::anyhow!("output nbytes overflow for {}", src.name))?;
 
         out_tensors.push(GgufOutTensor {
+            src_name: src.name.clone(),
+            src_dims: src.dims.clone(),
             name: dst_name,
             shape,
             src_type: src.ggml_type,
@@ -988,6 +1010,7 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
             out_nbytes,
             out_offset: 0,
             layer_idx,
+            reverse_2d,
         });
     }
 
@@ -1137,6 +1160,24 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
         .collect();
     let header_bytes = serde_json::to_vec(&header)?;
 
+    if let Some(validate_path) = args.validate_against.as_ref() {
+        validate_gguf_conversion(
+            gguf_path,
+            &mmap,
+            &parsed,
+            &planned,
+            validate_path,
+            args.validate_tensor_values.max(1),
+            args.validate_logits_rows.max(1),
+        )?;
+        log::info!(
+            "Validation-only mode succeeded for GGUF {:?} against {:?}",
+            gguf_path,
+            validate_path
+        );
+        return Ok(());
+    }
+
     let out = File::create(&args.output).with_context(|| format!("create {:?}", args.output))?;
     let mut w = BufWriter::new(out);
     w.write_all(b"CELLM")?;
@@ -1173,6 +1214,376 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
         header.tensors.len(),
         type_summary
     );
+    if args.validate_gguf {
+        validate_gguf_conversion(
+            gguf_path,
+            &mmap,
+            &parsed,
+            &planned,
+            &args.output,
+            args.validate_tensor_values.max(1),
+            args.validate_logits_rows.max(1),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_gguf_conversion(
+    gguf_path: &Path,
+    gguf_mmap: &[u8],
+    _parsed: &ParsedGguf,
+    planned: &[GgufOutTensor],
+    out_path: &Path,
+    tensor_values: usize,
+    logits_rows: usize,
+) -> Result<()> {
+    log::info!(
+        "Validation: GGUF tensor checks for {:?} against {:?}",
+        gguf_path,
+        out_path
+    );
+    let cellm = CellmFile::load(out_path)?;
+
+    for t in planned {
+        let meta = cellm
+            .tensor_index(&t.name)
+            .ok_or_else(|| anyhow::anyhow!("validation: missing output tensor {}", t.name))?;
+        if meta.dtype != "f16" {
+            anyhow::bail!(
+                "validation: tensor {} dtype mismatch: {} != f16",
+                t.name,
+                meta.dtype
+            );
+        }
+        if meta.shape != t.shape {
+            anyhow::bail!(
+                "validation: tensor {} shape mismatch: {:?} != {:?}",
+                t.name,
+                meta.shape,
+                t.shape
+            );
+        }
+        if meta.nbytes as usize != t.out_nbytes {
+            anyhow::bail!(
+                "validation: tensor {} nbytes mismatch: {} != {}",
+                t.name,
+                meta.nbytes,
+                t.out_nbytes
+            );
+        }
+
+        let src = &gguf_mmap[t.src_offset..t.src_offset + t.src_nbytes];
+        let out_bytes = cellm.tensor_bytes(&t.name)?;
+        let out_u16: &[u16] = cast_slice(out_bytes);
+        let expected = decode_gguf_prefix_f16(src, t.src_type, t.shape.iter().product(), tensor_values)?;
+        let got_len = expected.len().min(out_u16.len());
+        let mut max_abs = 0.0f32;
+        let mut mean_abs = 0.0f32;
+        for i in 0..got_len {
+            let a = f16::from_bits(expected[i]).to_f32();
+            let b = f16::from_bits(out_u16[i]).to_f32();
+            let d = (a - b).abs();
+            max_abs = max_abs.max(d);
+            mean_abs += d;
+        }
+        if got_len > 0 {
+            mean_abs /= got_len as f32;
+        }
+        if max_abs > 1e-3 {
+            anyhow::bail!(
+                "validation: tensor {} prefix mismatch: max_abs={} mean_abs={} ({} values)",
+                t.name,
+                max_abs,
+                mean_abs,
+                got_len
+            );
+        }
+    }
+
+    validate_gguf_logits_parity(gguf_mmap, planned, &cellm, logits_rows)?;
+    log::info!("Validation: GGUF conversion parity checks passed.");
+    Ok(())
+}
+
+fn validate_gguf_logits_parity(
+    gguf_mmap: &[u8],
+    planned: &[GgufOutTensor],
+    cellm: &CellmFile,
+    logits_rows: usize,
+) -> Result<()> {
+    let lm = planned
+        .iter()
+        .find(|t| t.name == "lm_head.weight")
+        .or_else(|| planned.iter().find(|t| t.name == "model.embed_tokens.weight"))
+        .ok_or_else(|| anyhow::anyhow!("validation: missing lm_head/embed tensor for logits parity"))?;
+
+    if lm.shape.len() != 2 {
+        anyhow::bail!("validation: logits tensor {} is not 2D", lm.name);
+    }
+    if !lm.reverse_2d {
+        anyhow::bail!(
+            "validation: logits tensor {} expected reverse_2d mapping from GGUF",
+            lm.name
+        );
+    }
+
+    let vocab = lm.shape[0];
+    let hidden = lm.shape[1];
+    let rows = logits_rows.min(vocab).max(1);
+    let src_row_ne0 = *lm
+        .src_dims
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("validation: missing source dims for {}", lm.src_name))?;
+    if src_row_ne0 != hidden {
+        anyhow::bail!(
+            "validation: source row width mismatch for {}: {} != hidden {}",
+            lm.src_name,
+            src_row_ne0,
+            hidden
+        );
+    }
+
+    let src_row_nbytes = ggml_tensor_nbytes(lm.src_type, src_row_ne0).ok_or_else(|| {
+        anyhow::anyhow!(
+            "validation: unsupported source dtype {} for {}",
+            lm.src_type,
+            lm.src_name
+        )
+    })?;
+
+    let mut x = vec![0.0f32; hidden];
+    for (i, xi) in x.iter_mut().enumerate() {
+        let a = (i as f32 * 0.017).sin();
+        let b = (i as f32 * 0.023).cos();
+        *xi = 0.5 * a + 0.5 * b;
+    }
+
+    let out_bytes = cellm.tensor_bytes(&lm.name)?;
+    let out_u16: &[u16] = cast_slice(out_bytes);
+    if out_u16.len() != vocab * hidden {
+        anyhow::bail!(
+            "validation: output tensor {} len mismatch: {} != {}",
+            lm.name,
+            out_u16.len(),
+            vocab * hidden
+        );
+    }
+
+    let src_all = &gguf_mmap[lm.src_offset..lm.src_offset + lm.src_nbytes];
+    let mut max_abs = 0.0f32;
+    let mut mean_abs = 0.0f32;
+    let mut src_top = (0usize, f32::NEG_INFINITY);
+    let mut dst_top = (0usize, f32::NEG_INFINITY);
+    for row in 0..rows {
+        let src_off = row
+            .checked_mul(src_row_nbytes)
+            .ok_or_else(|| anyhow::anyhow!("validation: source row offset overflow"))?;
+        let src_row = &src_all[src_off..src_off + src_row_nbytes];
+        let src_vals = decode_gguf_prefix_f32(src_row, lm.src_type, hidden, hidden)?;
+        let dst_row = &out_u16[row * hidden..(row + 1) * hidden];
+
+        let mut src_dot = 0.0f32;
+        let mut dst_dot = 0.0f32;
+        for i in 0..hidden {
+            src_dot += src_vals[i] * x[i];
+            dst_dot += f16::from_bits(dst_row[i]).to_f32() * x[i];
+        }
+        if src_dot > src_top.1 {
+            src_top = (row, src_dot);
+        }
+        if dst_dot > dst_top.1 {
+            dst_top = (row, dst_dot);
+        }
+        let d = (src_dot - dst_dot).abs();
+        max_abs = max_abs.max(d);
+        mean_abs += d;
+    }
+    mean_abs /= rows as f32;
+
+    if max_abs > 5e-2 {
+        anyhow::bail!(
+            "validation: logits parity failed for {}: max_abs={} mean_abs={} src_top={} dst_top={}",
+            lm.name,
+            max_abs,
+            mean_abs,
+            src_top.0,
+            dst_top.0
+        );
+    }
+
+    log::info!(
+        "Validation logits parity: tensor={} rows={} max_abs={} mean_abs={} top_row(src={},dst={})",
+        lm.name,
+        rows,
+        max_abs,
+        mean_abs,
+        src_top.0,
+        dst_top.0
+    );
+    Ok(())
+}
+
+fn decode_gguf_prefix_f16(
+    src: &[u8],
+    src_type: u32,
+    numel: usize,
+    want: usize,
+) -> Result<Vec<u16>> {
+    let vals = decode_gguf_prefix_f32(src, src_type, numel, want)?;
+    Ok(vals.into_iter().map(|v| f16::from_f32(v).to_bits()).collect())
+}
+
+fn decode_gguf_prefix_f32(
+    src: &[u8],
+    src_type: u32,
+    numel: usize,
+    want: usize,
+) -> Result<Vec<f32>> {
+    let target = want.min(numel);
+    let mut out = Vec::with_capacity(target);
+    match src_type {
+        0 => {
+            // F32
+            if src.len() % 4 != 0 {
+                anyhow::bail!("decode prefix f32: bad source length {}", src.len());
+            }
+            let n = (src.len() / 4).min(target);
+            for i in 0..n {
+                let off = i * 4;
+                let bits = u32::from_le_bytes([src[off], src[off + 1], src[off + 2], src[off + 3]]);
+                out.push(f32::from_bits(bits));
+            }
+        }
+        1 => {
+            // F16
+            if src.len() % 2 != 0 {
+                anyhow::bail!("decode prefix f16: bad source length {}", src.len());
+            }
+            let n = (src.len() / 2).min(target);
+            for i in 0..n {
+                let off = i * 2;
+                out.push(read_f16_le_as_f32(src[off], src[off + 1]));
+            }
+        }
+        30 => {
+            // BF16
+            if src.len() % 2 != 0 {
+                anyhow::bail!("decode prefix bf16: bad source length {}", src.len());
+            }
+            let n = (src.len() / 2).min(target);
+            for i in 0..n {
+                let off = i * 2;
+                let bits = u16::from_le_bytes([src[off], src[off + 1]]);
+                out.push(f32::from_bits((bits as u32) << 16));
+            }
+        }
+        2 => decode_q4_0_prefix(src, target, &mut out)?,
+        3 => decode_q4_1_prefix(src, target, &mut out)?,
+        10 => decode_qk_prefix(src, target, 84, dequantize_q2k_block, &mut out)?,
+        11 => decode_qk_prefix(src, target, 110, dequantize_q3k_block, &mut out)?,
+        12 => decode_qk_prefix(src, target, 144, dequantize_q4k_block, &mut out)?,
+        13 => decode_qk_prefix(src, target, 176, dequantize_q5k_block, &mut out)?,
+        14 => decode_qk_prefix(src, target, 210, dequantize_q6k_block, &mut out)?,
+        other => anyhow::bail!("decode prefix: unsupported GGUF type {}", other),
+    }
+    if out.len() < target {
+        anyhow::bail!(
+            "decode prefix: insufficient decoded values {} < {}",
+            out.len(),
+            target
+        );
+    }
+    out.truncate(target);
+    Ok(out)
+}
+
+fn decode_q4_0_prefix(src: &[u8], target: usize, out: &mut Vec<f32>) -> Result<()> {
+    let bs = 18usize;
+    if src.len() % bs != 0 {
+        anyhow::bail!("Q4_0 decode prefix: bad source length {}", src.len());
+    }
+    let nblk = src.len() / bs;
+    for bi in 0..nblk {
+        if out.len() >= target {
+            break;
+        }
+        let off = bi * bs;
+        let d = read_f16_le_as_f32(src[off], src[off + 1]);
+        let q = &src[off + 2..off + bs];
+        for i in 0..16usize {
+            if out.len() >= target {
+                break;
+            }
+            let b = q[i];
+            let q0 = (b & 0x0F) as i32 - 8;
+            out.push(d * q0 as f32);
+            if out.len() >= target {
+                break;
+            }
+            let q1 = (b >> 4) as i32 - 8;
+            out.push(d * q1 as f32);
+        }
+    }
+    Ok(())
+}
+
+fn decode_q4_1_prefix(src: &[u8], target: usize, out: &mut Vec<f32>) -> Result<()> {
+    let bs = 20usize;
+    if src.len() % bs != 0 {
+        anyhow::bail!("Q4_1 decode prefix: bad source length {}", src.len());
+    }
+    let nblk = src.len() / bs;
+    for bi in 0..nblk {
+        if out.len() >= target {
+            break;
+        }
+        let off = bi * bs;
+        let d = read_f16_le_as_f32(src[off], src[off + 1]);
+        let m = read_f16_le_as_f32(src[off + 2], src[off + 3]);
+        let q = &src[off + 4..off + bs];
+        for i in 0..16usize {
+            if out.len() >= target {
+                break;
+            }
+            let b = q[i];
+            let q0 = (b & 0x0F) as f32;
+            out.push(d * q0 + m);
+            if out.len() >= target {
+                break;
+            }
+            let q1 = (b >> 4) as f32;
+            out.push(d * q1 + m);
+        }
+    }
+    Ok(())
+}
+
+fn decode_qk_prefix(
+    src: &[u8],
+    target: usize,
+    block_size: usize,
+    decode_block: fn(&[u8], &mut [f32]) -> Result<()>,
+    out: &mut Vec<f32>,
+) -> Result<()> {
+    if src.len() % block_size != 0 {
+        anyhow::bail!(
+            "QK decode prefix: bad source length {} for block {}",
+            src.len(),
+            block_size
+        );
+    }
+    let nblk = src.len() / block_size;
+    let mut vals = vec![0.0f32; 256];
+    for bi in 0..nblk {
+        if out.len() >= target {
+            break;
+        }
+        let off = bi * block_size;
+        decode_block(&src[off..off + block_size], &mut vals)?;
+        let need = target - out.len();
+        let take = need.min(vals.len());
+        out.extend_from_slice(&vals[..take]);
+    }
     Ok(())
 }
 

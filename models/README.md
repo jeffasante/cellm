@@ -9,7 +9,7 @@ tags:
 
 # Cellm Models Hub
 
-This repository contains a collection of optimized Large Language Models (LLMs) in the `.cellm` format. These models are specifically tuned for high-performance inference using the **Cellm** engine, featuring Metal-accelerated kernels and memory-mapped efficiency.
+This repository contains a collection of optimized Large Language Models (LLMs) in the `.cellm` format. These models are specifically tuned for high-performance inference using the [Cellm](https://github.com/jeffasante/cellm) engine, featuring Metal-accelerated kernels and memory-mapped efficiency.
 
 ## Models
 

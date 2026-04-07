@@ -32,7 +32,7 @@ enum DemoAssetLinks {
     static let gemma3TokenizerFileName = "\(gemma3Dir)/tokenizer-gemma-3-1b-it.json"
     static let gemma3TokenizerConfigFileName = "\(gemma3Dir)/tokenizer_config.json"
 
-    static let gemma42p3bLiteRt = "https://huggingface.co/jeffasante/cellm-models/blob/main/gemma-4-2p3b-it/gemma-4-2p3b-it-litert.cellm"
+    static let gemma42p3bLiteRt = "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-2p3b-it/gemma-4-2p3b-it-litert.cellm"
     static let gemma42p3bTokenizer = "https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX/resolve/main/tokenizer.json"
     static let gemma42p3bTokenizerConfig = "https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX/resolve/main/tokenizer_config.json"
     static let gemma42p3bDir = "samples/gemma-4-2p3b-it"

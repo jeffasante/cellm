@@ -110,6 +110,8 @@ Notes:
 - Use `--chat-format plain` to force the simpler `User:/Assistant:` style. `--chat-format auto` (default) only uses ChatML when the tokenizer advertises a chat template in `tokenizer_config.json`.
 - `--max-layers` is only for debugging; using fewer layers will significantly degrade quality.
 - Backend selection is strict in this build: `--backend cpu` runs CPU only, and `--backend metal` runs Metal only (no automatic fallback).
+- Python-free mode is the default: `litertlm_proxy` models are blocked unless explicitly enabled with `CELLM_ALLOW_LITERT_PROXY=1`.
+- Native Rust execution paths are `llama`, `gemma*`, and `qwen*` model types in `.cellm/.cellmd`.
 
 Run with backend selection:
 ```bash

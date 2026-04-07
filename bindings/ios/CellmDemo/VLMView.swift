@@ -1,5 +1,6 @@
 import SwiftUI
 import PhotosUI
+import UniformTypeIdentifiers
 
 struct VLMView: View {
     @State private var selectedItem: PhotosPickerItem?
@@ -19,6 +20,8 @@ struct VLMView: View {
     @State private var timingText: String?
     @State private var showBackendSettings: Bool = false
     @State private var showModelPicker = false
+    @State private var showAudioPicker = false
+    @State private var audioURL: URL?
 
     var body: some View {
         ScrollView {
@@ -33,6 +36,7 @@ struct VLMView: View {
 
                 card("Files") {
                     actionButton(modelURL == nil ? "Pick .cellm model" : modelURL!.lastPathComponent, icon: "externaldrive") { showModelPicker = true }
+                    actionButton(audioURL == nil ? "Pick audio file (LiteRT)" : audioURL!.lastPathComponent, icon: "waveform") { showAudioPicker = true }
                     actionButton(isDownloading ? "Downloading sample assets…" : "Download sample VLM model + image", icon: "arrow.down.circle", disabled: isDownloading || isRunning) {
                         downloadSampleAssets()
                     }
@@ -113,7 +117,7 @@ struct VLMView: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
                     .frame(maxWidth: .infinity)
-                    .disabled(isRunning || modelURL == nil || imageBytes == nil || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(isRunning || modelURL == nil || (imageBytes == nil && audioURL == nil) || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                 if let infoText {
                     card("Status") {
@@ -157,6 +161,9 @@ struct VLMView: View {
         .background(Color(.systemGroupedBackground).ignoresSafeArea())
         .sheet(isPresented: $showModelPicker) {
             DocumentPicker(allowed: [.data]) { modelURL = $0 }
+        }
+        .sheet(isPresented: $showAudioPicker) {
+            DocumentPicker(allowed: [.audio]) { audioURL = $0 }
         }
         .onAppear {
             restoreAssets()
@@ -259,13 +266,52 @@ struct VLMView: View {
         timingText = nil
         output = ""
         backendWarning = nil
-        guard let modelURL, let imageBytes else { return }
+        guard let modelURL else { return }
         let promptText = prompt
         let backend = selectedBackend
 
         isRunning = true
         Task.detached(priority: .userInitiated) {
             do {
+                if let audioURL = audioURL {
+                    let result = try CellmFFI.runLiteRtMultimodalOnce(
+                        modelURL: modelURL,
+                        prompt: promptText,
+                        imageURL: nil,
+                        audioURL: audioURL,
+                        backend: backend
+                    )
+                    await MainActor.run {
+                        self.output = prettyOutput(result.text)
+                        self.activeBackend = result.activeBackend
+                        self.infoText = "LiteRT multimodal audio completed."
+                        self.timingText = nil
+                        self.isRunning = false
+                    }
+                    return
+                }
+
+                guard let imageBytes = imageBytes else {
+                    throw CellmError.message("Pick an image or audio file.")
+                }
+                if let tempImageURL = writeTempImageForLiteRt(imageBytes),
+                   let result = try? CellmFFI.runLiteRtMultimodalOnce(
+                        modelURL: modelURL,
+                        prompt: promptText,
+                        imageURL: tempImageURL,
+                        audioURL: nil,
+                        backend: backend
+                   ) {
+                    await MainActor.run {
+                        self.output = prettyOutput(result.text)
+                        self.activeBackend = result.activeBackend
+                        self.infoText = "LiteRT multimodal image completed."
+                        self.timingText = nil
+                        self.isRunning = false
+                    }
+                    return
+                }
+
                 let eng = try CellmVLMEngine(
                     modelURL: modelURL,
                     topK: 20,
@@ -406,6 +452,18 @@ struct VLMView: View {
             image.draw(in: CGRect(origin: .zero, size: size))
         }
         return rendered.jpegData(compressionQuality: 0.95)
+    }
+
+    private func writeTempImageForLiteRt(_ data: Data) -> URL? {
+        do {
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("cellm_vlm_litert_\(UUID().uuidString)")
+                .appendingPathExtension("jpg")
+            try data.write(to: url, options: .atomic)
+            return url
+        } catch {
+            return nil
+        }
     }
 
     private func forceRedownload() {

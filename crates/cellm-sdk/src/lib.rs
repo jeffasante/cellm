@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "ios"))]
 use std::process::Command;
 
 use anyhow::Result;
@@ -74,6 +75,7 @@ enum Runner {
     LiteRtProxy(LiteRtProxyRunner),
 }
 
+#[allow(dead_code)]
 struct LiteRtProxyRunner {
     model_path: PathBuf,
     tensor_name: String,
@@ -81,6 +83,32 @@ struct LiteRtProxyRunner {
 
 impl LiteRtProxyRunner {
     fn run_prompt(&self, prompt: &str, backend: BackendKind) -> Result<String> {
+        if !allow_litert_proxy() {
+            anyhow::bail!(
+                "litertlm_proxy is disabled in Python-free mode. \
+Use native llama/gemma/qwen .cellm/.cellmd models, or set CELLM_ALLOW_LITERT_PROXY=1 to opt in explicitly."
+            );
+        }
+        self.run_prompt_multimodal(prompt, backend, None, None)
+    }
+
+    fn run_prompt_multimodal(
+        &self,
+        prompt: &str,
+        backend: BackendKind,
+        image_path: Option<&Path>,
+        audio_path: Option<&Path>,
+    ) -> Result<String> {
+        #[cfg(target_os = "ios")]
+        {
+            let _ = (prompt, backend, image_path, audio_path);
+            anyhow::bail!(
+                "litert proxy is not executable on iOS in this build (external litert-lm process spawning is unavailable on iOS). Use native cellm models for on-device iOS inference."
+            );
+        }
+
+        #[cfg(not(target_os = "ios"))]
+        {
         let file = CellmFile::load(&self.model_path)?;
         let bundle = file
             .tensor_bytes(&self.tensor_name)
@@ -102,27 +130,32 @@ impl LiteRtProxyRunner {
             )
         })?;
 
-        let default_bin = PathBuf::from("/Users/jeff/Desktop/cellm/.venv-hf/bin/litert-lm");
-        let bin = std::env::var("CELLM_LITERT_LM_BIN")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                if default_bin.exists() {
-                    default_bin
-                } else {
-                    PathBuf::from("litert-lm")
-                }
-            });
+        if image_path.is_some() || audio_path.is_some() {
+            let _ = std::fs::remove_file(&temp_path);
+            anyhow::bail!(
+                "litert proxy multimodal is not supported in Rust-only mode yet. Use text-only prompts for litert proxy models."
+            );
+        }
+
+        let bin = resolve_tool_bin("CELLM_LITERT_LM_BIN", ".venv-hf/bin/litert-lm", "litert-lm");
         let litert_backend = match backend {
             BackendKind::Cpu => "cpu",
-            BackendKind::Metal => "gpu",
+            BackendKind::Metal => {
+                let _ = std::fs::remove_file(&temp_path);
+                anyhow::bail!(
+                    "litert proxy gpu backend is disabled in cellm SDK because it routes through WebGPU. Use CPU for litert proxy models, or use native non-proxy .cellm/.cellmd models for strict Metal execution."
+                );
+            }
         };
-        let output = Command::new(&bin)
-            .arg("run")
+        let mut cmd = Command::new(&bin);
+        cmd.arg("run")
             .arg(&temp_path)
             .arg("--prompt")
             .arg(prompt)
             .arg("-b")
-            .arg(litert_backend)
+            .arg(litert_backend);
+        apply_litert_cpu_thread_tuning(&mut cmd, litert_backend);
+        let output = cmd
             .output()
             .map_err(|e| anyhow::anyhow!("litert proxy: failed to execute {:?}: {e}", bin))?;
         let _ = std::fs::remove_file(&temp_path);
@@ -135,6 +168,46 @@ impl LiteRtProxyRunner {
             );
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn resolve_tool_bin(env_var: &str, local_rel_path: &str, fallback: &str) -> PathBuf {
+    if let Ok(p) = std::env::var(env_var) {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return pb;
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join(local_rel_path);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from(fallback)
+}
+
+fn apply_litert_cpu_thread_tuning(cmd: &mut Command, backend: &str) {
+    if backend != "cpu" {
+        return;
+    }
+    let has_tflite_threads = std::env::var_os("TFLITE_NUM_THREADS").is_some();
+    let has_omp_threads = std::env::var_os("OMP_NUM_THREADS").is_some();
+    if has_tflite_threads && has_omp_threads {
+        return;
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(4, 32)
+        .to_string();
+    if !has_tflite_threads {
+        cmd.env("TFLITE_NUM_THREADS", &threads);
+    }
+    if !has_omp_threads {
+        cmd.env("OMP_NUM_THREADS", &threads);
     }
 }
 
@@ -173,6 +246,13 @@ impl Engine {
             t if t.starts_with("gemma") => Runner::Gemma(GemmaRunner::load(model_path)?),
             t if t.starts_with("qwen") => Runner::Qwen(QwenRunner::load(model_path)?),
             "litertlm_proxy" => {
+                if !allow_litert_proxy() {
+                    anyhow::bail!(
+                        "model_type=litertlm_proxy is disabled in Python-free mode. \
+This model requires external litert-lm process execution. \
+Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PROXY=1 to opt in explicitly."
+                    );
+                }
                 let tensor_name = if file.tensor_index("litert.bundle").is_some() {
                     "litert.bundle".to_string()
                 } else {
@@ -288,6 +368,18 @@ impl Engine {
             anyhow::bail!("generate_text_litert is only supported for litertlm_proxy engines");
         };
         r.run_prompt(prompt, self.backend)
+    }
+
+    pub fn generate_multimodal_litert(
+        &self,
+        prompt: &str,
+        image_path: Option<&Path>,
+        audio_path: Option<&Path>,
+    ) -> Result<String> {
+        let Runner::LiteRtProxy(r) = &self.runner else {
+            anyhow::bail!("generate_multimodal_litert is only supported for litertlm_proxy engines");
+        };
+        r.run_prompt_multimodal(prompt, self.backend, image_path, audio_path)
     }
 
     pub fn create_session(&mut self) -> SessionId {
@@ -768,6 +860,13 @@ fn effective_text_model_type(header: &cellm_model::CellmHeader) -> String {
         }
     }
     header.model_type.clone()
+}
+
+fn allow_litert_proxy() -> bool {
+    matches!(
+        std::env::var("CELLM_ALLOW_LITERT_PROXY").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
 }
 
 #[derive(Debug, Clone, Copy)]

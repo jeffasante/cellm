@@ -966,6 +966,61 @@ pub extern "C" fn cellm_engine_generate_text(
     }
 }
 
+/// Multimodal generation entrypoint for litertlm_proxy models.
+///
+/// `image_path_utf8` and `audio_path_utf8` are optional and may be null.
+/// If `out_buf` is null or `buf_len == 0`, returns required bytes (without null terminator).
+/// Otherwise writes up to `buf_len-1` bytes and null-terminates. Returns bytes written.
+#[no_mangle]
+pub extern "C" fn cellm_engine_generate_multimodal(
+    engine: cellm_engine_t,
+    prompt_utf8: *const c_char,
+    image_path_utf8: *const c_char,
+    audio_path_utf8: *const c_char,
+    out_buf: *mut c_char,
+    buf_len: usize,
+) -> usize {
+    let result: Result<usize, String> = (|| {
+        if engine == 0 {
+            return Err("engine_generate_multimodal: null engine".to_string());
+        }
+        let prompt = cstr_to_str(prompt_utf8)?;
+        let image_path = if image_path_utf8.is_null() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(cstr_to_str(image_path_utf8)?))
+        };
+        let audio_path = if audio_path_utf8.is_null() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(cstr_to_str(audio_path_utf8)?))
+        };
+
+        let e = unsafe { &mut *(engine as *mut Engine) };
+        let text = e
+            .generate_multimodal_litert(prompt, image_path.as_deref(), audio_path.as_deref())
+            .map_err(|err| format!("engine_generate_multimodal failed: {err}"))?;
+        let bytes = text.as_bytes();
+        if out_buf.is_null() || buf_len == 0 {
+            return Ok(bytes.len());
+        }
+        let n = bytes.len().min(buf_len.saturating_sub(1));
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf as *mut u8, n);
+            *out_buf.add(n) = 0;
+        }
+        Ok(n)
+    })();
+
+    match result {
+        Ok(n) => n,
+        Err(e) => {
+            set_last_error(e);
+            0
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cellm_vlm_describe_image(
     engine: cellm_engine_t,

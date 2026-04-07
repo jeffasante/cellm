@@ -102,6 +102,18 @@ size_t cellm_engine_generate_text(
     size_t buf_len
 );
 
+// Multimodal generation for litertlm_proxy models.
+// - image_path_utf8/audio_path_utf8 may be NULL.
+// - If out_buf is null/buf_len==0, returns required byte count (excluding null terminator).
+size_t cellm_engine_generate_multimodal(
+    cellm_engine_t engine,
+    const char* prompt_utf8,
+    const char* image_path_utf8,
+    const char* audio_path_utf8,
+    char* out_buf,
+    size_t buf_len
+);
+
 // Tokenizers.
 cellm_tokenizer_t cellm_tokenizer_create(const char* tokenizer_path);
 void cellm_tokenizer_destroy(cellm_tokenizer_t tok);

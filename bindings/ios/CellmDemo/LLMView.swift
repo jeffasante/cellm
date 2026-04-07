@@ -262,13 +262,30 @@ struct LLMView: View {
                 .fontWeight(.semibold)
 
             modelDownloadCard(
-                title: "Gemma-4-2P3B-IT (LiteRT)",
-                subtitle: "Best overall",
-                detail: "2.3B instruction model via LiteRT proxy. Strong quality for local chat.",
-                sizeText: "~2.5 GB+",
-                isInstalled: hasGemma4LiteRTSample,
-                isSelected: selectedSampleLabel == "Gemma-4-2P3B-IT (LiteRT)",
+                title: "Gemma3-1B-IT (int8)",
+                subtitle: "Best on-device",
+                detail: "Native cellm model for iOS/Android. No LiteRT proxy runtime required.",
+                sizeText: "~1.2 GB",
+                isInstalled: hasGemma3Sample,
+                isSelected: selectedSampleLabel == "Gemma3-1B-IT (int8)",
                 onDownload: { downloadGemmaSampleAssets() },
+                onUseInstalled: {
+                    selectInstalledSample(
+                        modelFile: DemoAssetLinks.gemma3FileName,
+                        tokenizerFile: DemoAssetLinks.gemma3TokenizerFileName,
+                        label: "Gemma3-1B-IT (int8)"
+                    )
+                }
+            )
+
+            modelDownloadCard(
+                title: "Gemma-4-2P3B-IT (LiteRT)",
+                subtitle: "Proxy bundle (desktop)",
+                detail: "This build is Python-free on iOS. LiteRT proxy bundles are not runnable in-app; use native .cellm/.cellmd models.",
+                sizeText: "~2.45 GB",
+                isInstalled: hasGemma4LiteRtSample,
+                isSelected: selectedSampleLabel == "Gemma-4-2P3B-IT (LiteRT)",
+                onDownload: { downloadGemma4LiteRtAssets() },
                 onUseInstalled: {
                     selectInstalledSample(
                         modelFile: DemoAssetLinks.gemma42p3bFileName,
@@ -385,7 +402,15 @@ struct LLMView: View {
         }
     }
 
-    private var hasGemma4LiteRTSample: Bool {
+    private var hasGemma3Sample: Bool {
+        hasSampleFiles(
+            modelFile: DemoAssetLinks.gemma3FileName,
+            tokenizerFile: DemoAssetLinks.gemma3TokenizerFileName,
+            tokenizerConfigFile: DemoAssetLinks.gemma3TokenizerConfigFileName
+        )
+    }
+
+    private var hasGemma4LiteRtSample: Bool {
         hasSampleFiles(
             modelFile: DemoAssetLinks.gemma42p3bFileName,
             tokenizerFile: DemoAssetLinks.gemma42p3bTokenizerFileName,
@@ -774,12 +799,13 @@ struct LLMView: View {
         streamElapsedMs = 0
         backendWarning = nil
         resolveStaleSelectionsIfNeeded()
-        guard let modelURL, let tokenizerURL else { return }
-        guard FileManager.default.fileExists(atPath: modelURL.path) else {
+        guard var effectiveModelURL = modelURL, var effectiveTokenizerURL = tokenizerURL else { return }
+
+        guard FileManager.default.fileExists(atPath: effectiveModelURL.path) else {
             errorText = "Selected model file is missing. Re-pick the model or download sample assets."
             return
         }
-        guard FileManager.default.fileExists(atPath: tokenizerURL.path) else {
+        guard FileManager.default.fileExists(atPath: effectiveTokenizerURL.path) else {
             errorText = "Selected tokenizer file is missing. Re-pick tokenizer.json or download tokenizer assets."
             return
         }
@@ -808,8 +834,8 @@ struct LLMView: View {
                     throw CellmError.message("Metal requested but unavailable: \(metalErr)")
                 }
                 let runtimeKey = Self.runtimeCacheKey(
-                    modelURL: modelURL,
-                    tokenizerURL: tokenizerURL,
+                    modelURL: effectiveModelURL,
+                    tokenizerURL: effectiveTokenizerURL,
                     backend: backend,
                     tokensPerBlock: tokensPerBlock,
                     totalBlocks: totalBlocks,
@@ -831,7 +857,7 @@ struct LLMView: View {
                     )
 
                     let tokStart = Date()
-                    let tok = try CellmTokenizer(tokenizerURL: tokenizerURL)
+                    let tok = try CellmTokenizer(tokenizerURL: effectiveTokenizerURL)
                     let tokEnd = Date()
                     lines.append(
                         String(
@@ -842,7 +868,7 @@ struct LLMView: View {
 
                     let engineStart = Date()
                     let eng = try CellmEngine(
-                        modelURL: modelURL,
+                        modelURL: effectiveModelURL,
                         tokenizer: tok,
                         tokensPerBlock: tokensPerBlock,
                         totalBlocks: totalBlocks,
@@ -940,13 +966,13 @@ struct LLMView: View {
                 }
             } catch {
                 await MainActor.run {
-                    let modelExists = FileManager.default.fileExists(atPath: modelURL.path)
-                    let tokExists = FileManager.default.fileExists(atPath: tokenizerURL.path)
+                    let modelExists = FileManager.default.fileExists(atPath: effectiveModelURL.path)
+                    let tokExists = FileManager.default.fileExists(atPath: effectiveTokenizerURL.path)
                     let raw = String(describing: error)
                     self.errorText = """
                     \(raw)
-                    model=\(modelURL.lastPathComponent) exists=\(modelExists)
-                    tokenizer=\(tokenizerURL.lastPathComponent) exists=\(tokExists)
+                    model=\(effectiveModelURL.lastPathComponent) exists=\(modelExists)
+                    tokenizer=\(effectiveTokenizerURL.lastPathComponent) exists=\(tokExists)
                     requested_backend=\(backend.label.lowercased()) active_backend=\(self.activeBackend.isEmpty ? "n/a" : self.activeBackend)
                     preset=\(preset.rawValue)
                     max_tokens=\(effectiveMaxTokens)
@@ -1142,10 +1168,10 @@ Assistant:
 
     private func downloadGemmaSampleAssets() {
         errorText = nil
-        selectedSampleLabel = "Gemma-4-2P3B-IT (LiteRT)"
-        if let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bFileName),
-           let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bTokenizerFileName),
-           RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bTokenizerConfigFileName) != nil {
+        selectedSampleLabel = "Gemma3-1B-IT (int8)"
+        if let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3FileName),
+           let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerFileName),
+           RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerConfigFileName) != nil {
             modelURL = model
             tokenizerURL = tok
             downloadStatus = "Using existing files in Documents."
@@ -1162,24 +1188,24 @@ Assistant:
             do {
                 let totalFiles = 3.0
                 let modelPath = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.gemma42p3bLiteRt,
-                    fileName: DemoAssetLinks.gemma42p3bFileName,
+                    from: DemoAssetLinks.gemma3Int8,
+                    fileName: DemoAssetLinks.gemma3FileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "Gemma", fileName: DemoAssetLinks.gemma42p3bFileName)
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "Gemma3", fileName: DemoAssetLinks.gemma3FileName)
                     }
                 )
                 let tokPath = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.gemma42p3bTokenizer,
-                    fileName: DemoAssetLinks.gemma42p3bTokenizerFileName,
+                    from: DemoAssetLinks.gemma3Tokenizer,
+                    fileName: DemoAssetLinks.gemma3TokenizerFileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "Gemma tokenizer", fileName: DemoAssetLinks.gemma42p3bTokenizerFileName)
+                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "Gemma3 tokenizer", fileName: DemoAssetLinks.gemma3TokenizerFileName)
                     }
                 )
                 _ = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.gemma42p3bTokenizerConfig,
-                    fileName: DemoAssetLinks.gemma42p3bTokenizerConfigFileName,
+                    from: DemoAssetLinks.gemma3TokenizerConfig,
+                    fileName: DemoAssetLinks.gemma3TokenizerConfigFileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 2.0, progress: p, totalFiles: totalFiles, label: "Gemma tokenizer", fileName: DemoAssetLinks.gemma42p3bTokenizerConfigFileName)
+                        setDownloadProgress(completedFiles: 2.0, progress: p, totalFiles: totalFiles, label: "Gemma3 tokenizer", fileName: DemoAssetLinks.gemma3TokenizerConfigFileName)
                     }
                 )
                 await MainActor.run {
@@ -1201,6 +1227,17 @@ Assistant:
                 }
             }
         }
+    }
+
+    private func downloadGemma4LiteRtAssets() {
+        errorText = nil
+        selectedSampleLabel = "Gemma-4-2P3B-IT (LiteRT)"
+        downloadStatus = ""
+        downloadProgress = 0
+        currentDownloadFile = ""
+        currentDownloadSizeText = ""
+        isDownloading = false
+        errorText = "Gemma-4 LiteRT proxy is disabled in this iOS build (Python-free mode). Use native .cellm/.cellmd models."
     }
 
     private func downloadQwenModelOnly() {
@@ -1405,21 +1442,27 @@ Assistant:
     }
 
     private func restoreAssets() {
-        let gemmaModel = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bFileName)
-            ?? RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3FileName)
+        let gemmaModel = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3FileName)
             ?? RemoteAssets.existingDocumentsFile(fileName: "gemma-3-1b-it-int8.cellmd")
-        let gemmaTok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bTokenizerFileName)
-            ?? RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerFileName)
+        let gemmaTok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerFileName)
             ?? RemoteAssets.existingDocumentsFile(fileName: "tokenizer-gemma-3-1b-it.json")
-        let gemmaCfg = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bTokenizerConfigFileName) != nil
-            || RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerConfigFileName) != nil
+        let gemmaCfg = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerConfigFileName) != nil
             || RemoteAssets.existingDocumentsFile(fileName: "tokenizer_config.json") != nil
         if let gemmaModel, let gemmaTok, gemmaCfg {
             modelURL = gemmaModel
             tokenizerURL = gemmaTok
-            selectedSampleLabel = gemmaModel.lastPathComponent.contains("gemma-4-2p3b-it")
-                ? "Gemma-4-2P3B-IT (LiteRT)"
-                : "Gemma3-1B-IT (int8)"
+            selectedSampleLabel = "Gemma3-1B-IT (int8)"
+            if downloadStatus.isEmpty { downloadStatus = "Loaded local sample files." }
+            return
+        }
+
+        let gemma4Model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bFileName)
+        let gemma4Tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bTokenizerFileName)
+        let gemma4Cfg = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bTokenizerConfigFileName) != nil
+        if let gemma4Model, let gemma4Tok, gemma4Cfg {
+            modelURL = gemma4Model
+            tokenizerURL = gemma4Tok
+            selectedSampleLabel = "Gemma-4-2P3B-IT (LiteRT)"
             if downloadStatus.isEmpty { downloadStatus = "Loaded local sample files." }
             return
         }
@@ -1492,7 +1535,9 @@ Assistant:
         clearLocalFiles()
         if priorSelection == "SmolLM2" {
             downloadSmolLMSampleAssets()
-        } else if priorSelection == "Gemma3-1B-IT (int8)" || priorSelection == "Gemma-4-2P3B-IT (LiteRT)" {
+        } else if priorSelection == "Gemma-4-2P3B-IT (LiteRT)" {
+            downloadGemma4LiteRtAssets()
+        } else if priorSelection == "Gemma3-1B-IT (int8)" {
             downloadGemmaSampleAssets()
         } else {
             downloadQwenSampleAssets()

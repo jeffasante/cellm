@@ -3,6 +3,11 @@ import UniformTypeIdentifiers
 import Dispatch
 
 struct LLMView: View {
+    private enum SharedSelection {
+        static let llmModelPath = "cellm.shared.llm.model.path"
+        static let llmTokenizerPath = "cellm.shared.llm.tokenizer.path"
+    }
+
     private struct ChatTurn: Identifiable {
         let id = UUID()
         let role: String
@@ -52,6 +57,32 @@ struct LLMView: View {
             loaded = newRuntime
             lock.unlock()
             return (newRuntime, true)
+        }
+    }
+
+    private final class StreamTelemetry {
+        struct Snapshot {
+            let flushes: Int
+            let chars: Int
+            let elapsedMs: Double
+        }
+
+        private let lock = NSLock()
+        private let startedAt = Date()
+        private var flushes = 0
+        private var chars = 0
+
+        func record(piece: String) -> Snapshot {
+            lock.lock()
+            flushes += 1
+            chars += piece.count
+            let snapshot = Snapshot(
+                flushes: flushes,
+                chars: chars,
+                elapsedMs: Date().timeIntervalSince(startedAt) * 1000.0
+            )
+            lock.unlock()
+            return snapshot
         }
     }
 
@@ -108,6 +139,9 @@ struct LLMView: View {
     @State private var prompt: String = "Return exactly one uppercase letter: R"
     @State private var output: String = ""
     @State private var runDiagnostics: String = ""
+    @State private var streamFlushes: Int = 0
+    @State private var streamChars: Int = 0
+    @State private var streamElapsedMs: Double = 0
     @State private var isRunning: Bool = false
     @State private var errorText: String?
     @State private var selectedBackend: CellmBackend = .metal
@@ -124,6 +158,8 @@ struct LLMView: View {
     @State private var chatInput: String = ""
     @State private var chatTurns: [ChatTurn] = []
     @State private var runtimeStatus: String = "Runtime: not loaded"
+    @State private var showSettings: Bool = false
+    @State private var showAdvancedDownloads: Bool = false
 
     @State private var showModelPicker = false
     @State private var showTokenizerPicker = false
@@ -164,8 +200,7 @@ struct LLMView: View {
                 storageCard
                 promptCard
                 conversationCard
-                presetCard
-                backendCard
+                settingsSection
                 generateButton
                 if let errorText { errorCard(errorText) }
                 outputCard
@@ -201,6 +236,8 @@ struct LLMView: View {
         .onAppear {
             restoreAssets()
         }
+        .onChange(of: modelURL) { _ in persistSharedSelection() }
+        .onChange(of: tokenizerURL) { _ in persistSharedSelection() }
     }
 
     private var header: some View {
@@ -215,39 +252,66 @@ struct LLMView: View {
     }
 
     private var filesCard: some View {
-        card("Files") {
-            actionButton(modelURL == nil ? "Pick .cellm model" : modelURL!.lastPathComponent, icon: "externaldrive") { showModelPicker = true }
-            actionButton(tokenizerURL == nil ? "Pick tokenizer.json" : tokenizerURL!.lastPathComponent, icon: "doc.text") { showTokenizerPicker = true }
-            actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen stable model + tokenizer (~1.6 GB)", icon: "arrow.down.circle", disabled: isDownloading || isRunning) {
-                downloadQwenSampleAssets()
-            }
-            actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen stable model only (~1.6 GB)", icon: "shippingbox", disabled: isDownloading || isRunning) {
-                downloadQwenModelOnly()
-            }
-            actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen compact model only (~361 MB, experimental)", icon: "shippingbox", disabled: isDownloading || isRunning) {
-                downloadQwenCompactModelOnly()
-            }
-            actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen tokenizer JSON only", icon: "arrow.down.doc", disabled: isDownloading || isRunning) {
-                downloadQwenTokenizerOnly()
-            }
-            actionButton(isDownloading ? "Downloading sample files…" : "Download SmolLM sample model + tokenizer", icon: "arrow.down.circle", disabled: isDownloading || isRunning) {
-                downloadSmolLMSampleAssets()
-            }
-            actionButton(isDownloading ? "Downloading sample files…" : "Download Gemma 3 1B int8 model + tokenizer (~1.2 GB)", icon: "arrow.down.circle", disabled: isDownloading || isRunning) {
-                downloadGemmaSampleAssets()
-            }
-            actionButton(isDownloading ? "Downloading sample files…" : "Download SmolLM model only", icon: "shippingbox", disabled: isDownloading || isRunning) {
-                downloadSmolLMModelOnly()
-            }
-            actionButton(isDownloading ? "Downloading sample files…" : "Download SmolLM tokenizer JSON only", icon: "arrow.down.doc", disabled: isDownloading || isRunning) {
-                downloadSmolLMTokenizerOnly()
-            }
-            actionButton("Run Qwen Smoke Test", icon: "bolt.circle", disabled: isRunning || modelURL == nil || tokenizerURL == nil) {
-                runQwenSmokeTest()
-            }
-            actionButton("Run Scheduler Smoke (Suspend/Resume)", icon: "pause.circle", disabled: isRunning || modelURL == nil || tokenizerURL == nil) {
-                runSchedulerSmokeTest()
-            }
+        card("Model Management") {
+            Text("Manage on-device LLMs and download recommended presets.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            Text("Recommended models")
+                .font(.subheadline)
+                .fontWeight(.semibold)
+
+            modelDownloadCard(
+                title: "Gemma-4-2P3B-IT (LiteRT)",
+                subtitle: "Best overall",
+                detail: "2.3B instruction model via LiteRT proxy. Strong quality for local chat.",
+                sizeText: "~2.5 GB+",
+                isInstalled: hasGemma4LiteRTSample,
+                isSelected: selectedSampleLabel == "Gemma-4-2P3B-IT (LiteRT)",
+                onDownload: { downloadGemmaSampleAssets() },
+                onUseInstalled: {
+                    selectInstalledSample(
+                        modelFile: DemoAssetLinks.gemma42p3bFileName,
+                        tokenizerFile: DemoAssetLinks.gemma42p3bTokenizerFileName,
+                        label: "Gemma-4-2P3B-IT (LiteRT)"
+                    )
+                }
+            )
+
+            modelDownloadCard(
+                title: "Qwen3.5-0.8B",
+                subtitle: "Fast baseline",
+                detail: "Stable small model with good speed/quality tradeoff.",
+                sizeText: "~1.6 GB",
+                isInstalled: hasQwenStableSample,
+                isSelected: selectedSampleLabel == "Qwen3.5 (stable)",
+                onDownload: { downloadQwenSampleAssets() },
+                onUseInstalled: {
+                    selectInstalledSample(
+                        modelFile: DemoAssetLinks.qwen35StableFileName,
+                        tokenizerFile: DemoAssetLinks.qwen35TokenizerFileName,
+                        label: "Qwen3.5 (stable)"
+                    )
+                }
+            )
+
+            modelDownloadCard(
+                title: "SmolLM2-135M",
+                subtitle: "Smallest",
+                detail: "Tiny model for quick local tests and integration checks.",
+                sizeText: "~300 MB",
+                isInstalled: hasSmolLMSample,
+                isSelected: selectedSampleLabel == "SmolLM2",
+                onDownload: { downloadSmolLMSampleAssets() },
+                onUseInstalled: {
+                    selectInstalledSample(
+                        modelFile: DemoAssetLinks.smollm2FileName,
+                        tokenizerFile: DemoAssetLinks.smollm2TokenizerFileName,
+                        label: "SmolLM2"
+                    )
+                }
+            )
+
             if !downloadStatus.isEmpty {
                 Text(downloadStatus).font(.footnote).foregroundStyle(.secondary)
             }
@@ -273,7 +337,147 @@ struct LLMView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showAdvancedDownloads.toggle()
+                }
+            } label: {
+                HStack {
+                    Text(showAdvancedDownloads ? "Hide Advanced Actions" : "Show Advanced Actions")
+                        .font(.footnote)
+                        .fontWeight(.semibold)
+                    Spacer()
+                    Image(systemName: showAdvancedDownloads ? "chevron.up" : "chevron.down")
+                        .font(.footnote.bold())
+                }
+                .padding(10)
+                .background(Color(.systemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+            .buttonStyle(.plain)
+
+            if showAdvancedDownloads {
+                actionButton(modelURL == nil ? "Pick .cellm model" : modelURL!.lastPathComponent, icon: "externaldrive") { showModelPicker = true }
+                actionButton(tokenizerURL == nil ? "Pick tokenizer.json" : tokenizerURL!.lastPathComponent, icon: "doc.text") { showTokenizerPicker = true }
+                actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen stable model only (~1.6 GB)", icon: "shippingbox", disabled: isDownloading || isRunning) {
+                    downloadQwenModelOnly()
+                }
+                actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen compact model only (~361 MB, experimental)", icon: "shippingbox", disabled: isDownloading || isRunning) {
+                    downloadQwenCompactModelOnly()
+                }
+                actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen tokenizer JSON only", icon: "arrow.down.doc", disabled: isDownloading || isRunning) {
+                    downloadQwenTokenizerOnly()
+                }
+                actionButton(isDownloading ? "Downloading sample files…" : "Download SmolLM model only", icon: "shippingbox", disabled: isDownloading || isRunning) {
+                    downloadSmolLMModelOnly()
+                }
+                actionButton(isDownloading ? "Downloading sample files…" : "Download SmolLM tokenizer JSON only", icon: "arrow.down.doc", disabled: isDownloading || isRunning) {
+                    downloadSmolLMTokenizerOnly()
+                }
+                actionButton("Run Qwen Smoke Test", icon: "bolt.circle", disabled: isRunning || modelURL == nil || tokenizerURL == nil) {
+                    runQwenSmokeTest()
+                }
+                actionButton("Run Scheduler Smoke (Suspend/Resume)", icon: "pause.circle", disabled: isRunning || modelURL == nil || tokenizerURL == nil) {
+                    runSchedulerSmokeTest()
+                }
+            }
         }
+    }
+
+    private var hasGemma4LiteRTSample: Bool {
+        hasSampleFiles(
+            modelFile: DemoAssetLinks.gemma42p3bFileName,
+            tokenizerFile: DemoAssetLinks.gemma42p3bTokenizerFileName,
+            tokenizerConfigFile: DemoAssetLinks.gemma42p3bTokenizerConfigFileName
+        )
+    }
+
+    private var hasQwenStableSample: Bool {
+        hasSampleFiles(
+            modelFile: DemoAssetLinks.qwen35StableFileName,
+            tokenizerFile: DemoAssetLinks.qwen35TokenizerFileName,
+            tokenizerConfigFile: DemoAssetLinks.qwen35TokenizerConfigFileName
+        )
+    }
+
+    private var hasSmolLMSample: Bool {
+        hasSampleFiles(
+            modelFile: DemoAssetLinks.smollm2FileName,
+            tokenizerFile: DemoAssetLinks.smollm2TokenizerFileName,
+            tokenizerConfigFile: DemoAssetLinks.smollm2TokenizerConfigFileName
+        )
+    }
+
+    private func hasSampleFiles(modelFile: String, tokenizerFile: String, tokenizerConfigFile: String) -> Bool {
+        RemoteAssets.existingDocumentsFile(fileName: modelFile) != nil &&
+        RemoteAssets.existingDocumentsFile(fileName: tokenizerFile) != nil &&
+        RemoteAssets.existingDocumentsFile(fileName: tokenizerConfigFile) != nil
+    }
+
+    private func selectInstalledSample(modelFile: String, tokenizerFile: String, label: String) {
+        guard let model = RemoteAssets.existingDocumentsFile(fileName: modelFile),
+              let tokenizer = RemoteAssets.existingDocumentsFile(fileName: tokenizerFile) else {
+            errorText = "Sample files are not installed yet."
+            return
+        }
+        modelURL = model
+        tokenizerURL = tokenizer
+        selectedSampleLabel = label
+        downloadStatus = "Using installed files: \(model.lastPathComponent), \(tokenizer.lastPathComponent)"
+    }
+
+    private func modelDownloadCard(
+        title: String,
+        subtitle: String,
+        detail: String,
+        sizeText: String,
+        isInstalled: Bool,
+        isSelected: Bool,
+        onDownload: @escaping () -> Void,
+        onUseInstalled: @escaping () -> Void
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(subtitle.uppercased())
+                        .font(.caption2)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(.orange)
+                    Text(title)
+                        .font(.headline)
+                }
+                Spacer()
+                Text(isInstalled ? "Installed" : "Not installed")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(isInstalled ? .green : .secondary)
+            }
+            Text(sizeText)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Text(detail)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                Button(isDownloading ? "Downloading…" : "Download") { onDownload() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isDownloading || isRunning)
+                Button("Use Installed") { onUseInstalled() }
+                    .buttonStyle(.bordered)
+                    .disabled(!isInstalled || isRunning || isDownloading)
+            }
+            if isSelected {
+                Text("Currently selected")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.blue)
+            }
+        }
+        .padding(12)
+        .background(Color(.systemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 
     private var promptCard: some View {
@@ -413,6 +617,39 @@ struct LLMView: View {
         }
     }
 
+    private var settingsSection: some View {
+        VStack(spacing: 12) {
+            Button {
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                    showSettings.toggle()
+                }
+            } label: {
+                HStack {
+                    Label(showSettings ? "Hide Settings" : "Generation & Backend Settings", systemImage: "slider.horizontal.3")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Image(systemName: showSettings ? "chevron.up" : "chevron.down")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                }
+                .padding(14)
+                .background(Color(.secondarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+            }
+            .buttonStyle(.plain)
+
+            if showSettings {
+                VStack(spacing: 16) {
+                    presetCard
+                    backendCard
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+    }
+
     private var generateButton: some View {
         Button(isRunning ? "Generating…" : "Generate") { run() }
             .buttonStyle(.borderedProminent)
@@ -429,6 +666,9 @@ struct LLMView: View {
 
     private var outputCard: some View {
         card("Output") {
+            if streamFlushes > 0 || isRunning {
+                streamHealthView
+            }
             if !runDiagnostics.isEmpty {
                 Text(runDiagnostics)
                     .font(.footnote)
@@ -446,6 +686,45 @@ struct LLMView: View {
                 .background(Color(.systemBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 10))
         }
+    }
+
+    private var streamHealthView: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Stream Health")
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundStyle(.secondary)
+
+            let seconds = max(0.001, streamElapsedMs / 1000.0)
+            let flushRate = Double(streamFlushes) / seconds
+            let charRate = Double(streamChars) / seconds
+
+            HStack(spacing: 8) {
+                metricBadge("flushes", "\(streamFlushes)")
+                metricBadge("flush/s", String(format: "%.2f", flushRate))
+                metricBadge("chars/s", String(format: "%.1f", charRate))
+                metricBadge("elapsed", String(format: "%.1fs", seconds))
+            }
+        }
+        .padding(10)
+        .background(Color(.systemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func metricBadge(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundStyle(.primary)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color(.secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     private func card<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -490,6 +769,9 @@ struct LLMView: View {
         errorText = nil
         output = ""
         runDiagnostics = ""
+        streamFlushes = 0
+        streamChars = 0
+        streamElapsedMs = 0
         backendWarning = nil
         resolveStaleSelectionsIfNeeded()
         guard let modelURL, let tokenizerURL else { return }
@@ -521,10 +803,11 @@ struct LLMView: View {
         Task.detached(priority: .userInitiated) {
             do {
                 var initLogLines: [String] = []
+                let streamTelemetry = StreamTelemetry()
                 if backend == .metal, let metalErr = CellmFFI.metalSmokeError() {
                     throw CellmError.message("Metal requested but unavailable: \(metalErr)")
                 }
-                let runtimeKey = runtimeCacheKey(
+                let runtimeKey = Self.runtimeCacheKey(
                     modelURL: modelURL,
                     tokenizerURL: tokenizerURL,
                     backend: backend,
@@ -605,20 +888,31 @@ struct LLMView: View {
                     thermalLevel: thermal,
                     exerciseSuspendResume: exerciseSuspendResume,
                     onToken: { piece in
+                        let snapshot = streamTelemetry.record(piece: piece)
                         Task { @MainActor in
                             self.output += piece
+                            self.streamFlushes = snapshot.flushes
+                            self.streamChars = snapshot.chars
+                            self.streamElapsedMs = snapshot.elapsedMs
+                            self.runDiagnostics = formatLiveDiagnostics(
+                                lines: initLogLines,
+                                flushes: snapshot.flushes,
+                                chars: snapshot.chars,
+                                elapsedMs: snapshot.elapsedMs
+                            )
                         }
                     }
                 )
                 await MainActor.run {
                     self.output = prettyOutput(text)
                     onFinalText?(text)
+                    var finalInitLogLines = initLogLines
                     if let stats = eng.lastGenerationStats {
-                        initLogLines.append("prompt_style=\(eng.lastPromptStyle)")
+                        finalInitLogLines.append("prompt_style=\(eng.lastPromptStyle)")
                         if !eng.lastDebugTrace.isEmpty {
-                            initLogLines.append(contentsOf: eng.lastDebugTrace.map { "trace \($0)" })
+                            finalInitLogLines.append(contentsOf: eng.lastDebugTrace.map { "trace \($0)" })
                         }
-                        self.runDiagnostics = formatInitDiagnostics(lines: initLogLines, stats: stats)
+                        self.runDiagnostics = formatInitDiagnostics(lines: finalInitLogLines, stats: stats)
                     }
                     self.activeBackend = eng.activeBackend
                     var warnings: [String] = []
@@ -664,7 +958,7 @@ struct LLMView: View {
         }
     }
 
-    private func runtimeCacheKey(
+    nonisolated private static func runtimeCacheKey(
         modelURL: URL,
         tokenizerURL: URL,
         backend: CellmBackend,
@@ -848,10 +1142,10 @@ Assistant:
 
     private func downloadGemmaSampleAssets() {
         errorText = nil
-        selectedSampleLabel = "Gemma3-1B-IT (int8)"
-        if let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3FileName),
-           let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerFileName),
-           RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerConfigFileName) != nil {
+        selectedSampleLabel = "Gemma-4-2P3B-IT (LiteRT)"
+        if let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bFileName),
+           let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bTokenizerFileName),
+           RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bTokenizerConfigFileName) != nil {
             modelURL = model
             tokenizerURL = tok
             downloadStatus = "Using existing files in Documents."
@@ -868,24 +1162,24 @@ Assistant:
             do {
                 let totalFiles = 3.0
                 let modelPath = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.gemma3Int8,
-                    fileName: DemoAssetLinks.gemma3FileName,
+                    from: DemoAssetLinks.gemma42p3bLiteRt,
+                    fileName: DemoAssetLinks.gemma42p3bFileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "Gemma", fileName: DemoAssetLinks.gemma3FileName)
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "Gemma", fileName: DemoAssetLinks.gemma42p3bFileName)
                     }
                 )
                 let tokPath = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.gemma3Tokenizer,
-                    fileName: DemoAssetLinks.gemma3TokenizerFileName,
+                    from: DemoAssetLinks.gemma42p3bTokenizer,
+                    fileName: DemoAssetLinks.gemma42p3bTokenizerFileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "Gemma tokenizer", fileName: DemoAssetLinks.gemma3TokenizerFileName)
+                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "Gemma tokenizer", fileName: DemoAssetLinks.gemma42p3bTokenizerFileName)
                     }
                 )
                 _ = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.gemma3TokenizerConfig,
-                    fileName: DemoAssetLinks.gemma3TokenizerConfigFileName,
+                    from: DemoAssetLinks.gemma42p3bTokenizerConfig,
+                    fileName: DemoAssetLinks.gemma42p3bTokenizerConfigFileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 2.0, progress: p, totalFiles: totalFiles, label: "Gemma tokenizer", fileName: DemoAssetLinks.gemma3TokenizerConfigFileName)
+                        setDownloadProgress(completedFiles: 2.0, progress: p, totalFiles: totalFiles, label: "Gemma tokenizer", fileName: DemoAssetLinks.gemma42p3bTokenizerConfigFileName)
                     }
                 )
                 await MainActor.run {
@@ -1111,16 +1405,21 @@ Assistant:
     }
 
     private func restoreAssets() {
-        let gemmaModel = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3FileName)
+        let gemmaModel = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bFileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3FileName)
             ?? RemoteAssets.existingDocumentsFile(fileName: "gemma-3-1b-it-int8.cellmd")
-        let gemmaTok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerFileName)
+        let gemmaTok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bTokenizerFileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerFileName)
             ?? RemoteAssets.existingDocumentsFile(fileName: "tokenizer-gemma-3-1b-it.json")
-        let gemmaCfg = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerConfigFileName) != nil
+        let gemmaCfg = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bTokenizerConfigFileName) != nil
+            || RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerConfigFileName) != nil
             || RemoteAssets.existingDocumentsFile(fileName: "tokenizer_config.json") != nil
         if let gemmaModel, let gemmaTok, gemmaCfg {
             modelURL = gemmaModel
             tokenizerURL = gemmaTok
-            selectedSampleLabel = "Gemma3-1B-IT (int8)"
+            selectedSampleLabel = gemmaModel.lastPathComponent.contains("gemma-4-2p3b-it")
+                ? "Gemma-4-2P3B-IT (LiteRT)"
+                : "Gemma3-1B-IT (int8)"
             if downloadStatus.isEmpty { downloadStatus = "Loaded local sample files." }
             return
         }
@@ -1160,6 +1459,9 @@ Assistant:
     }
 
     private func clearLocalFiles() {
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma42p3bFileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma42p3bTokenizerFileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma42p3bTokenizerConfigFileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma3FileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerFileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerConfigFileName)
@@ -1190,7 +1492,7 @@ Assistant:
         clearLocalFiles()
         if priorSelection == "SmolLM2" {
             downloadSmolLMSampleAssets()
-        } else if priorSelection == "Gemma3-1B-IT (int8)" {
+        } else if priorSelection == "Gemma3-1B-IT (int8)" || priorSelection == "Gemma-4-2P3B-IT (LiteRT)" {
             downloadGemmaSampleAssets()
         } else {
             downloadQwenSampleAssets()
@@ -1231,6 +1533,15 @@ Assistant:
         } catch {
             self.errorText = "Failed to import selected file: \(error.localizedDescription)"
             return nil
+        }
+    }
+
+    private func persistSharedSelection() {
+        if let model = modelURL?.path {
+            UserDefaults.standard.set(model, forKey: SharedSelection.llmModelPath)
+        }
+        if let tok = tokenizerURL?.path {
+            UserDefaults.standard.set(tok, forKey: SharedSelection.llmTokenizerPath)
         }
     }
 
@@ -1292,6 +1603,22 @@ Assistant:
         let initLine = lines.joined(separator: " ")
         let genLine = formatDiagnostics(stats: stats)
         return "\(initLine)\n\(genLine)"
+    }
+
+    private func formatLiveDiagnostics(lines: [String], flushes: Int, chars: Int, elapsedMs: Double) -> String {
+        let initLine = lines.joined(separator: " ")
+        let seconds = max(0.001, elapsedMs / 1000.0)
+        let flushRate = Double(flushes) / seconds
+        let charRate = Double(chars) / seconds
+        let liveLine = String(
+            format: "stream_live flushes=%d chars=%d elapsed=%.1fms flushes_per_s=%.2f chars_per_s=%.2f",
+            flushes,
+            chars,
+            elapsedMs,
+            flushRate,
+            charRate
+        )
+        return "\(initLine)\n\(liveLine)"
     }
 
     private func setDownloadProgress(completedFiles: Double, progress: RemoteAssets.DownloadProgress, totalFiles: Double, label: String, fileName: String) {

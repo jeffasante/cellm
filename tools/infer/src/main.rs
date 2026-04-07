@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -158,6 +159,11 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
     }
 
     let text_model_type = effective_text_model_type(&header);
+    if text_model_type == "litertlm_proxy" {
+        run_litertlm_proxy(&file, &args)?;
+        return Ok(());
+    }
+
     let t_stage = Instant::now();
     let mut runner = match text_model_type.as_str() {
         "llama" => Runner::Llama(LlamaRunner::load(&args.model)?),
@@ -984,4 +990,72 @@ fn effective_text_model_type(header: &cellm_model::CellmHeader) -> String {
         }
     }
     header.model_type.clone()
+}
+
+fn run_litertlm_proxy(file: &CellmFile, args: &Args) -> Result<()> {
+    let prompt = args
+        .prompt
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("litertlm_proxy requires --prompt"))?;
+    let litert_tensor_name = if file.tensor_index("litert.bundle").is_some() {
+        "litert.bundle"
+    } else {
+        file.header
+            .tensors
+            .first()
+            .map(|t| t.name.as_str())
+            .ok_or_else(|| anyhow::anyhow!("litertlm_proxy model has no tensors"))?
+    };
+    let litert_bytes = file.tensor_bytes(litert_tensor_name)?;
+    let temp_name = format!(
+        "cellm_litert_proxy_{}_{}.litertlm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    let temp_path = std::env::temp_dir().join(temp_name);
+    std::fs::write(&temp_path, litert_bytes)
+        .map_err(|e| anyhow::anyhow!("failed to write temporary litert model {:?}: {e}", temp_path))?;
+
+    let default_bin = PathBuf::from("/Users/jeff/Desktop/cellm/.venv-hf/bin/litert-lm");
+    let litert_bin = std::env::var("CELLM_LITERT_LM_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            if default_bin.exists() {
+                default_bin
+            } else {
+                PathBuf::from("litert-lm")
+            }
+        });
+    let backend = match args.backend {
+        BackendKind::Cpu => "cpu",
+        BackendKind::Metal => "gpu",
+    };
+
+    println!("LLM backend: litert-lm ({backend})");
+    println!("Model: {:?}", args.model);
+    let output = Command::new(&litert_bin)
+        .arg("run")
+        .arg(&temp_path)
+        .arg("--prompt")
+        .arg(prompt)
+        .arg("-b")
+        .arg(backend)
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to execute {:?}: {e}", litert_bin))?;
+    let _ = std::fs::remove_file(&temp_path);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "litert-lm run failed with status {}: {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("{}", stdout.trim_end());
+    Ok(())
 }

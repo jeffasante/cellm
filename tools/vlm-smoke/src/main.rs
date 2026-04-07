@@ -83,6 +83,22 @@ fn main() -> Result<()> {
                 .to_string_lossy()
                 .to_string();
             println!("Backend active: {bname}");
+            let mut patch = 0.0f64;
+            let mut encoder = 0.0f64;
+            let mut decode = 0.0f64;
+            let mut total = 0.0f64;
+            let trc = cellm_sdk::ffi::cellm_vlm_last_timings_ms(
+                &mut patch as *mut f64,
+                &mut encoder as *mut f64,
+                &mut decode as *mut f64,
+                &mut total as *mut f64,
+            );
+            if trc == 0 {
+                println!(
+                    "Timings: patch={:.1}ms encoder={:.1}ms decode={:.1}ms total={:.1}ms",
+                    patch, encoder, decode, total
+                );
+            }
             println!("VLM output:\n{text}");
         } else {
             println!("VLM returned error: {}", last_error());

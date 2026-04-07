@@ -17,6 +17,8 @@ enum DemoAssetLinks {
     static let smollm2Tokenizer = "https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/main/tokenizer.json"
     static let smollm2TokenizerConfig = "https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/main/tokenizer_config.json"
     static let smolvlmTokenizer = "https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct/resolve/main/tokenizer.json"
+    static let smolvlmProcessorConfig = "https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct/resolve/main/processor_config.json"
+    static let smolvlmPreprocessorConfig = "https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct/resolve/main/preprocessor_config.json"
     static let smollm2Dir = "samples/smollm2-135m"
     static let smollm2FileName = "\(smollm2Dir)/smollm2-135m-int8.cellm"
     static let smollm2TokenizerFileName = "\(smollm2Dir)/tokenizer-smollm2-135m.json"
@@ -30,8 +32,18 @@ enum DemoAssetLinks {
     static let gemma3TokenizerFileName = "\(gemma3Dir)/tokenizer-gemma-3-1b-it.json"
     static let gemma3TokenizerConfigFileName = "\(gemma3Dir)/tokenizer_config.json"
 
+    static let gemma42p3bLiteRt = "https://huggingface.co/jeffasante/cellm-models/blob/main/gemma-4-2p3b-it/gemma-4-2p3b-it-litert.cellm"
+    static let gemma42p3bTokenizer = "https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX/resolve/main/tokenizer.json"
+    static let gemma42p3bTokenizerConfig = "https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX/resolve/main/tokenizer_config.json"
+    static let gemma42p3bDir = "samples/gemma-4-2p3b-it"
+    static let gemma42p3bFileName = "\(gemma42p3bDir)/gemma-4-2p3b-it-litert.cellm"
+    static let gemma42p3bTokenizerFileName = "\(gemma42p3bDir)/tokenizer-gemma-4-2p3b-it.json"
+    static let gemma42p3bTokenizerConfigFileName = "\(gemma42p3bDir)/tokenizer_config.json"
+
     static let smolvlmFileName = "smolvlm-256m-int8.cellm"
     static let smolvlmTokenizerFileName = "tokenizer-smolvlm-256m.json"
+    static let smolvlmProcessorConfigFileName = "processor_config-smolvlm-256m.json"
+    static let smolvlmPreprocessorConfigFileName = "preprocessor_config-smolvlm-256m.json"
     static let rococoFileName = "rococo_1.jpg"
 }
 

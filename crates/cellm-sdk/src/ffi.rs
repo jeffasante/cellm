@@ -916,6 +916,57 @@ pub extern "C" fn cellm_engine_backend_name(
 }
 
 #[no_mangle]
+pub extern "C" fn cellm_engine_is_litert_proxy(engine: cellm_engine_t) -> u32 {
+    if engine == 0 {
+        set_last_error("engine_is_litert_proxy: null engine".to_string());
+        return 0;
+    }
+    let e = unsafe { &*(engine as *const Engine) };
+    if e.is_litert_proxy() { 1 } else { 0 }
+}
+
+/// Direct text generation entrypoint for litertlm_proxy models.
+///
+/// If `out_buf` is null or `buf_len == 0`, returns required bytes (without null terminator).
+/// Otherwise writes up to `buf_len-1` bytes and null-terminates. Returns bytes written.
+#[no_mangle]
+pub extern "C" fn cellm_engine_generate_text(
+    engine: cellm_engine_t,
+    prompt_utf8: *const c_char,
+    out_buf: *mut c_char,
+    buf_len: usize,
+) -> usize {
+    let result: Result<usize, String> = (|| {
+        if engine == 0 {
+            return Err("engine_generate_text: null engine".to_string());
+        }
+        let prompt = cstr_to_str(prompt_utf8)?;
+        let e = unsafe { &mut *(engine as *mut Engine) };
+        let text = e
+            .generate_text_litert(prompt)
+            .map_err(|err| format!("engine_generate_text failed: {err}"))?;
+        let bytes = text.as_bytes();
+        if out_buf.is_null() || buf_len == 0 {
+            return Ok(bytes.len());
+        }
+        let n = bytes.len().min(buf_len.saturating_sub(1));
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf as *mut u8, n);
+            *out_buf.add(n) = 0;
+        }
+        Ok(n)
+    })();
+
+    match result {
+        Ok(n) => n,
+        Err(e) => {
+            set_last_error(e);
+            0
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn cellm_vlm_describe_image(
     engine: cellm_engine_t,
     session: SessionId,
@@ -955,7 +1006,9 @@ pub extern "C" fn cellm_vlm_describe_image(
                 seed: sampling.seed,
                 repeat_penalty: sampling.repeat_penalty as f32,
                 repeat_window: sampling.repeat_window,
-                max_new_tokens: 128,
+                // Keep VLM generations concise by default to reduce latency and loop risk
+                // on mobile; callers can expose a longer budget if needed.
+                max_new_tokens: 16,
                 min_new_tokens: 1,
             },
         )

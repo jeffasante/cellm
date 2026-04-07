@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::Result;
 use cellm_cache::{KVCache, KvEncodingKind, KvStorageKind, PageTable};
@@ -70,6 +71,71 @@ enum Runner {
     Llama(LlamaRunner),
     Gemma(GemmaRunner),
     Qwen(QwenRunner),
+    LiteRtProxy(LiteRtProxyRunner),
+}
+
+struct LiteRtProxyRunner {
+    model_path: PathBuf,
+    tensor_name: String,
+}
+
+impl LiteRtProxyRunner {
+    fn run_prompt(&self, prompt: &str, backend: BackendKind) -> Result<String> {
+        let file = CellmFile::load(&self.model_path)?;
+        let bundle = file
+            .tensor_bytes(&self.tensor_name)
+            .map_err(|e| anyhow::anyhow!("litert proxy: failed to read embedded bundle: {e}"))?;
+
+        let temp_name = format!(
+            "cellm_sdk_litert_proxy_{}_{}.litertlm",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        );
+        let temp_path = std::env::temp_dir().join(temp_name);
+        std::fs::write(&temp_path, bundle).map_err(|e| {
+            anyhow::anyhow!(
+                "litert proxy: failed to write temporary model {:?}: {e}",
+                temp_path
+            )
+        })?;
+
+        let default_bin = PathBuf::from("/Users/jeff/Desktop/cellm/.venv-hf/bin/litert-lm");
+        let bin = std::env::var("CELLM_LITERT_LM_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                if default_bin.exists() {
+                    default_bin
+                } else {
+                    PathBuf::from("litert-lm")
+                }
+            });
+        let litert_backend = match backend {
+            BackendKind::Cpu => "cpu",
+            BackendKind::Metal => "gpu",
+        };
+        let output = Command::new(&bin)
+            .arg("run")
+            .arg(&temp_path)
+            .arg("--prompt")
+            .arg(prompt)
+            .arg("-b")
+            .arg(litert_backend)
+            .output()
+            .map_err(|e| anyhow::anyhow!("litert proxy: failed to execute {:?}: {e}", bin))?;
+        let _ = std::fs::remove_file(&temp_path);
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "litert proxy: run failed with status {}: {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
 }
 
 /// cellm public API engine.
@@ -106,6 +172,21 @@ impl Engine {
             "llama" => Runner::Llama(LlamaRunner::load(model_path)?),
             t if t.starts_with("gemma") => Runner::Gemma(GemmaRunner::load(model_path)?),
             t if t.starts_with("qwen") => Runner::Qwen(QwenRunner::load(model_path)?),
+            "litertlm_proxy" => {
+                let tensor_name = if file.tensor_index("litert.bundle").is_some() {
+                    "litert.bundle".to_string()
+                } else {
+                    header
+                        .tensors
+                        .first()
+                        .map(|t| t.name.clone())
+                        .ok_or_else(|| anyhow::anyhow!("litertlm_proxy has no tensors"))?
+                };
+                Runner::LiteRtProxy(LiteRtProxyRunner {
+                    model_path: model_path.to_path_buf(),
+                    tensor_name,
+                })
+            }
             other => anyhow::bail!(
                 "unsupported model_type for Engine: model_type={} effective_text_model_type={other}",
                 header.model_type
@@ -128,6 +209,7 @@ impl Engine {
                         anyhow::bail!("Llama full-metal backend requested but unavailable");
                     }
                 }
+                Runner::LiteRtProxy(_) => {}
             }
         }
 
@@ -135,12 +217,23 @@ impl Engine {
             Runner::Llama(r) => r.config().clone(),
             Runner::Gemma(r) => r.config().clone(),
             Runner::Qwen(r) => r.config().clone(),
+            Runner::LiteRtProxy(_) => ModelConfig {
+                vocab_size: 0,
+                hidden_size: 0,
+                num_hidden_layers: 1,
+                num_attention_heads: 1,
+                num_key_value_heads: 1,
+                intermediate_size: 0,
+                rms_norm_eps: 1e-6,
+                rope_theta: 10_000.0,
+            },
         };
 
         let head_dim = match &runner {
             Runner::Llama(_) => cfg.hidden_size / cfg.num_attention_heads,
             Runner::Gemma(_) => infer_gemma_kv_head_dim(&file)?,
             Runner::Qwen(_) => infer_qwen_kv_head_dim(&file)?,
+            Runner::LiteRtProxy(_) => 1,
         };
 
         let layout = KvCacheLayout {
@@ -184,6 +277,17 @@ impl Engine {
             BackendKind::Cpu => "cpu",
             BackendKind::Metal => "metal",
         }
+    }
+
+    pub fn is_litert_proxy(&self) -> bool {
+        matches!(self.runner, Runner::LiteRtProxy(_))
+    }
+
+    pub fn generate_text_litert(&self, prompt: &str) -> Result<String> {
+        let Runner::LiteRtProxy(r) = &self.runner else {
+            anyhow::bail!("generate_text_litert is only supported for litertlm_proxy engines");
+        };
+        r.run_prompt(prompt, self.backend)
     }
 
     pub fn create_session(&mut self) -> SessionId {
@@ -290,6 +394,9 @@ impl Engine {
                 }
                 Runner::Qwen(r) => {
                     r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
+                }
+                Runner::LiteRtProxy(_) => {
+                    anyhow::bail!("submit_tokens is not supported for litertlm_proxy; use generate_text_litert");
                 }
             };
             if let Runner::Gemma(r) = &self.runner {
@@ -604,6 +711,9 @@ impl Engine {
                     r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?
                 }
                 Runner::Qwen(r) => r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
+                Runner::LiteRtProxy(_) => {
+                    anyhow::bail!("step_decode is not supported for litertlm_proxy; use generate_text_litert");
+                }
             };
             if let Runner::Gemma(r) = &self.runner {
                 if r.is_gemma3_text() {

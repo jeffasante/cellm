@@ -90,6 +90,18 @@ size_t cellm_engine_backend_name(
     size_t buf_len
 );
 
+// Returns 1 if this engine wraps a litertlm_proxy model, 0 otherwise.
+uint32_t cellm_engine_is_litert_proxy(cellm_engine_t engine);
+
+// Direct text generation for litertlm_proxy models.
+// If out_buf is null/buf_len==0, returns required byte count (excluding null terminator).
+size_t cellm_engine_generate_text(
+    cellm_engine_t engine,
+    const char* prompt_utf8,
+    char* out_buf,
+    size_t buf_len
+);
+
 // Tokenizers.
 cellm_tokenizer_t cellm_tokenizer_create(const char* tokenizer_path);
 void cellm_tokenizer_destroy(cellm_tokenizer_t tok);

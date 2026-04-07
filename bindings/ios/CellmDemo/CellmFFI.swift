@@ -138,6 +138,7 @@ final class CellmEngine {
     private let modelURL: URL
 
     let activeBackend: String
+    let isLiteRtProxy: Bool
     private(set) var lastPromptStyle: String = "unknown"
     private(set) var lastDebugTrace: [String] = []
     private(set) var lastGenerationStats: LlmGenerationStats?
@@ -177,6 +178,7 @@ final class CellmEngine {
         guard sid != 0 else { throw CellmError.message(CellmFFI.lastError()) }
         self.session = sid
         self.activeBackend = CellmFFI.engineBackendName(h)
+        self.isLiteRtProxy = (cellm_engine_is_litert_proxy(h) != 0)
     }
 
     deinit {
@@ -194,12 +196,27 @@ final class CellmEngine {
         exerciseSuspendResume: Bool = false,
         onToken: ((String) -> Void)? = nil
     ) throws -> String {
+        if isLiteRtProxy {
+            let text = try generateWithLiteRt(prompt: prompt)
+            onToken?(text)
+            let totalMs = 0.0
+            lastGenerationStats = LlmGenerationStats(
+                promptTokenCount: 0,
+                generatedTokenCount: 0,
+                prefillMs: 0.0,
+                decodeMs: 0.0,
+                totalMs: totalMs,
+                firstPiece: text,
+                stopReason: "litert_proxy"
+            )
+            return text
+        }
         lastGenerationStats = nil
         lastDebugTrace = []
         let uppercaseConstraintTarget = Self.expectedUppercaseTarget(prompt: prompt)
-        let promptStyle = Self.promptStyle(tokenizerURL: tokenizer.tokenizerURL, modelURL: modelURL)
-        lastPromptStyle = promptStyle.label
-        let promptText = Self.wrapPrompt(prompt, style: promptStyle)
+        let processor = ModelDataProcessorFactory.make(tokenizerURL: tokenizer.tokenizerURL, modelURL: modelURL)
+        lastPromptStyle = processor.label
+        let promptText = processor.wrapPrompt(prompt)
         let promptTokens = try tokenizer.encode(promptText)
         lastDebugTrace.append("start backend=\(activeBackend) prompt_style=\(lastPromptStyle) prompt_tokens=\(promptTokens.count)")
         Self.debugLog("generate start backend=\(activeBackend) prompt_style=\(lastPromptStyle) prompt_tokens=\(promptTokens.count) max_new_tokens=\(maxNewTokens)")
@@ -223,33 +240,40 @@ final class CellmEngine {
         }
 
         var out = ""
-        // Stream with low-latency cadence so output feels continuous while
-        // still avoiding per-token UI churn.
-        let streamMaxFlushInterval: TimeInterval = 0.06
-        let streamMaxBufferedChars = 32
+        // Lightweight on-device decode scheduler: smooth streaming cadence with
+        // backend/thermal/cache-hit aware thresholds.
+        let streamScheduler = DecodeStreamScheduler(
+            activeBackend: activeBackend,
+            thermalLevel: thermalLevel,
+            prefillCacheHit: cacheHit == 1,
+            startAt: tAfterPrefill
+        )
+        lastDebugTrace.append("stream_profile \(streamScheduler.profileLabel)")
+        Self.debugLog("stream scheduler \(streamScheduler.profileLabel)")
         var pendingStreamChunk = ""
-        var lastStreamFlushAt = Date()
-        let shouldForceFlush: (String) -> Bool = { piece in
-            if piece.contains("\n") { return true }
-            if piece.contains(".") || piece.contains("!") || piece.contains("?") { return true }
-            if piece.hasSuffix(":") || piece.hasSuffix(";") { return true }
-            return false
-        }
         let flushPendingChunk: (Bool) -> Void = { force in
             guard !pendingStreamChunk.isEmpty else { return }
-            let now = Date()
-            let dueByTime = now.timeIntervalSince(lastStreamFlushAt) >= streamMaxFlushInterval
-            let dueBySize = pendingStreamChunk.count >= streamMaxBufferedChars
-            if !force && !dueByTime && !dueBySize {
+            guard force else {
                 return
             }
+            let now = Date()
             onToken?(pendingStreamChunk)
             pendingStreamChunk = ""
-            lastStreamFlushAt = now
+            streamScheduler.markFlushed(at: now)
         }
         let pushStreamPiece: (String) -> Void = { piece in
             pendingStreamChunk += piece
-            flushPendingChunk(shouldForceFlush(piece))
+            let now = Date()
+            let shouldFlush = streamScheduler.shouldFlush(
+                afterAppending: piece,
+                pendingChars: pendingStreamChunk.count,
+                now: now
+            )
+            if shouldFlush {
+                onToken?(pendingStreamChunk)
+                pendingStreamChunk = ""
+                streamScheduler.markFlushed(at: now)
+            }
         }
         let firstPiece = try tokenizer.decodeOne(next)
         var stopReason = "max_tokens"
@@ -261,7 +285,7 @@ final class CellmEngine {
             stopReason = (upper == target)
                 ? "uppercase_constraint_satisfied"
                 : "uppercase_constraint_target_enforced"
-        } else if !Self.isStopPiece(firstPiece) {
+        } else if !processor.isStopPiece(firstPiece) {
             out += firstPiece
             pushStreamPiece(firstPiece)
         }
@@ -320,7 +344,7 @@ final class CellmEngine {
                 generated += 1
                 break
             }
-            if Self.isStopPiece(piece) {
+            if processor.isStopPiece(piece) {
                 stopReason = "stop_piece"
                 break
             }
@@ -380,6 +404,25 @@ final class CellmEngine {
         return out
     }
 
+    private func generateWithLiteRt(prompt: String) throws -> String {
+        let needed = prompt.withCString { cPrompt in
+            cellm_engine_generate_text(handle, cPrompt, nil, 0)
+        }
+        if needed == 0 {
+            throw CellmError.message(CellmFFI.lastError())
+        }
+        var bytes = [CChar](repeating: 0, count: needed + 1)
+        let written = prompt.withCString { cPrompt in
+            bytes.withUnsafeMutableBufferPointer { out in
+                cellm_engine_generate_text(handle, cPrompt, out.baseAddress, out.count)
+            }
+        }
+        if written == 0 {
+            throw CellmError.message(CellmFFI.lastError())
+        }
+        return String(cString: bytes)
+    }
+
     private static func debugLog(_ message: String) {
         guard debugLogsEnabled else { return }
         print("[CellmDebug] \(message)")
@@ -425,93 +468,6 @@ final class CellmEngine {
     func resetSession() throws {
         let rc = cellm_session_reset(handle, session)
         if rc != 0 { throw CellmError.message(CellmFFI.lastError()) }
-    }
-
-    private static func wrapPrompt(_ prompt: String, style: PromptStyle) -> String {
-        let cleanPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        switch style {
-        case .smolChat:
-            return "<|im_start|>User: \(cleanPrompt)<end_of_utterance>\nAssistant:"
-        case .chatML(let includeThinkPrefill):
-            var s = "<|im_start|>user\n\(cleanPrompt)<|im_end|>\n<|im_start|>assistant\n"
-            if includeThinkPrefill {
-                s += "<think>\n\n</think>\n\n"
-            }
-            return s
-        case .gemma:
-            // Do not prepend BOS as raw text (e.g. "<bos>"): if BOS is needed it should be
-            // injected as an id-level special token, not literal bytes in the prompt.
-            return "<start_of_turn>user\n\(cleanPrompt)<end_of_turn>\n<start_of_turn>model\n"
-        case .gemma4:
-            return "<|turn>user\n\(cleanPrompt)<turn|>\n<|turn>model\n"
-        case .plain:
-            return "User: \(cleanPrompt)\nAssistant:"
-        }
-    }
-
-    private enum PromptStyle {
-        case smolChat
-        case chatML(includeThinkPrefill: Bool)
-        case gemma(bosToken: String?)
-        case gemma4
-        case plain
-
-        var label: String {
-            switch self {
-            case .smolChat: return "smol_chat"
-            case .chatML: return "chatml"
-            case .gemma: return "gemma_turn"
-            case .gemma4: return "gemma4_turn"
-            case .plain: return "plain"
-            }
-        }
-    }
-
-    private static func promptStyle(tokenizerURL: URL, modelURL: URL? = nil) -> PromptStyle {
-        let tokenizerName = tokenizerURL.lastPathComponent.lowercased()
-        let modelName = modelURL?.lastPathComponent.lowercased() ?? ""
-        let cfgURL = tokenizerURL.deletingLastPathComponent().appendingPathComponent("tokenizer_config.json")
-        guard
-            let data = try? Data(contentsOf: cfgURL),
-            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let tpl = obj["chat_template"] as? String
-        else {
-            if tokenizerName.contains("gemma-4") || modelName.contains("gemma-4") {
-                return .gemma4
-            }
-            if tokenizerName.contains("gemma") || modelName.contains("gemma") {
-                return .gemma(bosToken: nil)
-            }
-            if tokenizerName.contains("qwen") || modelName.contains("qwen") {
-                return .chatML(includeThinkPrefill: false)
-            }
-            if tokenizerName.contains("smollm") || modelName.contains("smollm") {
-                return .smolChat
-            }
-            return .plain
-        }
-        if tpl.contains("<end_of_utterance>") && tpl.contains("Assistant:") {
-            return .smolChat
-        }
-        if tpl.contains("<|im_start|>") && tpl.contains("<|im_end|>") {
-            // Qwen chat templates may include `<think>...</think>` prefill, but
-            // forcing that path in our mobile runner currently increases degenerate output.
-            return .chatML(includeThinkPrefill: false)
-        }
-        if tpl.contains("<|turn>") && tpl.contains("<turn|>") {
-            return .gemma4
-        }
-        if tpl.contains("<start_of_turn>") && tpl.contains("<end_of_turn>") {
-            let addBos = (obj["add_bos_token"] as? Bool) ?? false
-            let bosToken = addBos ? (obj["bos_token"] as? String) : nil
-            return .gemma(bosToken: bosToken)
-        }
-        return .plain
-    }
-
-    private static func isStopPiece(_ piece: String) -> Bool {
-        let p = piece.trimmingCharacters(in: .whitespacesAndNewlines)
-        return p == "<|im_end|>" || p == "<end_of_utterance>" || p == "<|endoftext|>" || p == "<end_of_turn>" || p == "<turn|>"
     }
 
     private static func hasLongDigitRun(_ piece: String, threshold: Int) -> Bool {

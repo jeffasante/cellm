@@ -578,6 +578,27 @@ cargo run --bin convert -- \
   --dtype  f16
 ```
 
+LiteRT-LM proxy support (`.litertlm` -> `.cellm`):
+- `convert` can wrap a LiteRT-LM bundle into a `.cellm` container (`model_type=litertlm_proxy`).
+- `infer`/SDK can run that container through the LiteRT runner path.
+
+Example:
+```bash
+# 1) Wrap LiteRT model into .cellm
+cargo run --bin convert -- \
+  --input  ./models/hf/gemma-4-2p3b-it/gemma-4-2p3b-it.litertlm \
+  --output ./models/gemma-4-2p3b-it-litert.cellm
+
+# 2) Run with infer
+./target/release/infer \
+  --model ./models/gemma-4-2p3b-it-litert.cellm \
+  --tokenizer ./models/hf/gemma-4-E2B-it-ONNX/tokenizer.json \
+  --prompt "What is the capital of France?" \
+  --chat --chat-format gemma4 \
+  --gen 24 \
+  --backend cpu
+```
+
 GGUF note:
 - `convert` accepts Llama GGUF and converts to `.cellm` (`f16` output).
 - Supported GGUF tensor types in this path: `BF16`, `F16`, `F32`, `Q4_K`, `Q6_K`.
@@ -693,11 +714,20 @@ There is a small SwiftUI demo app scaffold under:
 - `bindings/ios/CellmDemo`
 
 It uses the C FFI from `cellm-sdk`:
-- `cellm_engine_create_v3(...)` for engine + sampling + backend config (`cpu` / `metal`)
+- `cellm_engine_create_v4(...)` for engine + sampling + backend config (`cpu` / `metal`)
 - `cellm_engine_backend_name(...)` to confirm active backend in-app
 - `cellm_tokenizer_create/encode/decode(...)` for prompt tokenization in-app
+- `cellm_engine_generate_text(...)` for LiteRT proxy text generation path
 
 See `bindings/ios/CellmDemo/README.md` for the Xcode steps.
+
+iOS LLM UI now includes a model-management card flow with recommended models:
+- Gemma-4-2P3B-IT (LiteRT) as the primary preset
+- Qwen3.5-0.8B (stable)
+- SmolLM2-135M (small/fast)
+
+Gemma-4 hosted sample asset used by iOS:
+- `https://huggingface.co/jeffasante/cellm-models/blob/main/gemma-4-2p3b-it/gemma-4-2p3b-it-litert.cellm`
 
 ## Design References
 

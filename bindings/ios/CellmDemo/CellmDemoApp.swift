@@ -15,6 +15,10 @@ struct CellmDemoApp: App {
                         .tabItem {
                             Label("VLM", systemImage: "photo.on.rectangle")
                         }
+                    ChatView()
+                        .tabItem {
+                            Label("Chat", systemImage: "bubble.left.and.bubble.right")
+                        }
                 }
             }
         }

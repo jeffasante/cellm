@@ -186,6 +186,11 @@ fn main() -> Result<()> {
         anyhow::bail!("only --dtype f16 is supported right now");
     }
 
+    if let Some(litert_path) = resolve_litertlm_input(&args.input)? {
+        convert_litertlm_to_cellm(&args, &litert_path)?;
+        return Ok(());
+    }
+
     if let Some(gguf_path) = resolve_gguf_input(&args.input)? {
         handle_gguf_not_yet_supported(&args, &gguf_path)?;
         return Ok(());
@@ -514,6 +519,117 @@ fn resolve_gguf_input(input: &Path) -> Result<Option<PathBuf>> {
         .collect();
     ggufs.sort();
     Ok(ggufs.into_iter().next())
+}
+
+fn resolve_litertlm_input(input: &Path) -> Result<Option<PathBuf>> {
+    if input.is_file() {
+        if input.extension().and_then(|s| s.to_str()) == Some("litertlm") {
+            return Ok(Some(input.to_path_buf()));
+        }
+        return Ok(None);
+    }
+
+    let mut literts: Vec<PathBuf> = std::fs::read_dir(input)
+        .with_context(|| format!("read_dir {:?}", input))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("litertlm"))
+        .collect();
+    literts.sort();
+    Ok(literts.into_iter().next())
+}
+
+fn convert_litertlm_to_cellm(args: &Args, litertlm_path: &Path) -> Result<()> {
+    let meta = std::fs::metadata(litertlm_path)
+        .with_context(|| format!("metadata {:?}", litertlm_path))?;
+    let litert_nbytes = usize::try_from(meta.len())
+        .map_err(|_| anyhow::anyhow!("litertlm is too large to index in this build"))?;
+    let litert_name = litertlm_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model.litertlm")
+        .to_string();
+
+    // Keep a fixed tensor offset so header serialization doesn't need iterative offset solving.
+    const LITERT_OFFSET: u64 = 65_536;
+
+    let header = CellmHeader {
+        model_type: "litertlm_proxy".to_string(),
+        source_model_type: Some("litertlm".to_string()),
+        source_safetensors_format: Some("litertlm-bundle".to_string()),
+        text_tensor_prefix: None,
+        vision_tensor_prefix: None,
+        projector_tensor_prefix: None,
+        vocab_size: 0,
+        hidden_dim: 0,
+        intermediate_size: 0,
+        num_layers: 0,
+        num_heads: 0,
+        num_kv_heads: 0,
+        rms_norm_eps: 1e-6,
+        rope_theta: 10_000.0,
+        bos_token_id: None,
+        eos_token_id: None,
+        max_position_embeddings: None,
+        tie_word_embeddings: None,
+        source_torch_dtype: None,
+        source_architectures: Some(vec!["LiteRT-LM".to_string()]),
+        source_quantization: None,
+        source_quantization_config: None,
+        source_text_config: Some(serde_json::json!({
+            "model_type": "litertlm_proxy",
+            "litert_source_file": litert_name
+        })),
+        source_vision_config: None,
+        source_projector_config: None,
+        tensors: vec![CellmTensorIndex {
+            name: "litert.bundle".to_string(),
+            offset_bytes: LITERT_OFFSET,
+            nbytes: litert_nbytes as u64,
+            shape: vec![litert_nbytes],
+            dtype: "u8".to_string(),
+        }],
+    };
+    let header_bytes = serde_json::to_vec(&header)?;
+    if 10usize
+        .checked_add(header_bytes.len())
+        .ok_or_else(|| anyhow::anyhow!("header length overflow"))?
+        > LITERT_OFFSET as usize
+    {
+        anyhow::bail!(
+            "header is too large for fixed litert offset (header_end={}, offset={})",
+            10 + header_bytes.len(),
+            LITERT_OFFSET
+        );
+    }
+
+    let mut out = BufWriter::new(
+        File::create(&args.output).with_context(|| format!("create {:?}", args.output))?,
+    );
+    out.write_all(b"CELLM")?;
+    out.write_all(&[1u8])?;
+    out.write_all(&(header_bytes.len() as u32).to_le_bytes())?;
+    out.write_all(&header_bytes)?;
+    let cur = 10u64 + header_bytes.len() as u64;
+    let pad = (LITERT_OFFSET as usize)
+        .checked_sub(cur as usize)
+        .ok_or_else(|| anyhow::anyhow!("negative pad while writing litert bundle"))?;
+    if pad > 0 {
+        out.write_all(&vec![0u8; pad])?;
+    }
+
+    let mut src = File::open(litertlm_path).with_context(|| format!("open {:?}", litertlm_path))?;
+    std::io::copy(&mut src, &mut out)
+        .with_context(|| format!("copy litert bundle {:?}", litertlm_path))?;
+    out.flush()?;
+
+    log::info!(
+        "Converted LiteRT-LM {:?} -> {:?} (embedded {} bytes)",
+        litertlm_path,
+        args.output,
+        litert_nbytes
+    );
+    Ok(())
 }
 
 fn handle_gguf_not_yet_supported(_args: &Args, gguf_path: &Path) -> Result<()> {

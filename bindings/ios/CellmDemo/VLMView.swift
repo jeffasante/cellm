@@ -17,6 +17,7 @@ struct VLMView: View {
     @State private var isDownloading: Bool = false
     @State private var backendWarning: String?
     @State private var timingText: String?
+    @State private var showBackendSettings: Bool = false
     @State private var showModelPicker = false
 
     var body: some View {
@@ -68,6 +69,14 @@ struct VLMView: View {
                            let tokSize = RemoteAssets.fileSizeString(url: tokURL) {
                             Text("Tokenizer: \(tokSize)").font(.footnote).foregroundStyle(.secondary)
                         }
+                        if let procURL = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smolvlmProcessorConfigFileName),
+                           let procSize = RemoteAssets.fileSizeString(url: procURL) {
+                            Text("Processor config: \(procSize)").font(.footnote).foregroundStyle(.secondary)
+                        }
+                        if let preprocURL = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smolvlmPreprocessorConfigFileName),
+                           let preprocSize = RemoteAssets.fileSizeString(url: preprocURL) {
+                            Text("Preprocessor config: \(preprocSize)").font(.footnote).foregroundStyle(.secondary)
+                        }
                     }
                     HStack(spacing: 10) {
                         Button("Re-download") { forceRedownload() }
@@ -98,23 +107,7 @@ struct VLMView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
 
-                card("Backend") {
-                    Picker("Requested", selection: $selectedBackend) {
-                        ForEach(CellmBackend.allCases) { backend in
-                            Text(backend.label).tag(backend)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    if !activeBackend.isEmpty {
-                        Text("Active: \(activeBackend)").font(.footnote).foregroundStyle(.secondary)
-                    }
-                    if let backendWarning {
-                        Text(backendWarning).font(.footnote).foregroundStyle(.orange)
-                    }
-                    Text("Note: when Metal is available, VLM uses Metal matmul for linear layers; remaining ops are still CPU in this phase.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
+                settingsSection
 
                 Button(isRunning ? "Running…" : "Run VLM") { run() }
                     .buttonStyle(.borderedProminent)
@@ -175,9 +168,55 @@ struct VLMView: View {
                    let ui = UIImage(data: data) {
                     await MainActor.run {
                         self.image = Image(uiImage: ui)
-                        self.imageBytes = data
+                        self.imageBytes = normalizedJPEGData(from: ui) ?? data
                     }
                 }
+            }
+        }
+    }
+
+    private var settingsSection: some View {
+        VStack(spacing: 12) {
+            Button {
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                    showBackendSettings.toggle()
+                }
+            } label: {
+                HStack {
+                    Label(showBackendSettings ? "Hide Backend Settings" : "Backend Settings", systemImage: "cpu")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Image(systemName: showBackendSettings ? "chevron.up" : "chevron.down")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                }
+                .padding(14)
+                .background(Color(.secondarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+            }
+            .buttonStyle(.plain)
+
+            if showBackendSettings {
+                card("Backend") {
+                    Picker("Requested", selection: $selectedBackend) {
+                        ForEach(CellmBackend.allCases) { backend in
+                            Text(backend.label).tag(backend)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    if !activeBackend.isEmpty {
+                        Text("Active: \(activeBackend)").font(.footnote).foregroundStyle(.secondary)
+                    }
+                    if let backendWarning {
+                        Text(backendWarning).font(.footnote).foregroundStyle(.orange)
+                    }
+                    Text("Note: when Metal is available, VLM uses Metal matmul for linear layers; remaining ops are still CPU in this phase.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
     }
@@ -227,7 +266,14 @@ struct VLMView: View {
         isRunning = true
         Task.detached(priority: .userInitiated) {
             do {
-                let eng = try CellmVLMEngine(modelURL: modelURL, backend: backend)
+                let eng = try CellmVLMEngine(
+                    modelURL: modelURL,
+                    topK: 20,
+                    temperature: 0.2,
+                    repeatPenalty: 1.15,
+                    repeatWindow: 64,
+                    backend: backend
+                )
                 let text = try eng.describe(imageBytes: imageBytes, prompt: promptText)
                 await MainActor.run {
                     self.output = prettyOutput(text)
@@ -273,6 +319,8 @@ struct VLMView: View {
         if let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smolvlmFileName),
            let imageURL = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.rococoFileName),
            RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smolvlmTokenizerFileName) != nil,
+           RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smolvlmProcessorConfigFileName) != nil,
+           RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smolvlmPreprocessorConfigFileName) != nil,
            let bytes = try? Data(contentsOf: imageURL),
            let ui = UIImage(data: bytes) {
             modelURL = model
@@ -289,7 +337,9 @@ struct VLMView: View {
                 async let model = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.smolvlmInt8, fileName: DemoAssetLinks.smolvlmFileName)
                 async let imageURL = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.rococoImage, fileName: DemoAssetLinks.rococoFileName)
                 async let tokenizer = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.smolvlmTokenizer, fileName: DemoAssetLinks.smolvlmTokenizerFileName)
-                let (modelPath, imagePath, _) = try await (model, imageURL, tokenizer)
+                async let processor = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.smolvlmProcessorConfig, fileName: DemoAssetLinks.smolvlmProcessorConfigFileName)
+                async let preprocessor = RemoteAssets.downloadToDocuments(from: DemoAssetLinks.smolvlmPreprocessorConfig, fileName: DemoAssetLinks.smolvlmPreprocessorConfigFileName)
+                let (modelPath, imagePath, _, _, _) = try await (model, imageURL, tokenizer, processor, preprocessor)
                 let bytes = try Data(contentsOf: imagePath)
                 guard let ui = UIImage(data: bytes) else {
                     throw CellmError.message("Downloaded image could not be decoded")
@@ -298,7 +348,7 @@ struct VLMView: View {
                     self.modelURL = modelPath
                     self.imageBytes = bytes
                     self.image = Image(uiImage: ui)
-                    self.downloadStatus = "Saved model, tokenizer and sample image"
+                    self.downloadStatus = "Saved model, tokenizer, processor+preprocessor config and sample image"
                     self.isDownloading = false
                 }
             } catch {
@@ -323,7 +373,9 @@ struct VLMView: View {
             image = Image(uiImage: ui)
         }
         let hasTokenizer = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smolvlmTokenizerFileName) != nil
-        if modelURL != nil && imageBytes != nil && hasTokenizer && downloadStatus.isEmpty {
+        let hasProcessor = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smolvlmProcessorConfigFileName) != nil
+        let hasPreprocessor = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.smolvlmPreprocessorConfigFileName) != nil
+        if modelURL != nil && imageBytes != nil && hasTokenizer && hasProcessor && hasPreprocessor && downloadStatus.isEmpty {
             downloadStatus = "Loaded local sample files."
         }
     }
@@ -331,6 +383,8 @@ struct VLMView: View {
     private func clearLocalFiles() {
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smolvlmFileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smolvlmTokenizerFileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smolvlmProcessorConfigFileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smolvlmPreprocessorConfigFileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.rococoFileName)
         modelURL = nil
         imageBytes = nil
@@ -341,6 +395,17 @@ struct VLMView: View {
     private func finiteMs(_ x: Double) -> Double {
         guard x.isFinite, x >= 0.0 else { return 0.0 }
         return x
+    }
+
+    private func normalizedJPEGData(from image: UIImage) -> Data? {
+        let size = image.size
+        guard size.width > 0, size.height > 0 else { return nil }
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 1.0
+        let rendered = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: size))
+        }
+        return rendered.jpegData(compressionQuality: 0.95)
     }
 
     private func forceRedownload() {

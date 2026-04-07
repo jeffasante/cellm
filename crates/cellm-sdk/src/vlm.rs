@@ -61,6 +61,12 @@ struct PreparedImage {
     pixel_values: Array5<f32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct VlmProcessorHints {
+    image_seq_len: Option<usize>,
+    do_image_splitting: bool,
+}
+
 struct VisionLayerWeights {
     ln1_w: Vec<f32>,
     ln1_b: Vec<f32>,
@@ -99,8 +105,10 @@ pub fn describe_image_with_cellm_timed(
     let total_start = Instant::now();
     let tokenizer_path = resolve_tokenizer_path(model_path)?;
     let tok = load_tokenizer(&tokenizer_path)?;
+    let processor_hints = load_vlm_processor_hints(model_path, &tokenizer_path, &tok);
 
-    let image_input = preprocess_image_idefics3(image_bytes, false)?;
+    let image_input = preprocess_image_idefics3(image_bytes, processor_hints.do_image_splitting)?;
+    let num_images = image_input.pixel_values.shape()[1];
     let file = CellmFile::load(model_path).map_err(|e| anyhow::anyhow!("{e}"))?;
     let (image_features, image_seq_len, patch_ms, encoder_ms, encoder_layer_ms) =
         run_vision_cellm(&file, image_input.pixel_values, cfg.backend)?;
@@ -122,7 +130,16 @@ pub fn describe_image_with_cellm_timed(
     let end_of_utt = tok.token_to_id("<end_of_utterance>").map(|v| v as i64);
     let banned_token_ids = banned_token_ids(&tok);
 
-    let image_block = format_image_block(1, image_seq_len);
+    if let Some(expected) = processor_hints.image_seq_len {
+        if expected != image_seq_len {
+            anyhow::bail!(
+                "processor/image_seq_len mismatch: processor_config={} vision_projector={}",
+                expected,
+                image_seq_len
+            );
+        }
+    }
+    let image_block = format_image_block(num_images, image_seq_len);
     let prompt = build_single_turn_prompt(user_prompt, &image_block);
     let enc = tok
         .encode(prompt, false)
@@ -231,11 +248,25 @@ fn run_decode_cellm(
     }
 
     let mut generated = Vec::new();
+    let mut same_token_run = 0usize;
+    let mut last_token: Option<i64> = None;
     for step in 0..cfg.max_new_tokens {
         generated.push(next);
+        if Some(next) == last_token {
+            same_token_run += 1;
+        } else {
+            same_token_run = 1;
+            last_token = Some(next);
+        }
         if (next == eos_token_id || end_of_utterance_id == Some(next))
             && (step + 1) >= cfg.min_new_tokens
         {
+            break;
+        }
+        if same_token_run >= 6 && (step + 1) >= cfg.min_new_tokens {
+            break;
+        }
+        if is_alternating_two_token_loop(&generated, 10) && (step + 1) >= cfg.min_new_tokens {
             break;
         }
         runner
@@ -258,6 +289,25 @@ fn run_decode_cellm(
     }
 
     Ok((generated, decode_start.elapsed().as_secs_f64() * 1000.0))
+}
+
+fn is_alternating_two_token_loop(tokens: &[i64], min_len: usize) -> bool {
+    if tokens.len() < min_len || min_len < 4 {
+        return false;
+    }
+    let recent = &tokens[tokens.len() - min_len..];
+    let a = recent[0];
+    let b = recent[1];
+    if a == b {
+        return false;
+    }
+    for (i, &tok) in recent.iter().enumerate() {
+        let expect = if i % 2 == 0 { a } else { b };
+        if tok != expect {
+            return false;
+        }
+    }
+    true
 }
 
 fn sample_from_candidates(
@@ -327,13 +377,14 @@ fn run_vision_cellm(
     backend: BackendKind,
 ) -> Result<(Array2<f32>, usize, f64, f64, Vec<f64>)> {
     let mut linear_backend = match backend {
-        BackendKind::Metal => match MetalKernels::create_matmul() {
-            Ok(ctx) => LinearBackend::Metal {
+        BackendKind::Metal => {
+            let ctx = MetalKernels::create_matmul()
+                .map_err(|e| anyhow::anyhow!("VLM Metal backend requested but unavailable: {e}"))?;
+            LinearBackend::Metal {
                 ctx,
                 weight_t_cache: HashMap::new(),
-            },
-            Err(_) => LinearBackend::Cpu,
-        },
+            }
+        }
         BackendKind::Cpu => LinearBackend::Cpu,
     };
     let vision_prefix = file
@@ -1117,6 +1168,21 @@ fn resize_and_pad_512(rgb: &RgbImage) -> ResizedPadded {
     }
 }
 
+fn resize_longest_edge(rgb: &RgbImage, target_longest: u32) -> RgbImage {
+    let (w, h) = rgb.dimensions();
+    if w == 0 || h == 0 {
+        return rgb.clone();
+    }
+    let longest = w.max(h);
+    if longest == target_longest {
+        return rgb.clone();
+    }
+    let scale = target_longest as f32 / longest as f32;
+    let new_w = ((w as f32) * scale).round().max(1.0) as u32;
+    let new_h = ((h as f32) * scale).round().max(1.0) as u32;
+    image::imageops::resize(rgb, new_w, new_h, image::imageops::FilterType::CatmullRom)
+}
+
 fn copy_rgb_to_nchw(dst: &mut Array5<f32>, image_idx: usize, rgb: &RgbImage) {
     let target = 512usize;
     for y in 0..target {
@@ -1150,23 +1216,31 @@ fn fill_pixel_attention_mask(
 fn preprocess_image_idefics3(image_bytes: &[u8], split_image: bool) -> Result<PreparedImage> {
     let img = image::load_from_memory(image_bytes).context("decode image bytes failed")?;
     let rgb = img.to_rgb8();
-    let (w, h) = rgb.dimensions();
-
-    let tile = 512u32;
-    let cols = ((w + tile - 1) / tile).clamp(1, 6);
-    let rows = ((h + tile - 1) / tile).clamp(1, 6);
     let mut images = Vec::new();
     images.push(resize_and_pad_512(&rgb));
     if split_image {
+        // Match Idefics3-style processor behavior: split patches from a
+        // resized longest-edge image (2048), then each patch is padded/resized to 512.
+        let split_base = resize_longest_edge(&rgb, 2048);
+        let (w, h) = split_base.dimensions();
+        let tile = 512u32;
+        let cols = ((w + tile - 1) / tile).clamp(1, 6);
+        let rows = ((h + tile - 1) / tile).clamp(1, 6);
+        let mut coords = Vec::new();
         for row in 0..rows {
             for col in 0..cols {
-                let x = col * tile;
-                let y = row * tile;
-                let cw = (w - x).min(tile);
-                let ch = (h - y).min(tile);
-                let crop = image::imageops::crop_imm(&rgb, x, y, cw, ch).to_image();
-                images.push(resize_and_pad_512(&crop));
+                coords.push((row, col));
             }
+        }
+        let max_tiles = max_split_tiles();
+        let selected = select_spread_tiles(&coords, max_tiles);
+        for (row, col) in selected {
+            let x = col * tile;
+            let y = row * tile;
+            let cw = (w - x).min(tile);
+            let ch = (h - y).min(tile);
+            let crop = image::imageops::crop_imm(&split_base, x, y, cw, ch).to_image();
+            images.push(resize_and_pad_512(&crop));
         }
     }
 
@@ -1185,6 +1259,99 @@ fn preprocess_image_idefics3(image_bytes: &[u8], split_image: bool) -> Result<Pr
         );
     }
     Ok(PreparedImage { pixel_values })
+}
+
+fn max_split_tiles() -> usize {
+    std::env::var("CELLM_VLM_MAX_SPLIT_TILES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|v| v.clamp(1, 36))
+        .unwrap_or(4)
+}
+
+fn select_spread_tiles(coords: &[(u32, u32)], max_tiles: usize) -> Vec<(u32, u32)> {
+    if coords.is_empty() || max_tiles == 0 {
+        return Vec::new();
+    }
+    if coords.len() <= max_tiles {
+        return coords.to_vec();
+    }
+    let mut out = Vec::with_capacity(max_tiles);
+    let span = (coords.len() - 1) as f32;
+    for i in 0..max_tiles {
+        let t = if max_tiles == 1 {
+            0.5
+        } else {
+            i as f32 / (max_tiles - 1) as f32
+        };
+        let idx = (t * span).round() as usize;
+        let pick = coords[idx];
+        if !out.contains(&pick) {
+            out.push(pick);
+        }
+    }
+    if out.len() < max_tiles {
+        for &c in coords {
+            if !out.contains(&c) {
+                out.push(c);
+                if out.len() == max_tiles {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn load_vlm_processor_hints(model_path: &Path, tokenizer_path: &Path, tok: &Tokenizer) -> VlmProcessorHints {
+    let default_split = tok.token_to_id("<global-img>").is_some() && tok.token_to_id("<row_1_col_1>").is_some();
+    let mut hints = VlmProcessorHints {
+        image_seq_len: None,
+        do_image_splitting: default_split,
+    };
+
+    if let Ok(v) = std::env::var("CELLM_VLM_SPLIT_IMAGE") {
+        let lowered = v.trim().to_ascii_lowercase();
+        if lowered == "0" || lowered == "false" || lowered == "no" {
+            hints.do_image_splitting = false;
+        } else if lowered == "1" || lowered == "true" || lowered == "yes" {
+            hints.do_image_splitting = true;
+        }
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = tokenizer_path.parent() {
+        candidates.push(dir.join("processor_config.json"));
+        candidates.push(dir.join("preprocessor_config.json"));
+        candidates.push(dir.join("processor_config-smolvlm-256m.json"));
+        candidates.push(dir.join("preprocessor_config-smolvlm-256m.json"));
+    }
+    if let Some(dir) = model_path.parent() {
+        candidates.push(dir.join("processor_config.json"));
+        candidates.push(dir.join("preprocessor_config.json"));
+        candidates.push(dir.join("processor_config-smolvlm-256m.json"));
+        candidates.push(dir.join("preprocessor_config-smolvlm-256m.json"));
+    }
+
+    for path in candidates {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if hints.image_seq_len.is_none() {
+            hints.image_seq_len = json
+                .get("image_seq_len")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+        }
+        if let Some(split) = json.get("do_image_splitting").and_then(|v| v.as_bool()) {
+            hints.do_image_splitting = split;
+        }
+    }
+
+    hints
 }
 
 fn banned_token_ids(tok: &Tokenizer) -> Vec<i64> {

@@ -31,27 +31,8 @@ m.md
 cellm.md
 
 # Large local model artifacts (keep out of git history)
-models/**/*.cellm
-models/**/*.cellmd
-!models/smollm2-135m-int8.cellm
-!models/smolvlm-256m-int8.cellm
-!models/qwen3.5-0.8b-int4-textonly.cellm
+models/
 
-models/**/*.safetensors
-models/**/*.safetensors.index.json
-models/**/*.bin
-models/**/*.pt
-models/**/*.onnx
-models/**/*.tflite
-models/**/*.ckpt
-models/**/*.h5
-models/**/*.gguf
-models/hf/**
-
-# Keep lightweight examples/docs under models
-!models/README.md
-!models/test_images/
-!models/test_images/*.jpg
 
 turboquant-main/
 metal/

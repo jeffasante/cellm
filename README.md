@@ -110,7 +110,6 @@ Notes:
 - Use `--chat-format plain` to force the simpler `User:/Assistant:` style. `--chat-format auto` (default) only uses ChatML when the tokenizer advertises a chat template in `tokenizer_config.json`.
 - `--max-layers` is only for debugging; using fewer layers will significantly degrade quality.
 - Backend selection is strict in this build: `--backend cpu` runs CPU only, and `--backend metal` runs Metal only (no automatic fallback).
-- Python-free mode is the default: `litertlm_proxy` models are blocked unless explicitly enabled with `CELLM_ALLOW_LITERT_PROXY=1`.
 - Native Rust execution paths are `llama`, `gemma*`, and `qwen*` model types in `.cellm/.cellmd`.
 
 Run with backend selection:
@@ -134,6 +133,92 @@ cargo run --release --bin infer -- \
   --backend metal
 ```
 
+### Run Newly Added Models (SmolLM2 + Qwen2.5 + Gemma-3)
+
+If you want the exact artifacts we added in this repo, use these commands:
+
+| Model | File Size | Quality Note |
+|---|---:|---|
+| `smollm2-360m-int8-v1.cellm` | ~391 MB | Small + fast; requires non-interleaved RoPE env flag |
+| `qwen2.5-0.5b-int8-v1.cellm` | ~472 MB | Best small Qwen result in this set |
+| `gemma-3-1b-it-int4-v1.cellm` | ~478 MB | Smallest Gemma-3, lower output quality |
+| `gemma-3-1b-it-mixed-int4-v1.cellm` | ~1.0 GB | Better Gemma-3 quality (recommended) |
+| `gemma-3-1b-it-int8-v1.cellm` | ~1.2 GB | Most stable Gemma-3 output |
+
+SmolLM2 360M (INT8):
+```bash
+cd /Users/jeff/Desktop/cellm
+CELLM_LLAMA_ROPE_INTERLEAVED=0 ./target/release/infer \
+  --model models/smollm2-360m-int8-v1.cellm \
+  --tokenizer models/hf/smollm2-360m/tokenizer.json \
+  --prompt "What is sycophancy?" \
+  --chat \
+  --chat-format auto \
+  --gen 48 \
+  --temperature 0 \
+  --backend metal \
+  --kv-encoding f16
+```
+
+Qwen2.5 0.5B (INT8):
+```bash
+cd /Users/jeff/Desktop/cellm
+./target/release/infer \
+  --model models/qwen2.5-0.5b-int8-v1.cellm \
+  --tokenizer models/qwen2.5-0.5b-bnb4/tokenizer.json \
+  --prompt "What is sycophancy?" \
+  --chat \
+  --gen 64 \
+  --temperature 0 \
+  --backend metal \
+  --kv-encoding f16
+```
+
+Gemma-3 1B mixed INT4 (recommended Gemma-3 quality/size tradeoff):
+```bash
+cd /Users/jeff/Desktop/cellm
+./target/release/infer \
+  --model models/gemma-3-1b-it-mixed-int4-v1.cellm \
+  --tokenizer models/hf/gemma-3-1b-it-full/tokenizer.json \
+  --prompt "What is consciousness?" \
+  --chat \
+  --chat-format plain \
+  --gen 48 \
+  --temperature 0 \
+  --backend metal \
+  --kv-encoding f16
+```
+
+Gemma-3 1B pure INT4 (smallest Gemma-3):
+```bash
+cd /Users/jeff/Desktop/cellm
+./target/release/infer \
+  --model models/gemma-3-1b-it-int4-v1.cellm \
+  --tokenizer models/hf/gemma-3-1b-it-full/tokenizer.json \
+  --prompt "What's twitch.com?" \
+  --chat \
+  --chat-format plain \
+  --gen 48 \
+  --temperature 0 \
+  --backend metal \
+  --kv-encoding f16
+```
+
+Gemma-3 1B INT8 (most stable):
+```bash
+cd /Users/jeff/Desktop/cellm
+./target/release/infer \
+  --model models/gemma-3-1b-it-int8-v1.cellm \
+  --tokenizer models/hf/gemma-3-1b-it-full/tokenizer.json \
+  --prompt "What's twitch.com?" \
+  --chat \
+  --chat-format plain \
+  --gen 48 \
+  --temperature 0 \
+  --backend metal \
+  --kv-encoding f16
+```
+
 ### Fused Kernel Status (April 5, 2026)
 
 - Added fused Metal QKV kernel wiring (`q_proj + k_proj + v_proj` in one launch) in:
@@ -152,10 +237,8 @@ Quick benchmark snapshot (`--kv-encoding f16`, `temperature=0`):
 | SmolLM2-135M | Metal + graph | `CELLM_LLAMA_ENABLE_GRAPH=1`, gen=12 | 0.48s | 0.32s |
 | Qwen3.5-0.8B-int8 | CPU | full layers, gen=8 | 322.27s | 26.26s |
 | Qwen3.5-0.8B-int8 | Metal | full layers, gen=8 | 100.08s | 8.15s |
-| Gemma-3-1B-it-int8 | CPU | full layers, gen=8 | 284.72s | 140.40s |
 | Gemma-3-1B-it-int8 | Metal | full layers, gen=8 | 4.97s | 2.36s |
-| Gemma-4-E2B-it-Q4_K_M-from-gguf | CPU | `--max-layers 8`, gen=4 | 250.33s | 66.64s |
-| Gemma-4-E2B-it-Q4_K_M-from-gguf | Metal | `--max-layers 8`, gen=4 | 4.48s | 0.86s |
+| Gemma-4-E4B-it-int4 | Metal | full layers, gen=32 | 0.88s | 0.22s |
 
 Notes:
 - Gemma-4 conversion quality is still unstable for this GGUF-converted checkpoint (latency is improved on Metal, output quality still needs parity fixes).
@@ -438,6 +521,26 @@ cargo run --release --bin vlm-smoke -- \
   --prompt "Describe this image."
 ```
 
+Gemma4 VLM (native `.cellmd`) experimental smoke:
+```bash
+CELLM_VLM_TOKENIZER=models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/tokenizer.json \
+CELLM_VLM_GEMMA4_MODE=placeholder \
+CELLM_VLM_GEMMA4_BIDIR_IMAGE=1 \
+CELLM_VLM_MAX_SOFT_TOKENS=70 \
+./target/release/vlm-smoke -- \
+  --model models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/gemma-4-E2B-it-int4-aggr-v5.cellmd \
+  --image models/test_images/bird.jpg \
+  --prompt "Describe this image in one sentence." \
+  --backend cpu \
+  --gen 32 \
+  --temperature 0 \
+  --top-k 1
+```
+- `CELLM_VLM_GEMMA4_MODE`: `placeholder` (inject image soft tokens in text) or `prefix` (prefix vision features before text prefill).
+- `CELLM_VLM_GEMMA4_BIDIR_IMAGE`: enables a Gemma4 image-block two-pass prefill approximation for better multimodal attention behavior.
+- `CELLM_VLM_MAX_SOFT_TOKENS`: vision soft-token budget; lower values are faster, higher values are much slower.
+- Status: Gemma4 VLM path is still experimental and not yet at full HF parity.
+
 Run VLM with backend selection:
 ```bash
 # ONNX vision+decoder, CPU backend selection
@@ -580,26 +683,7 @@ cargo run --bin convert -- \
   --dtype  f16
 ```
 
-LiteRT-LM proxy support (`.litertlm` -> `.cellm`):
-- `convert` can wrap a LiteRT-LM bundle into a `.cellm` container (`model_type=litertlm_proxy`).
-- `infer`/SDK can run that container through the LiteRT runner path.
-
-Example:
-```bash
-# 1) Wrap LiteRT model into .cellm
-cargo run --bin convert -- \
-  --input  ./models/hf/gemma-4-2p3b-it/gemma-4-2p3b-it.litertlm \
-  --output ./models/gemma-4-2p3b-it-litert.cellm
-
-# 2) Run with infer
-./target/release/infer \
-  --model ./models/gemma-4-2p3b-it-litert.cellm \
-  --tokenizer ./models/hf/gemma-4-E2B-it-ONNX/tokenizer.json \
-  --prompt "What is the capital of France?" \
-  --chat --chat-format gemma4 \
-  --gen 24 \
-  --backend cpu
-```
+- `convert` accepts safetensors, GGUF, or PyTorch models and creates optimized `.cellm` files.
 
 GGUF note:
 - `convert` accepts Llama GGUF and converts to `.cellm` (`f16` output).
@@ -719,17 +803,12 @@ It uses the C FFI from `cellm-sdk`:
 - `cellm_engine_create_v4(...)` for engine + sampling + backend config (`cpu` / `metal`)
 - `cellm_engine_backend_name(...)` to confirm active backend in-app
 - `cellm_tokenizer_create/encode/decode(...)` for prompt tokenization in-app
-- `cellm_engine_generate_text(...)` for LiteRT proxy text generation path
-
-See `bindings/ios/CellmDemo/README.md` for the Xcode steps.
+- `cellm_engine_generate_text(...)` for native text generation path
 
 iOS LLM UI now includes a model-management card flow with recommended models:
-- Gemma-4-2P3B-IT (LiteRT) as the primary preset
+- Gemma-4-E4B-it (Native)
 - Qwen3.5-0.8B (stable)
 - SmolLM2-135M (small/fast)
-
-Gemma-4 hosted sample asset used by iOS:
-- `https://huggingface.co/jeffasante/cellm-models/blob/main/gemma-4-2p3b-it/gemma-4-2p3b-it-litert.cellm`
 
 ## Design References
 

@@ -1,0 +1,20 @@
+[package]
+name = "tflite-smoke"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tflite-smoke"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+
+# TFLite C API wrapper (loads libtensorflowlite_c at runtime).
+edgefirst-tflite = "0.4"
+
+# Ensure we can run on macOS without preinstalling libtensorflowlite_c:
+# the -sys crate's "vendored" feature downloads a prebuilt dylib at build time.
+edgefirst-tflite-sys = { version = "0.4", features = ["vendored"] }
+

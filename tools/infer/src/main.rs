@@ -181,12 +181,12 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
 
     let t_stage = Instant::now();
     let mut runner = match text_model_type.as_str() {
-        "llama" => Runner::Llama(LlamaRunner::load(&args.model)?),
+        "llama" | "smollm3" => Runner::Llama(LlamaRunner::load(&args.model)?),
         t if t.starts_with("gemma") => Runner::Gemma(GemmaRunner::load(&args.model)?),
         t if t.starts_with("qwen") => Runner::Qwen(QwenRunner::load(&args.model)?),
         _ => {
             anyhow::bail!(
-                "infer supports only llama/gemma/qwen right now. Detected model_type={:?} effective_text_model_type={:?} architectures={:?} quantization_config={:?}.",
+                "infer supports only llama/smollm3/gemma/qwen right now. Detected model_type={:?} effective_text_model_type={:?} architectures={:?} quantization_config={:?}.",
                 header.model_type,
                 text_model_type,
                 header.source_architectures,
@@ -503,7 +503,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         } else {
             tok.decode(&all_ids, true).unwrap_or_default()
         };
-        let text = strip_think_blocks(&text);
+        let text = sanitize_assistant_text(&strip_think_blocks(&text));
         println!();
         println!("---");
         println!("{text}");
@@ -535,6 +535,18 @@ fn strip_think_blocks(text: &str) -> String {
         }
     }
     out.replace("<think>", "").replace("</think>", "")
+}
+
+fn sanitize_assistant_text(text: &str) -> String {
+    let s = text.trim_start();
+    let lowered = s.to_ascii_lowercase();
+    if lowered.starts_with("thought\n") {
+        return s["thought\n".len()..].trim_start().to_string();
+    }
+    if lowered.starts_with("thought\r\n") {
+        return s["thought\r\n".len()..].trim_start().to_string();
+    }
+    s.to_string()
 }
 
 fn select_backend(backend: BackendKind) -> Result<()> {
@@ -701,10 +713,22 @@ fn tokenizer_config_gemma4_turn(tokenizer_json_path: &std::path::Path) -> bool {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return false;
     };
-    let Some(tpl) = v.get("chat_template").and_then(|x| x.as_str()) else {
-        return false;
-    };
-    tpl.contains("<|turn>") && tpl.contains("<turn|>")
+    if let Some(tpl) = v.get("chat_template").and_then(|x| x.as_str()) {
+        return tpl.contains("<|turn>") && tpl.contains("<turn|>");
+    }
+    // Newer Gemma4 tokenizer configs may omit `chat_template` but still expose
+    // explicit turn tokens in config fields.
+    let sot_ok = v
+        .get("sot_token")
+        .and_then(|x| x.as_str())
+        .map(|s| s == "<|turn>")
+        .unwrap_or(false);
+    let eot_ok = v
+        .get("eot_token")
+        .and_then(|x| x.as_str())
+        .map(|s| s == "<turn|>")
+        .unwrap_or(false);
+    sot_ok && eot_ok
 }
 
 fn tokenizer_config_contains_think_prefill(tokenizer_json_path: &std::path::Path) -> bool {

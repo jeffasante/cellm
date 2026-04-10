@@ -7,17 +7,21 @@ struct CellmDemoApp: App {
             ZStack {
                 Color(.systemGroupedBackground).ignoresSafeArea()
                 TabView {
+                    ModelsView()
+                        .tabItem {
+                            Label("Models Hub", systemImage: "arrow.down.doc")
+                        }
                     LLMView()
                         .tabItem {
-                            Label("LLM", systemImage: "text.bubble")
+                            Label("LLM Sandbox", systemImage: "text.bubble")
                         }
                     VLMView()
                         .tabItem {
-                            Label("VLM", systemImage: "photo.on.rectangle")
+                            Label("Vision", systemImage: "photo.on.rectangle")
                         }
                     ChatView()
                         .tabItem {
-                            Label("Chat", systemImage: "bubble.left.and.bubble.right")
+                            Label("Chat Bot", systemImage: "bubble.left.and.bubble.right")
                         }
                 }
             }

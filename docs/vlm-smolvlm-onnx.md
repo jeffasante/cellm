@@ -152,3 +152,34 @@ Native `.cellm` vision + decoder (experimental, slower):
 - The next “real” step toward native VLM inside `cellm` is to:
   - Move native vision/decode math into optimized backend kernels (SIMD + Metal)
   - Keep processor behavior aligned with HF templates across model variants
+
+
+
+cd /Users/jeff/Desktop/cellm
+./target/release/infer \
+  --model models/gemma-4-E2B-it-f16.cellmd \
+  --tokenizer models/gemma-4-E2B-it/tokenizer.json \
+  --prompt "what is symcophancy?" \
+  --chat --chat-format gemma4 \
+  --gen 24 --temperature 0.7 --top-k 40 \
+  --backend cpu --kv-encoding f16
+
+
+cd /Users/jeff/Desktop/cellm
+./target/release/infer \
+  --model models/gemma-4-E2B-it-f16.cellmd \
+  --tokenizer models/gemma-4-E2B-it/tokenizer.json \
+  --prompt "Hello" \
+  --chat --chat-format gemma4 \
+  --gen 24 --temperature 0.7 --top-k 40 \
+  --backend metal --kv-encoding f16
+
+
+  cd /Users/jeff/Desktop/cellm
+./target/release/infer \
+  --model models/gemma-4-E2B-it-f16.cellmd \
+  --tokenizer models/gemma-4-E2B-it/tokenizer.json \
+  --prompt "what is symcophancy?" \
+  --chat --chat-format gemma4 \
+  --gen 24 --temperature 0.7 --top-k 40 \
+  --backend metal --kv-encoding f16

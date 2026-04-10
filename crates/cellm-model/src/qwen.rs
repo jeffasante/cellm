@@ -336,6 +336,9 @@ impl QwenRunner {
                     self.linear_f16_out_in(&x_norm, &k_name, kv_dim, hidden, &mut k)?;
                     self.linear_f16_out_in(&x_norm, &v_name, kv_dim, hidden, &mut v)?;
                 }
+                self.add_projection_bias_if_present(&q_name, &mut q_raw)?;
+                self.add_projection_bias_if_present(&k_name, &mut k)?;
+                self.add_projection_bias_if_present(&v_name, &mut v)?;
 
                 // q and optional gate.
                 let q_main_dim = n_heads * head_dim;
@@ -363,52 +366,54 @@ impl QwenRunner {
                     )));
                 }
 
-                // Qwen-style per-head Q/K RMSNorm (present on full-attention layers).
-                if use_metal_norm {
-                    let qw = self.tensor_f16(&format!("language_model.model.layers.{layer}.self_attn.q_norm.weight"))?.to_vec();
-                    let kw = self.tensor_f16(&format!("language_model.model.layers.{layer}.self_attn.k_norm.weight"))?.to_vec();
-                    let add_one = self.rmsnorm_weight_is_offset;
-                    let ops = self.metal_ops.as_mut().unwrap();
-                    for h in 0..n_heads {
-                        let seg = &mut q[h * head_dim..(h + 1) * head_dim];
-                        let inp = seg.to_vec();
-                        ops.rms_norm_f16w(&inp, &qw, cfg.rms_norm_eps, add_one, seg)
-                            .map_err(|e| CoreError::Backend(e.to_string()))?;
-                    }
-                    for h in 0..n_kv_heads {
-                        let seg = &mut k[h * head_dim..(h + 1) * head_dim];
-                        let inp = seg.to_vec();
-                        ops.rms_norm_f16w(&inp, &kw, cfg.rms_norm_eps, add_one, seg)
-                            .map_err(|e| CoreError::Backend(e.to_string()))?;
-                    }
-                } else {
-                    q_head_norm_w.resize(head_dim, 0.0);
-                    k_head_norm_w.resize(head_dim, 0.0);
-                    self.rmsnorm_weight(
-                        &format!("language_model.model.layers.{layer}.self_attn.q_norm.weight"),
-                        &mut q_head_norm_w,
-                    )?;
-                    self.rmsnorm_weight(
-                        &format!("language_model.model.layers.{layer}.self_attn.k_norm.weight"),
-                        &mut k_head_norm_w,
-                    )?;
-                    if self.rmsnorm_weight_is_offset {
-                        add_one_inplace(&mut q_head_norm_w);
-                        add_one_inplace(&mut k_head_norm_w);
-                    }
-                    for h in 0..n_heads {
-                        rms_norm_inplace_f32(
-                            &mut q[h * head_dim..(h + 1) * head_dim],
-                            &q_head_norm_w,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-                    for h in 0..n_kv_heads {
-                        rms_norm_inplace_f32(
-                            &mut k[h * head_dim..(h + 1) * head_dim],
-                            &k_head_norm_w,
-                            cfg.rms_norm_eps,
-                        );
+                // Qwen-style per-head Q/K RMSNorm is present in some variants
+                // (e.g. Qwen3.5), but absent in others (e.g. Qwen2.5).
+                // Only apply when both norm tensors exist.
+                let q_norm_name = format!("language_model.model.layers.{layer}.self_attn.q_norm.weight");
+                let k_norm_name = format!("language_model.model.layers.{layer}.self_attn.k_norm.weight");
+                let has_qk_norm =
+                    has_tensor_file(&self.file, &q_norm_name) && has_tensor_file(&self.file, &k_norm_name);
+                if has_qk_norm {
+                    if use_metal_norm {
+                        let qw = self.tensor_f16(&q_norm_name)?.to_vec();
+                        let kw = self.tensor_f16(&k_norm_name)?.to_vec();
+                        let add_one = self.rmsnorm_weight_is_offset;
+                        let ops = self.metal_ops.as_mut().unwrap();
+                        for h in 0..n_heads {
+                            let seg = &mut q[h * head_dim..(h + 1) * head_dim];
+                            let inp = seg.to_vec();
+                            ops.rms_norm_f16w(&inp, &qw, cfg.rms_norm_eps, add_one, seg)
+                                .map_err(|e| CoreError::Backend(e.to_string()))?;
+                        }
+                        for h in 0..n_kv_heads {
+                            let seg = &mut k[h * head_dim..(h + 1) * head_dim];
+                            let inp = seg.to_vec();
+                            ops.rms_norm_f16w(&inp, &kw, cfg.rms_norm_eps, add_one, seg)
+                                .map_err(|e| CoreError::Backend(e.to_string()))?;
+                        }
+                    } else {
+                        q_head_norm_w.resize(head_dim, 0.0);
+                        k_head_norm_w.resize(head_dim, 0.0);
+                        self.rmsnorm_weight(&q_norm_name, &mut q_head_norm_w)?;
+                        self.rmsnorm_weight(&k_norm_name, &mut k_head_norm_w)?;
+                        if self.rmsnorm_weight_is_offset {
+                            add_one_inplace(&mut q_head_norm_w);
+                            add_one_inplace(&mut k_head_norm_w);
+                        }
+                        for h in 0..n_heads {
+                            rms_norm_inplace_f32(
+                                &mut q[h * head_dim..(h + 1) * head_dim],
+                                &q_head_norm_w,
+                                cfg.rms_norm_eps,
+                            );
+                        }
+                        for h in 0..n_kv_heads {
+                            rms_norm_inplace_f32(
+                                &mut k[h * head_dim..(h + 1) * head_dim],
+                                &k_head_norm_w,
+                                cfg.rms_norm_eps,
+                            );
+                        }
                     }
                 }
 
@@ -481,6 +486,10 @@ impl QwenRunner {
                     &format!("language_model.model.layers.{layer}.self_attn.o_proj.weight"),
                     hidden,
                     attn_in,
+                    &mut attn_proj,
+                )?;
+                self.add_projection_bias_if_present(
+                    &format!("language_model.model.layers.{layer}.self_attn.o_proj.weight"),
                     &mut attn_proj,
                 )?;
 
@@ -1260,6 +1269,28 @@ impl QwenRunner {
             )
             .map_err(|e| CoreError::Backend(e.to_string()))?;
         Ok(true)
+    }
+
+    fn add_projection_bias_if_present(
+        &self,
+        weight_name: &str,
+        out: &mut [f32],
+    ) -> Result<(), CoreError> {
+        let Some(stem) = weight_name.strip_suffix(".weight") else {
+            return Ok(());
+        };
+        let bias_name = format!("{stem}.bias");
+        if !has_tensor_file(&self.file, &bias_name) {
+            return Ok(());
+        }
+        let b = self.tensor_f16(&bias_name)?;
+        if b.len() != out.len() {
+            return Ok(());
+        }
+        for (o, &bv) in out.iter_mut().zip(b.iter()) {
+            *o += f16::from_bits(bv).to_f32();
+        }
+        Ok(())
     }
 }
 

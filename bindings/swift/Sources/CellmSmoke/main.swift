@@ -118,6 +118,25 @@ if engine == 0 {
 }
 defer { cellm_engine_destroy(engine) }
 
+if cellm_engine_is_litert_proxy(engine) != 0 {
+    print("Detected LiteRT-LM model. Using direct generation API.")
+    let wrapped = wrapGemmaPrompt(prompt)
+    let needed = wrapped.withCString { cstr in
+        cellm_engine_generate_text(engine, cstr, nil, 0)
+    }
+    if needed == 0 {
+        throw SmokeError.message("engine_generate_text failed: \(ffiLastError())")
+    }
+    var buf = [CChar](repeating: 0, count: needed + 1)
+    _ = wrapped.withCString { cstr in
+        cellm_engine_generate_text(engine, cstr, &buf, buf.count)
+    }
+    let response = String(cString: buf)
+    print("----")
+    print(response.isEmpty ? "<empty>" : response)
+    exit(0)
+}
+
 let session = cellm_session_create(engine)
 if session == 0 {
     throw SmokeError.message("session_create failed: \(ffiLastError())")

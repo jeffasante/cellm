@@ -10,10 +10,10 @@ use cellm_core::KvCacheLayout;
 use cellm_kernels::metal::MetalBuffer;
 use cellm_kernels::metal::MetalMatmul;
 use cellm_kernels::MetalKernels;
-use cellm_model::{llama::LlamaRunner, CellmFile};
+use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, CellmFile};
 use half::f16;
 use image::RgbImage;
-use ndarray::{Array2, Array4, Array5, Axis};
+use ndarray::{Array2, Array3, Array4, Array5, Axis};
 use rand::prelude::*;
 use serde_json::Value;
 use tokenizers::Tokenizer;
@@ -59,6 +59,9 @@ pub struct VlmTimingBreakdown {
 
 struct PreparedImage {
     pixel_values: Array5<f32>,
+    gemma4_patch_values: Option<Array3<f32>>,
+    gemma4_position_ids: Option<Array3<i32>>,
+    gemma4_num_soft_tokens: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -86,6 +89,36 @@ struct VisionLayerWeights {
     fc2_b: Vec<f32>,
 }
 
+struct Gemma4VisionLayerWeights {
+    input_ln_w: Vec<f32>,
+    q_w: Vec<f32>,
+    k_w: Vec<f32>,
+    v_w: Vec<f32>,
+    o_w: Vec<f32>,
+    q_norm_w: Vec<f32>,
+    k_norm_w: Vec<f32>,
+    post_attn_ln_w: Vec<f32>,
+    pre_ffn_ln_w: Vec<f32>,
+    gate_w: Vec<f32>,
+    up_w: Vec<f32>,
+    down_w: Vec<f32>,
+    post_ffn_ln_w: Vec<f32>,
+    q_clip_in: Option<(f32, f32)>,
+    q_clip_out: Option<(f32, f32)>,
+    k_clip_in: Option<(f32, f32)>,
+    k_clip_out: Option<(f32, f32)>,
+    v_clip_in: Option<(f32, f32)>,
+    v_clip_out: Option<(f32, f32)>,
+    o_clip_in: Option<(f32, f32)>,
+    o_clip_out: Option<(f32, f32)>,
+    gate_clip_in: Option<(f32, f32)>,
+    gate_clip_out: Option<(f32, f32)>,
+    up_clip_in: Option<(f32, f32)>,
+    up_clip_out: Option<(f32, f32)>,
+    down_clip_in: Option<(f32, f32)>,
+    down_clip_out: Option<(f32, f32)>,
+}
+
 pub fn describe_image_with_cellm(
     model_path: &Path,
     image_bytes: &[u8],
@@ -106,15 +139,62 @@ pub fn describe_image_with_cellm_timed(
     let tokenizer_path = resolve_tokenizer_path(model_path)?;
     let tok = load_tokenizer(&tokenizer_path)?;
     let processor_hints = load_vlm_processor_hints(model_path, &tokenizer_path, &tok);
-
-    let image_input = preprocess_image_idefics3(image_bytes, processor_hints.do_image_splitting)?;
-    let num_images = image_input.pixel_values.shape()[1];
     let file = CellmFile::load(model_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let is_gemma4_vision = file
+        .tensor_index("model.vision_tower.patch_embedder.input_proj.weight")
+        .is_some()
+        && file
+            .tensor_index("model.embed_vision.embedding_projection.weight")
+            .is_some();
+    let model_type = effective_text_model_type(&file.header);
+    let gemma4_mode = std::env::var("CELLM_VLM_GEMMA4_MODE").unwrap_or_else(|_| "placeholder".to_string());
+    let gemma4_prefix_image = is_gemma4_vision && model_type.starts_with("gemma4")
+        && gemma4_mode.eq_ignore_ascii_case("prefix");
+    let image_input = preprocess_image_for_model(
+        image_bytes,
+        processor_hints.do_image_splitting,
+        is_gemma4_vision,
+        processor_hints.image_seq_len.unwrap_or(280),
+    )?;
+    let num_images = image_input.pixel_values.shape()[1];
     let (image_features, image_seq_len, patch_ms, encoder_ms, encoder_layer_ms) =
-        run_vision_cellm(&file, image_input.pixel_values, cfg.backend)?;
-    let image_token_id = tok
-        .token_to_id("<image>")
-        .context("tokenizer missing <image> token")? as i64;
+        run_vision_cellm(
+            &file,
+            &image_input,
+            cfg.backend,
+            processor_hints.image_seq_len,
+        )?;
+    if std::env::var("CELLM_VLM_DEBUG_FEATURE_STATS").is_ok() {
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut sum = 0.0f64;
+        let mut sumsq = 0.0f64;
+        let mut n = 0usize;
+        for v in image_features.iter().copied() {
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+            sum += v as f64;
+            sumsq += (v as f64) * (v as f64);
+            n += 1;
+        }
+        let mean = if n > 0 { sum / n as f64 } else { 0.0 };
+        let var = if n > 0 {
+            (sumsq / n as f64) - mean * mean
+        } else {
+            0.0
+        };
+        eprintln!(
+            "CELLM_VLM_DEBUG_FEATURE_STATS rows={} cols={} min={:.6} max={:.6} mean={:.6} std={:.6}",
+            image_features.shape()[0],
+            image_features.shape()[1],
+            min_v,
+            max_v,
+            mean,
+            var.max(0.0).sqrt()
+        );
+    }
+    let (image_token_id, image_token_text, use_idefics_wrappers, boi_token_text, eoi_token_text) =
+        resolve_image_token(&tok)?;
     let eos_token_id = file
         .header
         .eos_token_id
@@ -139,12 +219,42 @@ pub fn describe_image_with_cellm_timed(
             );
         }
     }
-    let image_block = format_image_block(num_images, image_seq_len);
-    let prompt = build_single_turn_prompt(user_prompt, &image_block);
+    let image_block = if gemma4_prefix_image {
+        String::new()
+    } else {
+        format_image_block(
+            num_images,
+            image_seq_len,
+            image_token_text.as_str(),
+            use_idefics_wrappers,
+            boi_token_text.as_deref(),
+            eoi_token_text.as_deref(),
+        )
+    };
+    let prompt = if gemma4_prefix_image {
+        if image_block.is_empty() {
+            user_prompt.to_string()
+        } else {
+            format!("{image_block}\n{user_prompt}")
+        }
+    } else {
+        build_single_turn_prompt(
+            user_prompt,
+            &image_block,
+            tok.token_to_id("<|turn>").is_some() && tok.token_to_id("<turn|>").is_some(),
+        )
+    };
     let enc = tok
         .encode(prompt, false)
         .map_err(|e| anyhow::anyhow!("tokenize failed: {e}"))?;
-    let input_ids: Vec<i64> = enc.get_ids().iter().map(|&x| x as i64).collect();
+    let mut input_ids: Vec<i64> = enc.get_ids().iter().map(|&x| x as i64).collect();
+    if gemma4_prefix_image {
+        if let Some(bos) = file.header.bos_token_id.map(|v| v as i64) {
+            if input_ids.first().copied() != Some(bos) {
+                input_ids.insert(0, bos);
+            }
+        }
+    }
 
     let (generated, decode_ms) = run_decode_cellm(
         model_path,
@@ -154,6 +264,7 @@ pub fn describe_image_with_cellm_timed(
         cfg,
         input_ids,
         &image_features,
+        gemma4_prefix_image,
         &banned_token_ids,
     )?;
     let text = tok
@@ -180,11 +291,37 @@ fn run_decode_cellm(
     cfg: VlmRunConfig,
     input_ids: Vec<i64>,
     image_features: &Array2<f32>,
+    prefix_image_features: bool,
     banned_token_ids: &[i64],
 ) -> Result<(Vec<i64>, f64)> {
     let decode_start = Instant::now();
-    let mut runner = LlamaRunner::load(model_path).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let hidden = runner.hidden_size();
+    enum DecodeRunner {
+        Llama(LlamaRunner),
+        Gemma(GemmaRunner),
+    }
+
+    let file = CellmFile::load(model_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let model_type = effective_text_model_type(&file.header);
+    let mut runner = match model_type.as_str() {
+        "llama" | "smollm3" => {
+            DecodeRunner::Llama(LlamaRunner::load(model_path).map_err(|e| anyhow::anyhow!("{e}"))?)
+        }
+        t if t.starts_with("gemma") => {
+            DecodeRunner::Gemma(GemmaRunner::load(model_path).map_err(|e| anyhow::anyhow!("{e}"))?)
+        }
+        other => anyhow::bail!("unsupported text model for VLM decode: {other}"),
+    };
+
+    let (hidden, num_layers, num_kv_heads, num_heads) = match &runner {
+        DecodeRunner::Llama(r) => {
+            let c = r.config();
+            (c.hidden_size, c.num_hidden_layers, c.num_key_value_heads, c.num_attention_heads)
+        }
+        DecodeRunner::Gemma(r) => {
+            let c = r.config();
+            (c.hidden_size, c.num_hidden_layers, c.num_key_value_heads, c.num_attention_heads)
+        }
+    };
     if image_features.shape()[1] != hidden {
         anyhow::bail!(
             "image feature dim {} != text hidden {}",
@@ -193,14 +330,23 @@ fn run_decode_cellm(
         );
     }
 
-    let head_dim = runner.config().hidden_size / runner.config().num_attention_heads;
-    let total_tokens = input_ids.len() + cfg.max_new_tokens + 8;
+    let head_dim = if model_type.starts_with("gemma") {
+        infer_gemma_kv_head_dim(&file)?
+    } else {
+        hidden / num_heads.max(1)
+    };
+    let prefix_tokens = if prefix_image_features {
+        image_features.shape()[0]
+    } else {
+        0
+    };
+    let total_tokens = prefix_tokens + input_ids.len() + cfg.max_new_tokens + 8;
     let total_blocks = (total_tokens + cfg.tokens_per_block - 1) / cfg.tokens_per_block;
     let layout = KvCacheLayout {
         total_blocks,
         tokens_per_block: cfg.tokens_per_block,
-        num_layers: runner.config().num_hidden_layers,
-        num_kv_heads: runner.config().num_key_value_heads,
+        num_layers,
+        num_kv_heads,
         head_dim,
     };
     let mut kv_cache = KVCache::new(layout).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -212,33 +358,246 @@ fn run_decode_cellm(
     let mut rng = StdRng::seed_from_u64(cfg.seed.max(1));
     let mut recent: Vec<u32> = Vec::new();
     let mut next: i64 = 0;
+    let is_gemma4_text = model_type.starts_with("gemma4");
+    let enable_gemma4_image_bidir = std::env::var("CELLM_VLM_GEMMA4_BIDIR_IMAGE")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no")))
+        .unwrap_or(true);
 
-    for (pos, &tok_id) in input_ids.iter().enumerate() {
-        if tok_id == image_token_id {
-            if image_idx >= image_features.shape()[0] {
-                anyhow::bail!("image token count mismatch: prompt has more <image> tokens than vision features");
+    let mut pos = 0usize;
+    if prefix_image_features {
+        for i in 0..image_features.shape()[0] {
+            if std::env::var("CELLM_VLM_ZERO_IMAGE_FEATURES").is_ok() {
+                x.fill(0.0);
+            } else {
+                let src = image_features.index_axis(Axis(0), i);
+                x.copy_from_slice(src.as_slice().context("vision feature row not contiguous")?);
             }
-            let src = image_features.index_axis(Axis(0), image_idx);
-            x.copy_from_slice(src.as_slice().context("vision feature row not contiguous")?);
+            let cand = match &mut runner {
+                DecodeRunner::Llama(r) => r
+                    .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                DecodeRunner::Gemma(r) => r
+                    .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+            };
+            next = sample_from_candidates(
+                &cand,
+                cfg.temperature,
+                cfg.repeat_penalty,
+                cfg.repeat_window,
+                banned_token_ids,
+                &recent,
+                &mut rng,
+            )?;
+            pos += 1;
             image_idx += 1;
-        } else {
-            runner
-                .embed_token_hidden(tok_id as u32, &mut x)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
-        let cand = runner
-            .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        next = sample_from_candidates(
-            &cand,
-            cfg.temperature,
-            cfg.repeat_penalty,
-            cfg.repeat_window,
-            banned_token_ids,
-            &recent,
-            &mut rng,
-        )?;
-        recent.push(tok_id as u32);
+    }
+    if !prefix_image_features && is_gemma4_text && enable_gemma4_image_bidir {
+        let img_positions: Vec<usize> = input_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &t)| if t == image_token_id { Some(i) } else { None })
+            .collect();
+        let mut image_pos_to_feature = vec![None; input_ids.len()];
+        for (feat_idx, &p) in img_positions.iter().enumerate() {
+            if p < image_pos_to_feature.len() {
+                image_pos_to_feature[p] = Some(feat_idx);
+            }
+        }
+        if let (Some(&img_start), Some(&img_end)) = (img_positions.first(), img_positions.last()) {
+            // Phase A: causal prefill before image block.
+            for &tok_id in input_ids.iter().take(img_start) {
+                match &runner {
+                    DecodeRunner::Llama(r) => r
+                        .embed_token_hidden(tok_id as u32, &mut x)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                    DecodeRunner::Gemma(r) => r
+                        .embed_token_hidden(tok_id as u32, &mut x)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                }
+                recent.push(tok_id as u32);
+                let cand = match &mut runner {
+                    DecodeRunner::Llama(r) => r
+                        .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                    DecodeRunner::Gemma(r) => r
+                        .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                };
+                next = sample_from_candidates(
+                    &cand,
+                    cfg.temperature,
+                    cfg.repeat_penalty,
+                    cfg.repeat_window,
+                    banned_token_ids,
+                    &recent,
+                    &mut rng,
+                )?;
+                pos += 1;
+            }
+
+            // Reserve all image positions so replays can use pos < token_count.
+            while page_table.token_count() < (img_end + 1) {
+                page_table
+                    .append_token(kv_cache.allocator_mut())
+                    .map_err(|e| anyhow::anyhow!("gemma image reserve append failed: {e}"))?;
+            }
+
+            // Phase B1: fill image K/V once.
+            for p in img_start..=img_end {
+                if let Some(feat_idx) = image_pos_to_feature[p] {
+                    if feat_idx >= image_features.shape()[0] {
+                        anyhow::bail!("image token/feature mismatch at pos={p}");
+                    }
+                    if std::env::var("CELLM_VLM_ZERO_IMAGE_FEATURES").is_ok() {
+                        x.fill(0.0);
+                    } else {
+                        let src = image_features.index_axis(Axis(0), feat_idx);
+                        x.copy_from_slice(src.as_slice().context("vision feature row not contiguous")?);
+                    }
+                    let _ = match &mut runner {
+                        DecodeRunner::Llama(r) => r
+                            .step_topk_from_hidden(&x, p, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                            .map_err(|e| anyhow::anyhow!("{e}"))?,
+                        DecodeRunner::Gemma(r) => r
+                            .step_topk_from_hidden(&x, p, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                            .map_err(|e| anyhow::anyhow!("{e}"))?,
+                    };
+                }
+            }
+
+            // Phase B2: replay image block with all image K/V present.
+            for p in img_start..=img_end {
+                if let Some(feat_idx) = image_pos_to_feature[p] {
+                    if feat_idx >= image_features.shape()[0] {
+                        anyhow::bail!("image token/feature mismatch at pos={p}");
+                    }
+                    if std::env::var("CELLM_VLM_ZERO_IMAGE_FEATURES").is_ok() {
+                        x.fill(0.0);
+                    } else {
+                        let src = image_features.index_axis(Axis(0), feat_idx);
+                        x.copy_from_slice(src.as_slice().context("vision feature row not contiguous")?);
+                    }
+                    let _ = match &mut runner {
+                        DecodeRunner::Llama(r) => r
+                            .step_topk_from_hidden(&x, p, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                            .map_err(|e| anyhow::anyhow!("{e}"))?,
+                        DecodeRunner::Gemma(r) => r
+                            .step_topk_from_hidden(&x, p, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                            .map_err(|e| anyhow::anyhow!("{e}"))?,
+                    };
+                    recent.push(image_token_id as u32);
+                }
+            }
+            image_idx = img_positions.len();
+            pos = img_end + 1;
+
+            // Phase C: causal prefill after image block.
+            for &tok_id in input_ids.iter().skip(img_end + 1) {
+                match &runner {
+                    DecodeRunner::Llama(r) => r
+                        .embed_token_hidden(tok_id as u32, &mut x)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                    DecodeRunner::Gemma(r) => r
+                        .embed_token_hidden(tok_id as u32, &mut x)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                }
+                recent.push(tok_id as u32);
+                let cand = match &mut runner {
+                    DecodeRunner::Llama(r) => r
+                        .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                    DecodeRunner::Gemma(r) => r
+                        .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                };
+                next = sample_from_candidates(
+                    &cand,
+                    cfg.temperature,
+                    cfg.repeat_penalty,
+                    cfg.repeat_window,
+                    banned_token_ids,
+                    &recent,
+                    &mut rng,
+                )?;
+                pos += 1;
+            }
+        } else {
+            // No image placeholders found, fall back to standard loop.
+            for &tok_id in input_ids.iter() {
+                match &runner {
+                    DecodeRunner::Llama(r) => r
+                        .embed_token_hidden(tok_id as u32, &mut x)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                    DecodeRunner::Gemma(r) => r
+                        .embed_token_hidden(tok_id as u32, &mut x)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                }
+                recent.push(tok_id as u32);
+                let cand = match &mut runner {
+                    DecodeRunner::Llama(r) => r
+                        .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                    DecodeRunner::Gemma(r) => r
+                        .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                };
+                next = sample_from_candidates(
+                    &cand,
+                    cfg.temperature,
+                    cfg.repeat_penalty,
+                    cfg.repeat_window,
+                    banned_token_ids,
+                    &recent,
+                    &mut rng,
+                )?;
+                pos += 1;
+            }
+        }
+    } else {
+        for &tok_id in input_ids.iter() {
+            if !prefix_image_features && tok_id == image_token_id {
+                if image_idx >= image_features.shape()[0] {
+                    anyhow::bail!("image token count mismatch: prompt has more <image> tokens than vision features");
+                }
+                if std::env::var("CELLM_VLM_ZERO_IMAGE_FEATURES").is_ok() {
+                    x.fill(0.0);
+                } else {
+                    let src = image_features.index_axis(Axis(0), image_idx);
+                    x.copy_from_slice(src.as_slice().context("vision feature row not contiguous")?);
+                }
+                image_idx += 1;
+            } else {
+                match &runner {
+                    DecodeRunner::Llama(r) => r
+                        .embed_token_hidden(tok_id as u32, &mut x)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                    DecodeRunner::Gemma(r) => r
+                        .embed_token_hidden(tok_id as u32, &mut x)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                }
+                recent.push(tok_id as u32);
+            }
+            let cand = match &mut runner {
+                DecodeRunner::Llama(r) => r
+                    .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                DecodeRunner::Gemma(r) => r
+                    .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+            };
+            next = sample_from_candidates(
+                &cand,
+                cfg.temperature,
+                cfg.repeat_penalty,
+                cfg.repeat_window,
+                banned_token_ids,
+                &recent,
+                &mut rng,
+            )?;
+            pos += 1;
+        }
     }
     if image_idx != image_features.shape()[0] {
         anyhow::bail!(
@@ -269,13 +628,23 @@ fn run_decode_cellm(
         if is_alternating_two_token_loop(&generated, 10) && (step + 1) >= cfg.min_new_tokens {
             break;
         }
-        runner
-            .embed_token_hidden(next as u32, &mut x)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let pos = input_ids.len() + step;
-        let cand = runner
-            .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        match &runner {
+            DecodeRunner::Llama(r) => r
+                .embed_token_hidden(next as u32, &mut x)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            DecodeRunner::Gemma(r) => r
+                .embed_token_hidden(next as u32, &mut x)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        }
+        let pos = pos + step;
+        let cand = match &mut runner {
+            DecodeRunner::Llama(r) => r
+                .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            DecodeRunner::Gemma(r) => r
+                .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        };
         next = sample_from_candidates(
             &cand,
             cfg.temperature,
@@ -289,6 +658,45 @@ fn run_decode_cellm(
     }
 
     Ok((generated, decode_start.elapsed().as_secs_f64() * 1000.0))
+}
+
+fn effective_text_model_type(header: &cellm_model::CellmHeader) -> String {
+    let mut mt = header.model_type.clone();
+    if mt == "llava" || mt == "llava_qwen" || mt == "llava_idefics3" || mt == "llava_smolvlm" || mt == "vlm" {
+        if let Some(st) = header
+            .source_text_config
+            .as_ref()
+            .and_then(|v| v.get("model_type"))
+            .and_then(|v| v.as_str())
+        {
+            mt = st.to_string();
+        } else if let Some(archs) = header.source_architectures.as_ref() {
+            if archs.iter().any(|a| a.to_lowercase().contains("qwen")) {
+                mt = "qwen".to_string();
+            } else if archs.iter().any(|a| a.to_lowercase().contains("llama")) {
+                mt = "llama".to_string();
+            }
+        }
+    }
+    mt
+}
+
+fn infer_gemma_kv_head_dim(file: &CellmFile) -> Result<usize> {
+    let kv_heads = file.header.num_kv_heads.max(1);
+    let mut max_head_dim = 0usize;
+    for t in &file.header.tensors {
+        if t.name.contains(".self_attn.k_proj.weight") && t.shape.len() == 2 {
+            let kv_dim = t.shape[0];
+            if kv_dim % kv_heads == 0 {
+                max_head_dim = max_head_dim.max(kv_dim / kv_heads);
+            }
+        }
+    }
+    if max_head_dim > 0 {
+        Ok(max_head_dim)
+    } else {
+        anyhow::bail!("failed to infer gemma kv head dim from k_proj weights")
+    }
 }
 
 fn is_alternating_two_token_loop(tokens: &[i64], min_len: usize) -> bool {
@@ -373,9 +781,21 @@ fn sample_from_candidates(
 
 fn run_vision_cellm(
     file: &CellmFile,
-    pixel_values: Array5<f32>,
+    image_input: &PreparedImage,
     backend: BackendKind,
+    target_image_seq_len: Option<usize>,
 ) -> Result<(Array2<f32>, usize, f64, f64, Vec<f64>)> {
+    if file
+        .tensor_index("model.vision_tower.patch_embedder.input_proj.weight")
+        .is_some()
+        && file
+            .tensor_index("model.embed_vision.embedding_projection.weight")
+            .is_some()
+    {
+        return run_vision_cellm_gemma4(file, image_input, target_image_seq_len, backend);
+    }
+    let pixel_values = image_input.pixel_values.clone();
+
     let mut linear_backend = match backend {
         BackendKind::Metal => {
             let ctx = MetalKernels::create_matmul()
@@ -608,9 +1028,11 @@ fn run_vision_cellm(
                 num_tokens,
                 num_heads,
                 head_dim,
+                None,
                 &mut score_buf,
                 &mut prob_buf,
                 &mut attn,
+                None,
                 &mut linear_backend,
             );
             linear_rows(
@@ -693,10 +1115,469 @@ fn run_vision_cellm(
     Ok((out, out_tokens_per_image, patch_ms, encoder_ms, encoder_layer_ms))
 }
 
+fn run_vision_cellm_gemma4(
+    file: &CellmFile,
+    image_input: &PreparedImage,
+    target_image_seq_len: Option<usize>,
+    backend: BackendKind,
+) -> Result<(Array2<f32>, usize, f64, f64, Vec<f64>)> {
+    let mut linear_backend = match backend {
+        BackendKind::Metal => {
+            let ctx = MetalKernels::create_matmul()
+                .map_err(|e| anyhow::anyhow!("Gemma4 VLM Metal backend unavailable: {e}"))?;
+            LinearBackend::Metal {
+                ctx,
+                weight_t_cache: HashMap::new(),
+            }
+        }
+        BackendKind::Cpu => LinearBackend::Cpu,
+    };
+
+    let patch_w_name = "model.vision_tower.patch_embedder.input_proj.weight";
+    let pos_name = "model.vision_tower.patch_embedder.position_embedding_table";
+    let proj_name = "model.embed_vision.embedding_projection.weight";
+
+    let patch_w_shape = tensor_shape(file, patch_w_name)?;
+    let pos_shape = tensor_shape(file, pos_name)?;
+    let proj_shape = tensor_shape(file, proj_name)?;
+    if patch_w_shape.len() != 2 || patch_w_shape[0] == 0 || patch_w_shape[1] == 0 {
+        anyhow::bail!("unexpected Gemma4 patch projector shape: {patch_w_shape:?}");
+    }
+    if pos_shape.len() != 3 || pos_shape[2] != patch_w_shape[0] {
+        anyhow::bail!("unexpected Gemma4 position table shape: {pos_shape:?}");
+    }
+    if proj_shape.len() != 2 || proj_shape[1] != patch_w_shape[0] {
+        anyhow::bail!("unexpected Gemma4 image projection shape: {proj_shape:?}");
+    }
+
+    let hidden = patch_w_shape[0];
+    let patch_in = patch_w_shape[1];
+    let pos_table = tensor_to_f32(file, pos_name)?;
+    let pos_rows = pos_shape[1];
+    let patches = image_input
+        .gemma4_patch_values
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Gemma4 preprocessing missing patch vectors"))?;
+    let pos_ids = image_input
+        .gemma4_position_ids
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Gemma4 preprocessing missing position ids"))?;
+    let soft_tokens = image_input
+        .gemma4_num_soft_tokens
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Gemma4 preprocessing missing soft-token counts"))?;
+    let nimg = patches.shape()[0];
+    let num_tokens = patches.shape()[1];
+    if patches.shape()[2] != patch_in {
+        anyhow::bail!(
+            "Gemma4 patch vector dim mismatch: expected {patch_in}, got {}",
+            patches.shape()[2]
+        );
+    }
+    if pos_ids.shape()[0] != nimg || pos_ids.shape()[1] != num_tokens || pos_ids.shape()[2] != 2 {
+        anyhow::bail!("Gemma4 position id tensor shape mismatch");
+    }
+    if num_tokens > pos_rows {
+        anyhow::bail!("Gemma4 position rows too small: need {num_tokens}, have {pos_rows}");
+    }
+    let patch_w = tensor_to_f32(file, patch_w_name)?;
+    let proj = tensor_to_f32(file, proj_name)?;
+    let eps = file
+        .header
+        .source_vision_config
+        .as_ref()
+        .and_then(|v| v.get("rms_norm_eps"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1e-6) as f32;
+    let num_layers = file
+        .header
+        .source_vision_config
+        .as_ref()
+        .and_then(|v| v.get("num_hidden_layers"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or_else(|| infer_gemma4_vision_num_layers(file));
+    let num_heads = file
+        .header
+        .source_vision_config
+        .as_ref()
+        .and_then(|v| v.get("num_attention_heads"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(12);
+    let intermediate = file
+        .header
+        .source_vision_config
+        .as_ref()
+        .and_then(|v| v.get("intermediate_size"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(hidden * 4);
+    if num_layers == 0 {
+        anyhow::bail!("Gemma4 vision layer count resolved to zero");
+    }
+    if num_heads == 0 || hidden % num_heads != 0 {
+        anyhow::bail!("invalid Gemma4 vision heads: hidden={hidden}, num_heads={num_heads}");
+    }
+    let head_dim = hidden / num_heads;
+    let rope_theta = file
+        .header
+        .source_vision_config
+        .as_ref()
+        .and_then(|v| v.get("rope_parameters"))
+        .and_then(|v| v.get("rope_theta"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(100.0) as f32;
+    if head_dim % 4 != 0 {
+        anyhow::bail!("Gemma4 vision head_dim must be divisible by 4, got {head_dim}");
+    }
+    let spatial_dim = head_dim / 2;
+    let rope_half = spatial_dim / 2;
+    let mut rope_inv_freq = vec![0.0f32; rope_half];
+    for (i, rf) in rope_inv_freq.iter_mut().enumerate() {
+        let exp = (2 * i) as f32 / spatial_dim as f32;
+        *rf = rope_theta.powf(-exp);
+    }
+
+    let mut layers = Vec::with_capacity(num_layers);
+    for layer in 0..num_layers {
+        let prefix = format!("model.vision_tower.encoder.layers.{layer}.");
+        let (q_clip_in, q_clip_out) = load_linear_clip_ranges(file, &format!("{prefix}self_attn.q_proj"))?;
+        let (k_clip_in, k_clip_out) = load_linear_clip_ranges(file, &format!("{prefix}self_attn.k_proj"))?;
+        let (v_clip_in, v_clip_out) = load_linear_clip_ranges(file, &format!("{prefix}self_attn.v_proj"))?;
+        let (o_clip_in, o_clip_out) = load_linear_clip_ranges(file, &format!("{prefix}self_attn.o_proj"))?;
+        let (gate_clip_in, gate_clip_out) = load_linear_clip_ranges(file, &format!("{prefix}mlp.gate_proj"))?;
+        let (up_clip_in, up_clip_out) = load_linear_clip_ranges(file, &format!("{prefix}mlp.up_proj"))?;
+        let (down_clip_in, down_clip_out) = load_linear_clip_ranges(file, &format!("{prefix}mlp.down_proj"))?;
+        layers.push(Gemma4VisionLayerWeights {
+            input_ln_w: tensor_to_f32(file, &format!("{prefix}input_layernorm.weight"))?,
+            q_w: tensor_to_f32(file, &format!("{prefix}self_attn.q_proj.linear.weight"))?,
+            k_w: tensor_to_f32(file, &format!("{prefix}self_attn.k_proj.linear.weight"))?,
+            v_w: tensor_to_f32(file, &format!("{prefix}self_attn.v_proj.linear.weight"))?,
+            o_w: tensor_to_f32(file, &format!("{prefix}self_attn.o_proj.linear.weight"))?,
+            q_norm_w: tensor_to_f32(file, &format!("{prefix}self_attn.q_norm.weight"))?,
+            k_norm_w: tensor_to_f32(file, &format!("{prefix}self_attn.k_norm.weight"))?,
+            post_attn_ln_w: tensor_to_f32(file, &format!("{prefix}post_attention_layernorm.weight"))?,
+            pre_ffn_ln_w: tensor_to_f32(file, &format!("{prefix}pre_feedforward_layernorm.weight"))?,
+            gate_w: tensor_to_f32(file, &format!("{prefix}mlp.gate_proj.linear.weight"))?,
+            up_w: tensor_to_f32(file, &format!("{prefix}mlp.up_proj.linear.weight"))?,
+            down_w: tensor_to_f32(file, &format!("{prefix}mlp.down_proj.linear.weight"))?,
+            post_ffn_ln_w: tensor_to_f32(file, &format!("{prefix}post_feedforward_layernorm.weight"))?,
+            q_clip_in,
+            q_clip_out,
+            k_clip_in,
+            k_clip_out,
+            v_clip_in,
+            v_clip_out,
+            o_clip_in,
+            o_clip_out,
+            gate_clip_in,
+            gate_clip_out,
+            up_clip_in,
+            up_clip_out,
+            down_clip_in,
+            down_clip_out,
+        });
+    }
+    let text_hidden = proj_shape[0];
+    if nimg != 1 {
+        anyhow::bail!("Gemma4 VLM currently supports exactly 1 image per prompt, got {nimg}");
+    }
+    let out_tokens_per_image = target_image_seq_len
+        .unwrap_or_else(|| soft_tokens[0].max(1))
+        .min(soft_tokens[0].max(1));
+
+    let mut tokens = vec![0.0f32; num_tokens * hidden];
+    let mut norm0 = vec![0.0f32; num_tokens * hidden];
+    let mut norm1 = vec![0.0f32; num_tokens * hidden];
+    let mut q = vec![0.0f32; num_tokens * hidden];
+    let mut k = vec![0.0f32; num_tokens * hidden];
+    let mut v = vec![0.0f32; num_tokens * hidden];
+    let mut attn = vec![0.0f32; num_tokens * hidden];
+    let mut proj_out = vec![0.0f32; num_tokens * hidden];
+    let mut gate = vec![0.0f32; num_tokens * intermediate];
+    let mut up = vec![0.0f32; num_tokens * intermediate];
+    let mut mlp_out = vec![0.0f32; num_tokens * hidden];
+    let mut score_buf = vec![0.0f32; num_tokens];
+    let mut prob_buf = vec![0.0f32; num_tokens];
+    let mut rope_cos = vec![0.0f32; num_tokens * (2 * rope_half)];
+    let mut rope_sin = vec![0.0f32; num_tokens * (2 * rope_half)];
+    let mut valid_mask = vec![false; num_tokens];
+    let mut patch_ms = 0.0f64;
+    let mut encoder_ms = 0.0f64;
+    let mut encoder_layer_ms = vec![0.0f64; num_layers];
+    let mut out = Array2::<f32>::zeros((nimg * out_tokens_per_image, text_hidden));
+
+    for img in 0..nimg {
+        let t_patch = Instant::now();
+        let mut patch_rows = vec![0.0f32; num_tokens * patch_in];
+        for t in 0..num_tokens {
+            for i in 0..patch_in {
+                patch_rows[t * patch_in + i] = 2.0 * (patches[[img, t, i]] - 0.5);
+            }
+        }
+        linear_rows(
+            &patch_rows,
+            num_tokens,
+            patch_in,
+            &patch_w,
+            hidden,
+            None,
+            &mut tokens,
+            &mut linear_backend,
+        );
+        let pos_axis = &pos_table[..pos_rows * hidden];
+        valid_mask.fill(false);
+        for t in 0..num_tokens {
+            let x = pos_ids[[img, t, 0]];
+            let y = pos_ids[[img, t, 1]];
+            if x < 0 || y < 0 {
+                let row = &mut tokens[t * hidden..(t + 1) * hidden];
+                row.fill(0.0);
+                continue;
+            }
+            let xi = x as usize;
+            let yi = y as usize;
+            if xi >= pos_rows || yi >= pos_rows {
+                anyhow::bail!("Gemma4 position id out of range: x={xi} y={yi} max={pos_rows}");
+            }
+            valid_mask[t] = true;
+            let row = &mut tokens[t * hidden..(t + 1) * hidden];
+            let xemb = &pos_axis[xi * hidden..(xi + 1) * hidden];
+            let yemb = &pos_table[pos_rows * hidden + yi * hidden..pos_rows * hidden + (yi + 1) * hidden];
+            for i in 0..hidden {
+                row[i] += xemb[i] + yemb[i];
+            }
+            let base = t * (2 * rope_half);
+            for i in 0..rope_half {
+                let ax = xi as f32 * rope_inv_freq[i];
+                let ay = yi as f32 * rope_inv_freq[i];
+                rope_cos[base + i] = ax.cos();
+                rope_sin[base + i] = ax.sin();
+                rope_cos[base + rope_half + i] = ay.cos();
+                rope_sin[base + rope_half + i] = ay.sin();
+            }
+        }
+        patch_ms += t_patch.elapsed().as_secs_f64() * 1000.0;
+
+        let t_enc = Instant::now();
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            let layer_start = Instant::now();
+            rms_norm_rows(&tokens, num_tokens, hidden, &layer.input_ln_w, eps, &mut norm0);
+
+            linear_rows_clipped(
+                &norm0,
+                num_tokens,
+                hidden,
+                &layer.q_w,
+                hidden,
+                None,
+                &mut q,
+                layer.q_clip_in,
+                layer.q_clip_out,
+                &mut linear_backend,
+            );
+            linear_rows_clipped(
+                &norm0,
+                num_tokens,
+                hidden,
+                &layer.k_w,
+                hidden,
+                None,
+                &mut k,
+                layer.k_clip_in,
+                layer.k_clip_out,
+                &mut linear_backend,
+            );
+            linear_rows_clipped(
+                &norm0,
+                num_tokens,
+                hidden,
+                &layer.v_w,
+                hidden,
+                None,
+                &mut v,
+                layer.v_clip_in,
+                layer.v_clip_out,
+                &mut linear_backend,
+            );
+
+            for t in 0..num_tokens {
+                let q_row = &mut q[t * hidden..(t + 1) * hidden];
+                let k_row = &mut k[t * hidden..(t + 1) * hidden];
+                let v_row = &mut v[t * hidden..(t + 1) * hidden];
+                let rope_base = t * (2 * rope_half);
+                let cos = &rope_cos[rope_base..rope_base + (2 * rope_half)];
+                let sin = &rope_sin[rope_base..rope_base + (2 * rope_half)];
+                for hidx in 0..num_heads {
+                    let start = hidx * head_dim;
+                    let end = start + head_dim;
+                    rms_norm_inplace_segment(&mut q_row[start..end], &layer.q_norm_w, eps);
+                    rms_norm_inplace_segment(&mut k_row[start..end], &layer.k_norm_w, eps);
+                    rms_norm_inplace_noscale(&mut v_row[start..end], eps);
+                    apply_multidim_rope_inplace(&mut q_row[start..end], cos, sin);
+                    apply_multidim_rope_inplace(&mut k_row[start..end], cos, sin);
+                }
+            }
+
+            self_attention_full(
+                &q,
+                &k,
+                &v,
+                num_tokens,
+                num_heads,
+                head_dim,
+                Some(1.0),
+                &mut score_buf,
+                &mut prob_buf,
+                &mut attn,
+                Some(&valid_mask),
+                &mut linear_backend,
+            );
+            linear_rows_clipped(
+                &attn,
+                num_tokens,
+                hidden,
+                &layer.o_w,
+                hidden,
+                None,
+                &mut proj_out,
+                layer.o_clip_in,
+                layer.o_clip_out,
+                &mut linear_backend,
+            );
+            rms_norm_rows(
+                &proj_out,
+                num_tokens,
+                hidden,
+                &layer.post_attn_ln_w,
+                eps,
+                &mut norm0,
+            );
+            add_inplace(&mut tokens, &norm0);
+
+            rms_norm_rows(
+                &tokens,
+                num_tokens,
+                hidden,
+                &layer.pre_ffn_ln_w,
+                eps,
+                &mut norm1,
+            );
+            linear_rows_clipped(
+                &norm1,
+                num_tokens,
+                hidden,
+                &layer.gate_w,
+                intermediate,
+                None,
+                &mut gate,
+                layer.gate_clip_in,
+                layer.gate_clip_out,
+                &mut linear_backend,
+            );
+            linear_rows_clipped(
+                &norm1,
+                num_tokens,
+                hidden,
+                &layer.up_w,
+                intermediate,
+                None,
+                &mut up,
+                layer.up_clip_in,
+                layer.up_clip_out,
+                &mut linear_backend,
+            );
+            gelu_pytorch_tanh_inplace(&mut gate);
+            mul_inplace(&mut gate, &up);
+            linear_rows_clipped(
+                &gate,
+                num_tokens,
+                intermediate,
+                &layer.down_w,
+                hidden,
+                None,
+                &mut mlp_out,
+                layer.down_clip_in,
+                layer.down_clip_out,
+                &mut linear_backend,
+            );
+            rms_norm_rows(
+                &mlp_out,
+                num_tokens,
+                hidden,
+                &layer.post_ffn_ln_w,
+                eps,
+                &mut norm0,
+            );
+            add_inplace(&mut tokens, &norm0);
+            encoder_layer_ms[layer_idx] += layer_start.elapsed().as_secs_f64() * 1000.0;
+        }
+
+        let mut max_x = 0usize;
+        for t in 0..num_tokens {
+            let x = pos_ids[[img, t, 0]];
+            if x >= 0 {
+                max_x = max_x.max(x as usize);
+            }
+        }
+        let pooled_w = (max_x + 1) / 3;
+        let mut pooled = vec![vec![0.0f32; hidden]; out_tokens_per_image];
+        let mut pooled_seen = vec![false; out_tokens_per_image];
+        for t in 0..num_tokens {
+            if !valid_mask[t] {
+                continue;
+            }
+            let x = pos_ids[[img, t, 0]] as usize;
+            let y = pos_ids[[img, t, 1]] as usize;
+            let idx = (x / 3) + pooled_w * (y / 3);
+            if idx >= out_tokens_per_image {
+                continue;
+            }
+            pooled_seen[idx] = true;
+            let src = &tokens[t * hidden..(t + 1) * hidden];
+            for i in 0..hidden {
+                pooled[idx][i] += src[i] / 9.0;
+            }
+        }
+        for out_tok in 0..out_tokens_per_image {
+            if !pooled_seen[out_tok] {
+                continue;
+            }
+            let mut src_norm = pooled[out_tok].clone();
+            rms_norm_inplace_noscale(&mut src_norm, eps);
+            for o in 0..text_hidden {
+                let mut acc = 0.0f32;
+                let wrow = &proj[o * hidden..(o + 1) * hidden];
+                for i in 0..hidden {
+                    acc += src_norm[i] * wrow[i];
+                }
+                out[[img * out_tokens_per_image + out_tok, o]] = acc;
+            }
+        }
+        encoder_ms += t_enc.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    Ok((out, out_tokens_per_image, patch_ms, encoder_ms, encoder_layer_ms))
+}
+
 fn infer_vision_num_layers(file: &CellmFile, vision_prefix: &str) -> usize {
     let mut layers = 0usize;
     loop {
         let name = format!("{vision_prefix}encoder.layers.{layers}.layer_norm1.weight");
+        if file.tensor_index(&name).is_some() {
+            layers += 1;
+        } else {
+            break;
+        }
+    }
+    layers
+}
+
+fn infer_gemma4_vision_num_layers(file: &CellmFile) -> usize {
+    let mut layers = 0usize;
+    loop {
+        let name = format!("model.vision_tower.encoder.layers.{layers}.input_layernorm.weight");
         if file.tensor_index(&name).is_some() {
             layers += 1;
         } else {
@@ -796,6 +1677,36 @@ fn tensor_to_f32(file: &CellmFile, name: &str) -> Result<Vec<f32>> {
     }
 }
 
+fn tensor_scalar_f32_optional(file: &CellmFile, name: &str) -> Result<Option<f32>> {
+    if file.tensor_index(name).is_none() {
+        return Ok(None);
+    }
+    let vals = tensor_to_f32(file, name)?;
+    if vals.len() != 1 {
+        anyhow::bail!("expected scalar tensor for {name}, got len={}", vals.len());
+    }
+    Ok(Some(vals[0]))
+}
+
+fn load_linear_clip_ranges(
+    file: &CellmFile,
+    prefix: &str,
+) -> Result<(Option<(f32, f32)>, Option<(f32, f32)>)> {
+    let in_min = tensor_scalar_f32_optional(file, &format!("{prefix}.input_min"))?;
+    let in_max = tensor_scalar_f32_optional(file, &format!("{prefix}.input_max"))?;
+    let out_min = tensor_scalar_f32_optional(file, &format!("{prefix}.output_min"))?;
+    let out_max = tensor_scalar_f32_optional(file, &format!("{prefix}.output_max"))?;
+    let in_clip = match (in_min, in_max) {
+        (Some(mn), Some(mx)) if mn.is_finite() && mx.is_finite() => Some((mn, mx)),
+        _ => None,
+    };
+    let out_clip = match (out_min, out_max) {
+        (Some(mn), Some(mx)) if mn.is_finite() && mx.is_finite() => Some((mn, mx)),
+        _ => None,
+    };
+    Ok((in_clip, out_clip))
+}
+
 fn layer_norm_rows(
     input: &[f32],
     rows: usize,
@@ -824,6 +1735,72 @@ fn layer_norm_rows(
             y[i] = ((x[i] - mean) * inv) * weight[i] + bias[i];
         }
     }
+}
+
+fn rms_norm_rows(
+    input: &[f32],
+    rows: usize,
+    cols: usize,
+    weight: &[f32],
+    eps: f32,
+    out: &mut [f32],
+) {
+    for r in 0..rows {
+        let x = &input[r * cols..(r + 1) * cols];
+        let y = &mut out[r * cols..(r + 1) * cols];
+        let mut ms = 0.0f32;
+        for &val in x {
+            ms += val * val;
+        }
+        ms /= cols as f32;
+        let inv = 1.0f32 / (ms + eps).sqrt();
+        for i in 0..cols {
+            y[i] = x[i] * inv * weight[i];
+        }
+    }
+}
+
+fn rms_norm_inplace_segment(x: &mut [f32], weight: &[f32], eps: f32) {
+    let mut ms = 0.0f32;
+    for &v in x.iter() {
+        ms += v * v;
+    }
+    ms /= x.len() as f32;
+    let inv = 1.0f32 / (ms + eps).sqrt();
+    for i in 0..x.len() {
+        x[i] = x[i] * inv * weight[i];
+    }
+}
+
+fn rms_norm_inplace_noscale(x: &mut [f32], eps: f32) {
+    let mut ms = 0.0f32;
+    for &v in x.iter() {
+        ms += v * v;
+    }
+    ms /= x.len() as f32;
+    let inv = 1.0f32 / (ms + eps).sqrt();
+    for v in x.iter_mut() {
+        *v *= inv;
+    }
+}
+
+fn apply_rope_1d_inplace(x: &mut [f32], cos: &[f32], sin: &[f32]) {
+    let half = x.len() / 2;
+    for i in 0..half {
+        let a = x[i];
+        let b = x[i + half];
+        x[i] = a * cos[i] - b * sin[i];
+        x[i + half] = b * cos[i] + a * sin[i];
+    }
+}
+
+fn apply_multidim_rope_inplace(x: &mut [f32], cos_xy: &[f32], sin_xy: &[f32]) {
+    let spatial = x.len() / 2;
+    let (x_part, y_part) = x.split_at_mut(spatial);
+    let (cos_x, cos_y) = cos_xy.split_at(spatial / 2);
+    let (sin_x, sin_y) = sin_xy.split_at(spatial / 2);
+    apply_rope_1d_inplace(x_part, cos_x, sin_x);
+    apply_rope_1d_inplace(y_part, cos_y, sin_y);
 }
 
 fn patch_embed_rows(
@@ -865,6 +1842,56 @@ fn patch_embed_rows(
         patch_w,
         hidden,
         Some(patch_b),
+        tokens_out,
+        backend,
+    );
+    for t in 0..rows {
+        let row = &mut tokens_out[t * hidden..(t + 1) * hidden];
+        let p = &pos[t * hidden..(t + 1) * hidden];
+        for i in 0..hidden {
+            row[i] += p[i];
+        }
+    }
+}
+
+fn patch_embed_rows_linear(
+    pixel_values: &Array5<f32>,
+    img: usize,
+    grid: usize,
+    patch: usize,
+    hidden: usize,
+    patch_w: &[f32],
+    pos: &[f32],
+    tokens_out: &mut [f32],
+    backend: &mut LinearBackend,
+) {
+    let rows = grid * grid;
+    let in_dim = 3 * patch * patch;
+    let mut im2col = vec![0.0f32; rows * in_dim];
+    for py in 0..grid {
+        for px in 0..grid {
+            let token_idx = py * grid + px;
+            let mut col_i = 0usize;
+            for ic in 0..3usize {
+                for ky in 0..patch {
+                    for kx in 0..patch {
+                        let y = py * patch + ky;
+                        let x = px * patch + kx;
+                        im2col[token_idx * in_dim + col_i] = pixel_values[[0, img, ic, y, x]];
+                        col_i += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    linear_rows(
+        &im2col,
+        rows,
+        in_dim,
+        patch_w,
+        hidden,
+        None,
         tokens_out,
         backend,
     );
@@ -948,6 +1975,34 @@ fn linear_rows(
     }
 }
 
+fn linear_rows_clipped(
+    input: &[f32],
+    rows: usize,
+    in_dim: usize,
+    weight: &[f32],
+    out_dim: usize,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+    input_clip: Option<(f32, f32)>,
+    output_clip: Option<(f32, f32)>,
+    backend: &mut LinearBackend,
+) {
+    if let Some((mn, mx)) = input_clip {
+        let mut clipped = vec![0.0f32; input.len()];
+        for (d, &s) in clipped.iter_mut().zip(input.iter()) {
+            *d = s.clamp(mn, mx);
+        }
+        linear_rows(&clipped, rows, in_dim, weight, out_dim, bias, out, backend);
+    } else {
+        linear_rows(input, rows, in_dim, weight, out_dim, bias, out, backend);
+    }
+    if let Some((mn, mx)) = output_clip {
+        for v in out.iter_mut() {
+            *v = v.clamp(mn, mx);
+        }
+    }
+}
+
 enum LinearBackend {
     Cpu,
     Metal {
@@ -972,13 +2027,76 @@ fn self_attention_full(
     seq: usize,
     num_heads: usize,
     head_dim: usize,
+    scale_override: Option<f32>,
     score_buf: &mut [f32],
     prob_buf: &mut [f32],
     out: &mut [f32],
+    valid_mask: Option<&[bool]>,
     backend: &mut LinearBackend,
 ) {
     let hidden = num_heads * head_dim;
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let scale = scale_override.unwrap_or(1.0f32 / (head_dim as f32).sqrt());
+
+    if valid_mask.is_none() {
+        if let LinearBackend::Metal { ctx, .. } = backend {
+            if self_attention_full_metal(
+                ctx, q, k, v, seq, num_heads, head_dim, scale, score_buf, prob_buf, out,
+            )
+            .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    if let Some(mask) = valid_mask {
+        for h in 0..num_heads {
+            let offset = h * head_dim;
+            for i in 0..seq {
+                if !mask[i] {
+                    for d in 0..head_dim {
+                        out[i * hidden + offset + d] = 0.0;
+                    }
+                    continue;
+                }
+                for j in 0..seq {
+                    if !mask[j] {
+                        score_buf[j] = -1.0e30;
+                        continue;
+                    }
+                    let qi = &q[i * hidden + offset..i * hidden + offset + head_dim];
+                    let kj = &k[j * hidden + offset..j * hidden + offset + head_dim];
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += qi[d] * kj[d];
+                    }
+                    score_buf[j] = dot * scale;
+                }
+                let mut mx = f32::NEG_INFINITY;
+                for j in 0..seq {
+                    if score_buf[j] > mx {
+                        mx = score_buf[j];
+                    }
+                }
+                let mut sum = 0.0f32;
+                for j in 0..seq {
+                    let p = (score_buf[j] - mx).exp();
+                    prob_buf[j] = p;
+                    sum += p;
+                }
+                let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for j in 0..seq {
+                        let p = prob_buf[j] * inv;
+                        acc += p * v[j * hidden + offset + d];
+                    }
+                    out[i * hidden + offset + d] = acc;
+                }
+            }
+        }
+        return;
+    }
 
     if let LinearBackend::Metal { ctx, .. } = backend {
         if self_attention_full_metal(
@@ -1109,24 +2227,72 @@ fn gelu_pytorch_tanh_inplace(x: &mut [f32]) {
     }
 }
 
+fn silu_inplace(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        *v = *v / (1.0 + (-*v).exp());
+    }
+}
+
+fn mul_inplace(dst: &mut [f32], rhs: &[f32]) {
+    for (d, r) in dst.iter_mut().zip(rhs.iter()) {
+        *d *= *r;
+    }
+}
+
 fn add_inplace(dst: &mut [f32], src: &[f32]) {
     for (d, s) in dst.iter_mut().zip(src.iter()) {
         *d += *s;
     }
 }
 
-fn build_single_turn_prompt(user_text: &str, image_block: &str) -> String {
+fn build_single_turn_prompt(user_text: &str, image_block: &str, use_gemma4_turn: bool) -> String {
+    if use_gemma4_turn {
+        if image_block.is_empty() {
+            return format!("<|turn>user\n{user_text}<turn|>\n<|turn>model\n");
+        }
+        // Match Gemma4 processor chat template layout more closely:
+        // user turn header, blank lines, image block, blank lines, user text.
+        return format!("<|turn>user\n\n\n{image_block}\n\n{user_text}<turn|>\n<|turn>model\n");
+    }
     format!("<|im_start|>User:{image_block}{user_text}<end_of_utterance>\nAssistant:")
 }
 
-fn format_image_block(num_images: usize, image_seq_len: usize) -> String {
-    let image_tokens = "<image>".repeat(image_seq_len);
+fn format_image_block(
+    num_images: usize,
+    image_seq_len: usize,
+    image_token_text: &str,
+    use_idefics_wrappers: bool,
+    boi_token_text: Option<&str>,
+    eoi_token_text: Option<&str>,
+) -> String {
+    let image_tokens = image_token_text.repeat(image_seq_len);
     let mut block = String::new();
+    let wrap_boi_eoi = !use_idefics_wrappers && boi_token_text.is_some() && eoi_token_text.is_some();
     for image_idx in 0..num_images {
-        if image_idx == 0 {
+        if image_idx == 0 && use_idefics_wrappers {
             block.push_str("<fake_token_around_image><global-img>");
             block.push_str(&image_tokens);
             block.push_str("<fake_token_around_image>");
+            continue;
+        }
+        if image_idx == 0 {
+            if wrap_boi_eoi {
+                block.push_str(boi_token_text.unwrap());
+            }
+            block.push_str(&image_tokens);
+            if wrap_boi_eoi {
+                block.push_str(eoi_token_text.unwrap());
+            }
+            continue;
+        }
+        if !use_idefics_wrappers {
+            if wrap_boi_eoi {
+                block.push_str(boi_token_text.unwrap());
+            }
+            block.push_str(&image_tokens);
+            if wrap_boi_eoi {
+                block.push_str(eoi_token_text.unwrap());
+            }
             continue;
         }
         let local_idx = image_idx - 1;
@@ -1138,6 +2304,39 @@ fn format_image_block(num_images: usize, image_seq_len: usize) -> String {
         block.push_str("<fake_token_around_image>");
     }
     block
+}
+
+fn resolve_image_token(tok: &Tokenizer) -> Result<(i64, String, bool, Option<String>, Option<String>)> {
+    let boi = tok
+        .token_to_id("<|image>")
+        .map(|_| "<|image>".to_string());
+    let eoi = tok
+        .token_to_id("<image|>")
+        .map(|_| "<image|>".to_string());
+    let is_gemma4_turn = tok.token_to_id("<|turn>").is_some() && tok.token_to_id("<turn|>").is_some();
+    if is_gemma4_turn {
+        if let Some(id) = tok.token_to_id("<|image|>") {
+            return Ok((id as i64, "<|image|>".to_string(), false, boi, eoi));
+        }
+    }
+    if let Some(id) = tok.token_to_id("<image>") {
+        return Ok((id as i64, "<image>".to_string(), true, boi, eoi));
+    }
+    if let Some(id) = tok.token_to_id("<image_soft_token>") {
+        return Ok((id as i64, "<image_soft_token>".to_string(), false, boi, eoi));
+    }
+    if let Some(id) = tok.token_to_id("<|image|>") {
+        return Ok((id as i64, "<|image|>".to_string(), false, boi, eoi));
+    }
+    if let Some(id) = tok.token_to_id("<|image>") {
+        return Ok((id as i64, "<|image>".to_string(), false, boi, eoi));
+    }
+    if let Some(id) = tok.token_to_id("<image|>") {
+        return Ok((id as i64, "<image|>".to_string(), false, boi, eoi));
+    }
+    anyhow::bail!(
+        "tokenizer missing supported image token (<image>, <image_soft_token>, <|image|>, <|image>, <image|>)"
+    )
 }
 
 struct ResizedPadded {
@@ -1213,6 +2412,103 @@ fn fill_pixel_attention_mask(
     }
 }
 
+fn preprocess_image_for_model(
+    image_bytes: &[u8],
+    split_image: bool,
+    is_gemma4_vision: bool,
+    max_soft_tokens: usize,
+) -> Result<PreparedImage> {
+    if is_gemma4_vision {
+        let max_soft_tokens = std::env::var("CELLM_VLM_MAX_SOFT_TOKENS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(max_soft_tokens);
+        return preprocess_image_gemma4(image_bytes, max_soft_tokens);
+    }
+    preprocess_image_idefics3(image_bytes, split_image)
+}
+
+fn get_aspect_ratio_preserving_size(
+    height: usize,
+    width: usize,
+    patch_size: usize,
+    max_patches: usize,
+    pooling_kernel_size: usize,
+) -> Result<(usize, usize)> {
+    let total_px = (height * width) as f32;
+    let target_px = (max_patches * patch_size * patch_size) as f32;
+    let factor = (target_px / total_px).sqrt();
+    let ideal_h = factor * height as f32;
+    let ideal_w = factor * width as f32;
+    let side_mult = pooling_kernel_size * patch_size;
+    let mut target_h = ((ideal_h / side_mult as f32).floor() as usize) * side_mult;
+    let mut target_w = ((ideal_w / side_mult as f32).floor() as usize) * side_mult;
+    if target_h == 0 && target_w == 0 {
+        anyhow::bail!("Gemma4 resize collapsed to 0x0");
+    }
+    let max_side = (max_patches / (pooling_kernel_size * pooling_kernel_size)) * side_mult;
+    if target_h == 0 {
+        target_h = side_mult;
+        target_w = ((width / height).max(1)) * side_mult;
+        target_w = target_w.min(max_side).max(side_mult);
+    } else if target_w == 0 {
+        target_w = side_mult;
+        target_h = ((height / width).max(1)) * side_mult;
+        target_h = target_h.min(max_side).max(side_mult);
+    }
+    Ok((target_h, target_w))
+}
+
+fn preprocess_image_gemma4(image_bytes: &[u8], max_soft_tokens: usize) -> Result<PreparedImage> {
+    let img = image::load_from_memory(image_bytes).context("decode image bytes failed")?;
+    let rgb = img.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    let patch_size = 16usize;
+    let pooling = 3usize;
+    let max_patches = max_soft_tokens * pooling * pooling;
+    let (target_h, target_w) =
+        get_aspect_ratio_preserving_size(h as usize, w as usize, patch_size, max_patches, pooling)?;
+    let resized = image::imageops::resize(
+        &rgb,
+        target_w as u32,
+        target_h as u32,
+        image::imageops::FilterType::CatmullRom,
+    );
+    let patch_h = target_h / patch_size;
+    let patch_w = target_w / patch_size;
+    let valid_patches = patch_h * patch_w;
+    let mut patch_values = Array3::<f32>::zeros((1, max_patches, 3 * patch_size * patch_size));
+    let mut pos_ids = Array3::<i32>::from_elem((1, max_patches, 2), -1);
+    for py in 0..patch_h {
+        for px in 0..patch_w {
+            let t = py * patch_w + px;
+            pos_ids[[0, t, 0]] = px as i32;
+            pos_ids[[0, t, 1]] = py as i32;
+            let mut idx = 0usize;
+            for c in 0..3 {
+                for ky in 0..patch_size {
+                    for kx in 0..patch_size {
+                        let p = resized
+                            .get_pixel((px * patch_size + kx) as u32, (py * patch_size + ky) as u32)
+                            .0[c];
+                        patch_values[[0, t, idx]] = p as f32 / 255.0;
+                        idx += 1;
+                    }
+                }
+            }
+        }
+    }
+    let num_soft = valid_patches / (pooling * pooling);
+    let mut pixel_values = Array5::<f32>::zeros((1, 1, 3, 1, 1));
+    pixel_values[[0, 0, 0, 0, 0]] = 0.0;
+    Ok(PreparedImage {
+        pixel_values,
+        gemma4_patch_values: Some(patch_values),
+        gemma4_position_ids: Some(pos_ids),
+        gemma4_num_soft_tokens: Some(vec![num_soft]),
+    })
+}
+
 fn preprocess_image_idefics3(image_bytes: &[u8], split_image: bool) -> Result<PreparedImage> {
     let img = image::load_from_memory(image_bytes).context("decode image bytes failed")?;
     let rgb = img.to_rgb8();
@@ -1258,7 +2554,12 @@ fn preprocess_image_idefics3(image_bytes: &[u8], split_image: bool) -> Result<Pr
             im.offset_y,
         );
     }
-    Ok(PreparedImage { pixel_values })
+    Ok(PreparedImage {
+        pixel_values,
+        gemma4_patch_values: None,
+        gemma4_position_ids: None,
+        gemma4_num_soft_tokens: None,
+    })
 }
 
 fn max_split_tiles() -> usize {
@@ -1345,6 +2646,19 @@ fn load_vlm_processor_hints(model_path: &Path, tokenizer_path: &Path, tok: &Toke
                 .get("image_seq_len")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize);
+            if hints.image_seq_len.is_none() {
+                hints.image_seq_len = json
+                    .get("image_seq_length")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+            }
+            if hints.image_seq_len.is_none() {
+                hints.image_seq_len = json
+                    .get("image_processor")
+                    .and_then(|v| v.get("image_seq_length"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+            }
         }
         if let Some(split) = json.get("do_image_splitting").and_then(|v| v.as_bool()) {
             hints.do_image_splitting = split;

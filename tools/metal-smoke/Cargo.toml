@@ -11,4 +11,10 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 cellm-kernels = { path = "../../crates/cellm-kernels" }
+metal = "0.29"
+memmap2 = "0.9"
+
+[[bin]]
+name = "test_mmap"
+path = "src/bin/test_mmap.rs"
 

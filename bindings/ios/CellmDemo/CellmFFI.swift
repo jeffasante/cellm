@@ -407,9 +407,6 @@ final class CellmEngine {
     }
 
     private func generateWithLiteRt(prompt: String, imageURL: URL? = nil, audioURL: URL? = nil) throws -> String {
-        #if os(iOS)
-        throw CellmError.message("LiteRT proxy models are desktop-only in this build. Use native .cellm/.cellmd models on iOS.")
-        #else
         let needsMultimodal = (imageURL != nil || audioURL != nil)
         let needed = prompt.withCString { cPrompt in
             if needsMultimodal {
@@ -463,7 +460,6 @@ final class CellmEngine {
             throw CellmError.message(CellmFFI.lastError())
         }
         return String(cString: bytes)
-        #endif
     }
 
     private static func debugLog(_ message: String) {

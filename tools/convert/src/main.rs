@@ -52,6 +52,40 @@ struct Args {
     #[arg(long, default_value_t = false)]
     quantize_int4_symmetric: bool,
 
+    /// Gemma4-only aggressive INT4 profile:
+    /// quantize most 2D text weights (including embeddings / lm_head when present)
+    /// while keeping norm-style tensors in f16.
+    #[arg(long, default_value_t = false)]
+    gemma4_aggressive_int4: bool,
+
+    /// Gemma4-only balanced INT4 profile:
+    /// quantize layer attention/MLP projections, keep embeddings/lm_head/PLE+noms in f16.
+    #[arg(long, default_value_t = false)]
+    gemma4_balanced_int4: bool,
+
+    /// Gemma4-only AWQ-lite INT4 profile:
+    /// keep sensitive tensors (embeddings/lm_head/PLE/norms + first/last 2 layers) in f16,
+    /// quantize remaining layer projections to int4.
+    #[arg(long, default_value_t = false)]
+    gemma4_awq_lite_int4: bool,
+
+    /// Gemma4-only mixed profile for mobile experiments:
+    /// quantize attention projections to int8 and MLP projections to int4.
+    /// Keeps embeddings/lm_head/norm-style tensors in f16.
+    #[arg(long, default_value_t = false)]
+    gemma4_mixed_i8_i4: bool,
+
+    /// Optional Gemma4 INT4 layer exclusion list (comma-separated), e.g. "0,1,33,34".
+    /// Excluded layers stay in f16 for INT4 quantization profiles.
+    #[arg(long)]
+    gemma4_int4_exclude_layers: Option<String>,
+
+    /// Optional Gemma4 mixed-profile attention INT8 layer list (comma-separated).
+    /// When set with --gemma4-mixed-i8-i4, only these attention layers use INT8;
+    /// other attention layers fall back to INT4.
+    #[arg(long)]
+    gemma4_mixed_i8_attn_layers: Option<String>,
+
     /// Keep only text-stack tensors (drop vision/projector tensors).
     #[arg(long, default_value_t = false)]
     text_only: bool,
@@ -84,8 +118,8 @@ struct HfConfigRoot {
     num_key_value_heads: Option<usize>,
     rms_norm_eps: Option<f32>,
     rope_theta: Option<f32>,
-    bos_token_id: Option<u32>,
-    eos_token_id: Option<u32>,
+    bos_token_id: Option<Value>,
+    eos_token_id: Option<Value>,
     model_type: Option<String>,
     torch_dtype: Option<String>,
     max_position_embeddings: Option<usize>,
@@ -123,6 +157,13 @@ struct HfTextConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 struct RopeParameters {
+    rope_theta: Option<f32>,
+    full_attention: Option<RopeParamVariant>,
+    sliding_attention: Option<RopeParamVariant>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct RopeParamVariant {
     rope_theta: Option<f32>,
 }
 
@@ -176,6 +217,7 @@ struct CellmTensorIndex {
 struct TensorPlan {
     name: String,
     shape: Vec<usize>,
+    header_shape: Vec<usize>,
     file_idx: usize,
     offset_bytes: u64,
     out_nbytes: usize,
@@ -201,11 +243,6 @@ fn main() -> Result<()> {
     let args = Args::parse();
     if args.dtype.as_str() != "f16" {
         anyhow::bail!("only --dtype f16 is supported right now");
-    }
-
-    if let Some(litert_path) = resolve_litertlm_input(&args.input)? {
-        convert_litertlm_to_cellm(&args, &litert_path)?;
-        return Ok(());
     }
 
     if let Some(gguf_path) = resolve_gguf_input(&args.input)? {
@@ -272,20 +309,38 @@ fn main() -> Result<()> {
     }
     if args.quantize_int8_symmetric
         && !(selected.model_type == "llama"
+            || selected.model_type == "smollm3"
             || selected.model_type.starts_with("qwen")
             || selected.model_type.starts_with("gemma"))
     {
         anyhow::bail!(
-            "--quantize-int8-symmetric is currently supported for llama/qwen/gemma text stacks only (detected model_type={}).",
+            "--quantize-int8-symmetric is currently supported for llama/smollm3/qwen/gemma text stacks only (detected model_type={}).",
             selected.model_type
         );
     }
-    if args.quantize_int4_symmetric && args.quantize_int8_symmetric {
+    if args.quantize_int4_symmetric && args.quantize_int8_symmetric && !args.gemma4_mixed_i8_i4 {
         anyhow::bail!("choose only one quantization mode: --quantize-int8-symmetric or --quantize-int4-symmetric");
     }
-    if args.quantize_int4_symmetric && !selected.model_type.starts_with("qwen") {
+    if (args.gemma4_aggressive_int4 as u8
+        + args.gemma4_balanced_int4 as u8
+        + args.gemma4_awq_lite_int4 as u8
+        + args.gemma4_mixed_i8_i4 as u8) > 1
+    {
+        anyhow::bail!("choose only one Gemma4 quant profile: --gemma4-aggressive-int4, --gemma4-balanced-int4, --gemma4-awq-lite-int4, or --gemma4-mixed-i8-i4");
+    }
+    if (args.gemma4_aggressive_int4 || args.gemma4_balanced_int4 || args.gemma4_awq_lite_int4)
+        && !args.quantize_int4_symmetric
+    {
+        anyhow::bail!("Gemma4 INT4 profiles require --quantize-int4-symmetric");
+    }
+    if args.gemma4_mixed_i8_i4
+        && !(args.quantize_int4_symmetric && args.quantize_int8_symmetric)
+    {
+        anyhow::bail!("--gemma4-mixed-i8-i4 requires both --quantize-int4-symmetric and --quantize-int8-symmetric");
+    }
+    if args.quantize_int4_symmetric && !(selected.model_type.starts_with("qwen") || selected.model_type.starts_with("gemma")) {
         anyhow::bail!(
-            "--quantize-int4-symmetric is currently supported for qwen text stacks only (detected model_type={}).",
+            "--quantize-int4-symmetric is currently supported for qwen/gemma text stacks only (detected model_type={}).",
             selected.model_type
         );
     }
@@ -297,8 +352,15 @@ fn main() -> Result<()> {
         quant_group_size,
         args.quantize_int8_symmetric,
         args.quantize_int4_symmetric,
+        args.gemma4_aggressive_int4,
+        args.gemma4_balanced_int4,
+        args.gemma4_awq_lite_int4,
+        args.gemma4_mixed_i8_i4,
+        &parse_layer_index_list(args.gemma4_int4_exclude_layers.as_deref())?,
+        &parse_layer_index_list(args.gemma4_mixed_i8_attn_layers.as_deref())?,
         args.text_only,
         &selected.model_type,
+        selected.num_hidden_layers,
     )?;
     let (text_tensor_prefix, vision_tensor_prefix, projector_tensor_prefix) =
         infer_tensor_prefixes(&plans);
@@ -344,7 +406,7 @@ fn main() -> Result<()> {
                 name: p.name.clone(),
                 offset_bytes: p.offset_bytes,
                 nbytes: p.out_nbytes as u64,
-                shape: p.shape.clone(),
+                shape: p.header_shape.clone(),
                 dtype: p.out_dtype.clone(),
             })
             .collect();
@@ -371,7 +433,7 @@ fn main() -> Result<()> {
             name: p.name.clone(),
             offset_bytes: p.offset_bytes,
             nbytes: p.out_nbytes as u64,
-            shape: p.shape.clone(),
+            shape: p.header_shape.clone(),
             dtype: p.out_dtype.clone(),
         })
         .collect();
@@ -382,7 +444,7 @@ fn main() -> Result<()> {
 
     // Write output.
     let out = File::create(&args.output).with_context(|| format!("create {:?}", args.output))?;
-    let mut w = BufWriter::new(out);
+    let mut w = BufWriter::with_capacity(65536, out);
 
     // Preamble.
     w.write_all(b"CELLM")?;
@@ -538,117 +600,6 @@ fn resolve_gguf_input(input: &Path) -> Result<Option<PathBuf>> {
     Ok(ggufs.into_iter().next())
 }
 
-fn resolve_litertlm_input(input: &Path) -> Result<Option<PathBuf>> {
-    if input.is_file() {
-        if input.extension().and_then(|s| s.to_str()) == Some("litertlm") {
-            return Ok(Some(input.to_path_buf()));
-        }
-        return Ok(None);
-    }
-
-    let mut literts: Vec<PathBuf> = std::fs::read_dir(input)
-        .with_context(|| format!("read_dir {:?}", input))?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("litertlm"))
-        .collect();
-    literts.sort();
-    Ok(literts.into_iter().next())
-}
-
-fn convert_litertlm_to_cellm(args: &Args, litertlm_path: &Path) -> Result<()> {
-    let meta = std::fs::metadata(litertlm_path)
-        .with_context(|| format!("metadata {:?}", litertlm_path))?;
-    let litert_nbytes = usize::try_from(meta.len())
-        .map_err(|_| anyhow::anyhow!("litertlm is too large to index in this build"))?;
-    let litert_name = litertlm_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("model.litertlm")
-        .to_string();
-
-    // Keep a fixed tensor offset so header serialization doesn't need iterative offset solving.
-    const LITERT_OFFSET: u64 = 65_536;
-
-    let header = CellmHeader {
-        model_type: "litertlm_proxy".to_string(),
-        source_model_type: Some("litertlm".to_string()),
-        source_safetensors_format: Some("litertlm-bundle".to_string()),
-        text_tensor_prefix: None,
-        vision_tensor_prefix: None,
-        projector_tensor_prefix: None,
-        vocab_size: 0,
-        hidden_dim: 0,
-        intermediate_size: 0,
-        num_layers: 0,
-        num_heads: 0,
-        num_kv_heads: 0,
-        rms_norm_eps: 1e-6,
-        rope_theta: 10_000.0,
-        bos_token_id: None,
-        eos_token_id: None,
-        max_position_embeddings: None,
-        tie_word_embeddings: None,
-        source_torch_dtype: None,
-        source_architectures: Some(vec!["LiteRT-LM".to_string()]),
-        source_quantization: None,
-        source_quantization_config: None,
-        source_text_config: Some(serde_json::json!({
-            "model_type": "litertlm_proxy",
-            "litert_source_file": litert_name
-        })),
-        source_vision_config: None,
-        source_projector_config: None,
-        tensors: vec![CellmTensorIndex {
-            name: "litert.bundle".to_string(),
-            offset_bytes: LITERT_OFFSET,
-            nbytes: litert_nbytes as u64,
-            shape: vec![litert_nbytes],
-            dtype: "u8".to_string(),
-        }],
-    };
-    let header_bytes = serde_json::to_vec(&header)?;
-    if 10usize
-        .checked_add(header_bytes.len())
-        .ok_or_else(|| anyhow::anyhow!("header length overflow"))?
-        > LITERT_OFFSET as usize
-    {
-        anyhow::bail!(
-            "header is too large for fixed litert offset (header_end={}, offset={})",
-            10 + header_bytes.len(),
-            LITERT_OFFSET
-        );
-    }
-
-    let mut out = BufWriter::new(
-        File::create(&args.output).with_context(|| format!("create {:?}", args.output))?,
-    );
-    out.write_all(b"CELLM")?;
-    out.write_all(&[1u8])?;
-    out.write_all(&(header_bytes.len() as u32).to_le_bytes())?;
-    out.write_all(&header_bytes)?;
-    let cur = 10u64 + header_bytes.len() as u64;
-    let pad = (LITERT_OFFSET as usize)
-        .checked_sub(cur as usize)
-        .ok_or_else(|| anyhow::anyhow!("negative pad while writing litert bundle"))?;
-    if pad > 0 {
-        out.write_all(&vec![0u8; pad])?;
-    }
-
-    let mut src = File::open(litertlm_path).with_context(|| format!("open {:?}", litertlm_path))?;
-    std::io::copy(&mut src, &mut out)
-        .with_context(|| format!("copy litert bundle {:?}", litertlm_path))?;
-    out.flush()?;
-
-    log::info!(
-        "Converted LiteRT-LM {:?} -> {:?} (embedded {} bytes)",
-        litertlm_path,
-        args.output,
-        litert_nbytes
-    );
-    Ok(())
-}
-
 fn handle_gguf_not_yet_supported(_args: &Args, gguf_path: &Path) -> Result<()> {
     let info = inspect_gguf_tensor_types(gguf_path)?;
     let mut summary: Vec<String> = info
@@ -668,8 +619,9 @@ struct GgufTypeScan {
 }
 
 fn inspect_gguf_tensor_types(path: &Path) -> Result<GgufTypeScan> {
-    let bytes = std::fs::read(path).with_context(|| format!("read {:?}", path))?;
-    let mut c = GgufCursor { b: &bytes, p: 0 };
+    let f = File::open(path).with_context(|| format!("open {:?}", path))?;
+    let mmap = unsafe { Mmap::map(&f).with_context(|| format!("mmap {:?}", path))? };
+    let mut c = GgufCursor { b: &mmap, p: 0 };
 
     let magic = c.read_exact(4)?;
     if magic != b"GGUF" {
@@ -894,17 +846,25 @@ struct ParsedGguf {
 
 #[derive(Debug, Clone)]
 struct GgufOutTensor {
-    src_name: String,
-    src_dims: Vec<usize>,
     name: String,
+    src_name: String,
     shape: Vec<usize>,
+    header_shape: Vec<usize>,
+    out_dtype: String,
+    src_dims: Vec<usize>,
     src_type: u32,
     src_offset: usize,
     src_nbytes: usize,
-    out_nbytes: usize,
     out_offset: u64,
-    layer_idx: Option<usize>,
+    out_nbytes: usize,
     reverse_2d: bool,
+    is_q8_head: bool,
+    layer_idx: Option<usize>,
+    op: TensorOp,
+}
+
+fn decode_gguf_all_f16(src: &[u8], src_type: u32, numel: usize) -> Result<Vec<u16>> {
+    decode_gguf_prefix_f16(src, src_type, numel, numel)
 }
 
 fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> Result<()> {
@@ -952,10 +912,19 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
     }
 
     let mut out_tensors: Vec<GgufOutTensor> = Vec::new();
+    // Safety valve: Gemma4 int4 conversion can stall on the large per-layer-input tensor family.
+    // Skip those tensors in this mode so conversion can complete on constrained machines.
+    let skip_gemma4_per_layer =
+        arch == "gemma4" && (args.quantize_int4_symmetric || args.quantize_int8_symmetric);
     for src in &parsed.tensors {
         let Some((dst_name, reverse_2d, layer_idx)) = map_fn(&src.name) else {
             continue;
         };
+        if skip_gemma4_per_layer
+            && (dst_name.starts_with("model.per_layer_") || dst_name.contains(".per_layer_"))
+        {
+            continue;
+        }
         let numel = src
             .dims
             .iter()
@@ -999,18 +968,119 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
             .checked_mul(2)
             .ok_or_else(|| anyhow::anyhow!("output nbytes overflow for {}", src.name))?;
 
+        let mut op = TensorOp::CopyAsF16;
+        let mut final_out_nbytes = out_nbytes;
+
+        // Apply quantization if requested and if the tensor is a candidate (usually 2D weights)
+        if args.quantize_int4_symmetric
+            && shape.len() == 2
+            && !is_quantization_excluded_name(&dst_name)
+        {
+            op = TensorOp::QuantizeI4Data;
+            // int4 is packed per row, so odd in_dim needs row-wise ceil(in_dim/2).
+            final_out_nbytes = i4_packed_nbytes_for_shape(&shape)?;
+            
+            // Push the main data tensor
+            out_tensors.push(GgufOutTensor {
+                src_name: src.name.clone(),
+                src_dims: src.dims.clone(),
+                name: dst_name.clone(),
+                shape: shape.clone(),
+                header_shape: shape.clone(),
+                out_dtype: "i4".to_string(),
+                src_type: src.ggml_type,
+                src_offset,
+                src_nbytes,
+                out_nbytes: final_out_nbytes,
+                out_offset: 0,
+                reverse_2d,
+                is_q8_head: false,
+                layer_idx,
+                op: TensorOp::QuantizeI4Data,
+            });
+
+            // Push a companion scales tensor
+            out_tensors.push(GgufOutTensor {
+                src_name: src.name.clone(),
+                src_dims: src.dims.clone(),
+                name: format!("{}.qscale", dst_name),
+                shape: shape.clone(), // Use 2D shape for Pass 2 processing
+                header_shape: vec![shape[0]], // Use 1D shape for header
+                out_dtype: "f16".to_string(),
+                src_type: src.ggml_type,
+                src_offset,
+                src_nbytes,
+                out_nbytes: shape[0] * 2, // f16
+                out_offset: 0,
+                reverse_2d,
+                is_q8_head: false,
+                layer_idx,
+                op: TensorOp::QuantizeI4Scales { weight_name: dst_name },
+            });
+            continue;
+        }
+
+        if args.quantize_int8_symmetric
+            && shape.len() == 2
+            && !is_quantization_excluded_name(&dst_name)
+        {
+            op = TensorOp::QuantizeI8Data;
+            final_out_nbytes = numel;
+
+            out_tensors.push(GgufOutTensor {
+                src_name: src.name.clone(),
+                src_dims: src.dims.clone(),
+                name: dst_name.clone(),
+                shape: shape.clone(),
+                header_shape: shape.clone(),
+                out_dtype: "i8".to_string(),
+                src_type: src.ggml_type,
+                src_offset,
+                src_nbytes,
+                out_nbytes: final_out_nbytes,
+                out_offset: 0,
+                reverse_2d,
+                is_q8_head: false,
+                layer_idx,
+                op: TensorOp::QuantizeI8Data,
+            });
+
+            out_tensors.push(GgufOutTensor {
+                src_name: src.name.clone(),
+                src_dims: src.dims.clone(),
+                name: format!("{}.qscale", dst_name),
+                shape: shape.clone(),
+                header_shape: vec![shape[0]],
+                out_dtype: "f16".to_string(),
+                src_type: src.ggml_type,
+                src_offset,
+                src_nbytes,
+                out_nbytes: shape[0] * 2,
+                out_offset: 0,
+                reverse_2d,
+                is_q8_head: false,
+                layer_idx,
+                op: TensorOp::QuantizeI8Scales { weight_name: dst_name },
+            });
+            continue;
+        }
+
         out_tensors.push(GgufOutTensor {
             src_name: src.name.clone(),
             src_dims: src.dims.clone(),
             name: dst_name,
-            shape,
+            shape: shape.clone(),
+            header_shape: shape,
+            out_dtype: "f16".to_string(),
             src_type: src.ggml_type,
             src_offset,
             src_nbytes,
-            out_nbytes,
+            out_nbytes: final_out_nbytes,
             out_offset: 0,
-            layer_idx,
             reverse_2d,
+            is_q8_head: false,
+            layer_idx,
+            op,
         });
     }
 
@@ -1035,7 +1105,11 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
     let mapped_names: std::collections::HashSet<&str> =
         out_tensors.iter().map(|t| t.name.as_str()).collect();
     let mut missing: Vec<String> = Vec::new();
-    for req in required_fn(num_layers) {
+    let mut required = required_fn(num_layers);
+    if skip_gemma4_per_layer {
+        required.retain(|n| !(n.starts_with("model.per_layer_") || n.contains(".per_layer_")));
+    }
+    for req in required {
         if !mapped_names.contains(req.as_str()) {
             missing.push(req);
         }
@@ -1131,7 +1205,7 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
                 offset_bytes: p.out_offset,
                 nbytes: p.out_nbytes as u64,
                 shape: p.shape.clone(),
-                dtype: "f16".to_string(),
+                dtype: p.out_dtype.clone(),
             })
             .collect();
         let header_bytes = serde_json::to_vec(&header)?;
@@ -1155,7 +1229,7 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
             offset_bytes: p.out_offset,
             nbytes: p.out_nbytes as u64,
             shape: p.shape.clone(),
-            dtype: "f16".to_string(),
+            dtype: p.out_dtype.clone(),
         })
         .collect();
     let header_bytes = serde_json::to_vec(&header)?;
@@ -1179,7 +1253,7 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
     }
 
     let out = File::create(&args.output).with_context(|| format!("create {:?}", args.output))?;
-    let mut w = BufWriter::new(out);
+    let mut w = BufWriter::with_capacity(65536, out);
     w.write_all(b"CELLM")?;
     w.write_all(&[1u8])?;
     w.write_all(&(header_bytes.len() as u32).to_le_bytes())?;
@@ -1191,7 +1265,11 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
         pos = aligned;
     }
 
-    for p in &planned {
+    log::info!("Pass 2: Writing {} tensors to {:?}...", planned.len(), args.output);
+    for (idx, p) in planned.iter().enumerate() {
+        if idx % 10 == 0 || p.out_nbytes > 100_000_000 {
+            log::info!("[{:3}/{}] Writing {:<40} ({} MB)...", idx + 1, out_tensors.len(), p.name, p.out_nbytes / 1024 / 1024);
+        }
         if pos < p.out_offset {
             w.write_all(&vec![0u8; (p.out_offset - pos) as usize])?;
             pos = p.out_offset;
@@ -1202,7 +1280,35 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
             .iter()
             .try_fold(1usize, |acc, &d| acc.checked_mul(d))
             .ok_or_else(|| anyhow::anyhow!("numel overflow for {}", p.name))?;
-        write_gguf_tensor_as_f16(src, p.src_type, numel, &mut w)?;
+        
+        match &p.op {
+            TensorOp::CopyAsF16 => {
+                write_gguf_tensor_as_f16(src, p.src_type, numel, &mut w)?;
+            }
+            TensorOp::QuantizeI4Data => {
+                // First decode GGUF specialized quant to f16, then re-quant to cellm int4
+                let f16_data = decode_gguf_all_f16(src, p.src_type, numel)?;
+                write_quant_i4_data_per_row_symmetric(cast_slice(&f16_data), &p.shape, Dtype::F16, &mut w)?;
+            }
+            TensorOp::QuantizeI4Scales { weight_name: _ } => {
+                // Similar for scales
+                let f16_data = decode_gguf_all_f16(src, p.src_type, numel)?;
+                write_quant_i4_scales_per_row_symmetric(cast_slice(&f16_data), &p.shape, Dtype::F16, &mut w)?;
+            }
+            TensorOp::QuantizeI8Data => {
+                let f16_data = decode_gguf_all_f16(src, p.src_type, numel)?;
+                write_quant_i8_data_per_row_symmetric(cast_slice(&f16_data), &p.shape, Dtype::F16, &mut w)?;
+            }
+            TensorOp::QuantizeI8Scales { weight_name: _ } => {
+                let f16_data = decode_gguf_all_f16(src, p.src_type, numel)?;
+                write_quant_i8_scales_per_row_symmetric(cast_slice(&f16_data), &p.shape, Dtype::F16, &mut w)?;
+            }
+            _ => {
+                // Fallback to f16 for now
+                write_gguf_tensor_as_f16(src, p.src_type, numel, &mut w)?;
+            }
+        }
+        
         pos += p.out_nbytes as u64;
     }
     w.flush()?;
@@ -1422,6 +1528,7 @@ fn validate_gguf_logits_parity(
     );
     Ok(())
 }
+
 
 fn decode_gguf_prefix_f16(
     src: &[u8],
@@ -2584,8 +2691,15 @@ fn build_tensor_plans(
     group_size: usize,
     quantize_int8_symmetric: bool,
     quantize_int4_symmetric: bool,
+    gemma4_aggressive_int4: bool,
+    gemma4_balanced_int4: bool,
+    gemma4_awq_lite_int4: bool,
+    gemma4_mixed_i8_i4: bool,
+    gemma4_int4_exclude_layers: &std::collections::HashSet<usize>,
+    gemma4_mixed_i8_attn_layers: &std::collections::HashSet<usize>,
     text_only: bool,
     model_type: &str,
+    model_num_layers: usize,
 ) -> Result<Vec<TensorPlan>> {
     let mmaps = mmap_all(paths)?;
     let mut plans: Vec<TensorPlan> = Vec::new();
@@ -2627,12 +2741,30 @@ fn build_tensor_plans(
                     );
                 }
             } else if quantize_int8_symmetric
-                && should_quantize_i8_weight(model_type, name, &shape)
+                && should_quantize_i8_weight(
+                    model_type,
+                    name,
+                    &shape,
+                    gemma4_mixed_i8_i4,
+                    gemma4_int4_exclude_layers,
+                    gemma4_mixed_i8_attn_layers,
+                )
             {
                 out_dtype = "i8".to_string();
                 TensorOp::QuantizeI8Data
             } else if quantize_int4_symmetric
-                && should_quantize_i4_weight(model_type, name, &shape)
+                && should_quantize_i4_weight(
+                    model_type,
+                    name,
+                    &shape,
+                    gemma4_aggressive_int4,
+                    gemma4_balanced_int4,
+                    gemma4_awq_lite_int4,
+                    gemma4_mixed_i8_i4,
+                    gemma4_int4_exclude_layers,
+                    gemma4_mixed_i8_attn_layers,
+                    model_num_layers,
+                )
             {
                 out_dtype = "i4".to_string();
                 TensorOp::QuantizeI4Data
@@ -2661,7 +2793,7 @@ fn build_tensor_plans(
             let out_nbytes = if out_dtype == "i8" {
                 numel
             } else if out_dtype == "i4" {
-                numel.div_ceil(2)
+                i4_packed_nbytes_for_shape(&out_shape)?
             } else {
                 numel * 2
             };
@@ -2680,7 +2812,8 @@ fn build_tensor_plans(
 
             plans.push(TensorPlan {
                 name: name.to_string(),
-                shape: out_shape,
+                shape: out_shape.clone(),
+                header_shape: out_shape,
                 file_idx,
                 offset_bytes: 0,
                 out_nbytes,
@@ -2693,6 +2826,7 @@ fn build_tensor_plans(
                 plans.push(TensorPlan {
                     name: format!("{name}.qscale"),
                     shape: vec![out_dim],
+                    header_shape: vec![out_dim],
                     file_idx,
                     offset_bytes: 0,
                     out_nbytes: out_dim * 2,
@@ -2706,6 +2840,7 @@ fn build_tensor_plans(
                 plans.push(TensorPlan {
                     name: format!("{name}.qscale"),
                     shape: vec![out_dim],
+                    header_shape: vec![out_dim],
                     file_idx,
                     offset_bytes: 0,
                     out_nbytes: out_dim * 2,
@@ -2726,6 +2861,22 @@ fn build_tensor_plans(
 fn align_up(v: u64, align: u64) -> u64 {
     debug_assert!(align.is_power_of_two());
     (v + (align - 1)) & !(align - 1)
+}
+
+fn i4_packed_nbytes_for_shape(shape: &[usize]) -> Result<usize> {
+    if shape.len() != 2 {
+        anyhow::bail!("i4 packed byte size expects 2D shape, got {shape:?}");
+    }
+    let rows = shape[0];
+    let cols = shape[1];
+    rows.checked_mul(cols.div_ceil(2))
+        .ok_or_else(|| anyhow::anyhow!("i4 packed byte size overflow for shape={shape:?}"))
+}
+
+fn is_quantization_excluded_name(name: &str) -> bool {
+    name.contains("norm")
+        || name.contains("per_layer_model_proj")
+        || name.contains("lm_head")
 }
 
 fn infer_tensor_prefixes(
@@ -2788,13 +2939,14 @@ fn should_quantize_i8_qwen_weight(name: &str, shape: &[usize]) -> bool {
     let in_qwen_layer = name.contains("language_model.model.layers.")
         || name.contains("model.layers.")
         || name.contains("model.text_model.layers.")
-        || name.contains("model.language_model.layers.");
+        || name.contains("model.language_model.layers.")
+        || name == "model.embed_tokens.weight"
+        || name == "lm_head.weight"
+        || name == "model.lm_head.weight";
     if !in_qwen_layer {
         return false;
     }
-    if name.contains("embed_tokens")
-        || name.contains("lm_head")
-        || name.contains("norm")
+    if name.contains("norm")
         || name.contains("conv1d")
     {
         return false;
@@ -2811,7 +2963,9 @@ fn should_quantize_i8_gemma_weight(name: &str, shape: &[usize]) -> bool {
     if shape.len() != 2 || !name.ends_with(".weight") {
         return false;
     }
-    let in_gemma_layer = name.contains("model.layers.") || name.contains("model.text_model.layers.");
+    let in_gemma_layer = name.contains("model.layers.")
+        || name.contains("model.text_model.layers.")
+        || name.contains("model.language_model.layers.");
     if !in_gemma_layer {
         return false;
     }
@@ -2826,35 +2980,273 @@ fn should_quantize_i8_gemma_weight(name: &str, shape: &[usize]) -> bool {
     name.contains(".self_attn.") || name.contains(".mlp.")
 }
 
+fn should_quantize_i4_gemma_weight(name: &str, shape: &[usize]) -> bool {
+    if shape.len() != 2 || !name.ends_with(".weight") {
+        return false;
+    }
+    // Mixed strategy for Gemma: quantize only MLP linears, keep
+    // attention projections + embeddings + lm_head in higher precision.
+    if !name.contains(".mlp.") {
+        return false;
+    }
+    name.starts_with("model.layers.")
+        || name.starts_with("model.language_model.")
+        || name.starts_with("model.text_model.")
+}
+
 fn should_quantize_i4_qwen_weight(name: &str, shape: &[usize]) -> bool {
     if shape.len() != 2 || !name.ends_with(".weight") {
         return false;
     }
-    // Quantize all 2D text tensors for aggressive size reduction, including
-    // embeddings, LM head, attention/MLP linears, and linear-attn projections.
-    name.starts_with("model.language_model.")
-        || name.starts_with("language_model.model.")
-        || name.starts_with("model.text_model.")
+    // Mixed strategy for Qwen: quantize MLP linears, keep attention projections
+    // and embeddings in f16 for better generation quality at modest size.
+    if name.contains(".mlp.") {
+        return name.starts_with("model.layers.")
+            || name.starts_with("model.language_model.")
+            || name.starts_with("language_model.model.")
+            || name.starts_with("model.text_model.");
+    }
+    false
 }
 
-fn should_quantize_i8_weight(model_type: &str, name: &str, shape: &[usize]) -> bool {
-    if model_type == "llama" {
+fn should_quantize_i8_weight(
+    model_type: &str,
+    name: &str,
+    shape: &[usize],
+    gemma4_mixed_i8_i4: bool,
+    gemma4_int4_exclude_layers: &std::collections::HashSet<usize>,
+    gemma4_mixed_i8_attn_layers: &std::collections::HashSet<usize>,
+) -> bool {
+    if model_type == "llama" || model_type == "smollm3" {
         return should_quantize_i8_llama_weight(name, shape);
     }
     if model_type.starts_with("qwen") {
         return should_quantize_i8_qwen_weight(name, shape);
     }
     if model_type.starts_with("gemma") {
+        if model_type.starts_with("gemma4") && gemma4_mixed_i8_i4 {
+            if shape.len() != 2 || !name.ends_with(".weight") {
+                return false;
+            }
+            if name.contains("norm")
+                || name.contains("q_norm")
+                || name.contains("k_norm")
+                || name.contains("embed_tokens")
+                || name.contains("lm_head")
+                || name.contains("per_layer_token_embd")
+                || name.contains("embed_tokens_per_layer")
+                || name.contains("per_layer_model_proj")
+                || name.contains("per_layer_proj_norm")
+            {
+                return false;
+            }
+            if !(name.starts_with("model.layers.")
+                || name.starts_with("model.language_model.layers.")
+                || name.starts_with("model.text_model.layers."))
+            {
+                return false;
+            }
+            if let Some(i) = extract_layer_index(name) {
+                if gemma4_int4_exclude_layers.contains(&i) {
+                    return false;
+                }
+                if !gemma4_mixed_i8_attn_layers.is_empty()
+                    && !gemma4_mixed_i8_attn_layers.contains(&i)
+                {
+                    return false;
+                }
+            }
+            return name.contains(".self_attn.");
+        }
         return should_quantize_i8_gemma_weight(name, shape);
     }
     false
 }
 
-fn should_quantize_i4_weight(model_type: &str, name: &str, shape: &[usize]) -> bool {
+fn should_quantize_i4_weight(
+    model_type: &str,
+    name: &str,
+    shape: &[usize],
+    gemma4_aggressive_int4: bool,
+    gemma4_balanced_int4: bool,
+    gemma4_awq_lite_int4: bool,
+    gemma4_mixed_i8_i4: bool,
+    gemma4_int4_exclude_layers: &std::collections::HashSet<usize>,
+    gemma4_mixed_i8_attn_layers: &std::collections::HashSet<usize>,
+    model_num_layers: usize,
+) -> bool {
     if model_type.starts_with("qwen") {
         return should_quantize_i4_qwen_weight(name, shape);
     }
+    if model_type.starts_with("gemma") {
+        if model_type.starts_with("gemma4") && gemma4_aggressive_int4 {
+            if shape.len() != 2 || !name.ends_with(".weight") {
+                return false;
+            }
+            // Keep normalization-like / special routing tensors in f16.
+            if name.contains("norm")
+                || name.contains("q_norm")
+                || name.contains("k_norm")
+                || name.contains("rope_freqs")
+                || name.contains("layer_output_scale")
+                || name.contains("per_layer_proj_norm")
+            {
+                return false;
+            }
+            // Restrict to text stack tensors only.
+            let is_text_stack = name.starts_with("model.layers.")
+                || name.starts_with("model.language_model.")
+                || name.starts_with("model.text_model.")
+                || name.contains("embed_tokens")
+                || name.contains("per_layer_token_embd")
+                || name.contains("per_layer_model_proj")
+                || name.contains("lm_head");
+            if let Some(i) = extract_layer_index(name) {
+                if gemma4_int4_exclude_layers.contains(&i) {
+                    return false;
+                }
+            }
+            return is_text_stack;
+        }
+        if model_type.starts_with("gemma4") && gemma4_balanced_int4 {
+            if shape.len() != 2 || !name.ends_with(".weight") {
+                return false;
+            }
+            if name.contains("norm")
+                || name.contains("q_norm")
+                || name.contains("k_norm")
+                || name.contains("rope_freqs")
+                || name.contains("layer_output_scale")
+                || name.contains("embed_tokens")
+                || name.contains("lm_head")
+                || name.contains("per_layer_token_embd")
+                || name.contains("embed_tokens_per_layer")
+                || name.contains("per_layer_model_proj")
+                || name.contains("per_layer_proj_norm")
+            {
+                return false;
+            }
+            // Balanced profile: quantize layer projections only.
+            let is_proj = name.starts_with("model.layers.")
+                || name.starts_with("model.language_model.layers.")
+                || name.starts_with("model.text_model.layers.");
+            if !is_proj {
+                return false;
+            }
+            if let Some(i) = extract_layer_index(name) {
+                if gemma4_int4_exclude_layers.contains(&i) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if model_type.starts_with("gemma4") && gemma4_awq_lite_int4 {
+            if shape.len() != 2 || !name.ends_with(".weight") {
+                return false;
+            }
+            // Keep critical tensors in higher precision.
+            if name.contains("norm")
+                || name.contains("q_norm")
+                || name.contains("k_norm")
+                || name.contains("rope_freqs")
+                || name.contains("layer_output_scale")
+                || name.contains("embed_tokens")
+                || name.contains("lm_head")
+                || name.contains("per_layer_token_embd")
+                || name.contains("embed_tokens_per_layer")
+                || name.contains("per_layer_model_proj")
+                || name.contains("per_layer_proj_norm")
+            {
+                return false;
+            }
+            // Restrict to decoder layer projections.
+            if !(name.starts_with("model.layers.")
+                || name.starts_with("model.language_model.layers.")
+                || name.starts_with("model.text_model.layers."))
+            {
+                return false;
+            }
+            // AWQ-lite sensitivity heuristic: keep first/last 2 layers in f16.
+            let idx = extract_layer_index(name);
+            if let Some(i) = idx {
+                if gemma4_int4_exclude_layers.contains(&i) {
+                    return false;
+                }
+                if i < 2 || (model_num_layers >= 2 && i + 2 >= model_num_layers) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if model_type.starts_with("gemma4") && gemma4_mixed_i8_i4 {
+            if shape.len() != 2 || !name.ends_with(".weight") {
+                return false;
+            }
+            if name.contains("norm")
+                || name.contains("q_norm")
+                || name.contains("k_norm")
+                || name.contains("embed_tokens")
+                || name.contains("lm_head")
+                || name.contains("per_layer_token_embd")
+                || name.contains("embed_tokens_per_layer")
+                || name.contains("per_layer_model_proj")
+                || name.contains("per_layer_proj_norm")
+            {
+                return false;
+            }
+            if !(name.starts_with("model.layers.")
+                || name.starts_with("model.language_model.layers.")
+                || name.starts_with("model.text_model.layers."))
+            {
+                return false;
+            }
+            if let Some(i) = extract_layer_index(name) {
+                if gemma4_int4_exclude_layers.contains(&i) {
+                    return false;
+                }
+            }
+            if name.contains(".mlp.") {
+                return true;
+            }
+            if name.contains(".self_attn.") {
+                if let Some(i) = extract_layer_index(name) {
+                    return !gemma4_mixed_i8_attn_layers.contains(&i);
+                }
+                return true;
+            }
+            return false;
+        }
+        return should_quantize_i4_gemma_weight(name, shape);
+    }
     false
+}
+
+fn extract_layer_index(name: &str) -> Option<usize> {
+    for pfx in ["model.layers.", "model.language_model.layers.", "model.text_model.layers."] {
+        if let Some(rest) = name.strip_prefix(pfx) {
+            let idx_str = rest.split('.').next()?;
+            return idx_str.parse::<usize>().ok();
+        }
+    }
+    None
+}
+
+fn parse_layer_index_list(s: Option<&str>) -> Result<std::collections::HashSet<usize>> {
+    let mut out = std::collections::HashSet::new();
+    let Some(raw) = s else {
+        return Ok(out);
+    };
+    for part in raw.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        let v: usize = p
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid layer index in --gemma4-int4-exclude-layers: {p}"))?;
+        out.insert(v);
+    }
+    Ok(out)
 }
 
 fn write_f32_as_f16(bytes: &[u8], w: &mut impl Write) -> Result<()> {
@@ -3074,6 +3466,16 @@ struct SelectedTextConfig {
 
 fn select_text_config(cfg: &HfConfigRoot) -> Result<SelectedTextConfig> {
     let nested = cfg.text_config.as_ref();
+    let parse_token_id = |v: Option<&Value>| -> Option<u32> {
+        let val = v?;
+        match val {
+            Value::Number(n) => n.as_u64().and_then(|x| u32::try_from(x).ok()),
+            Value::Array(arr) => arr
+                .iter()
+                .find_map(|x| x.as_u64().and_then(|n| u32::try_from(n).ok())),
+            _ => None,
+        }
+    };
 
     let need = |v: Option<usize>, n: &str| -> Result<usize> {
         v.with_context(|| format!("missing {n}"))
@@ -3113,11 +3515,49 @@ fn select_text_config(cfg: &HfConfigRoot) -> Result<SelectedTextConfig> {
         .or_else(|| nested.and_then(|t| t.rms_norm_eps))
         .unwrap_or(1e-5);
 
-    let rope_theta = cfg
-        .rope_theta
-        .or_else(|| nested.and_then(|t| t.rope_theta))
-        .or_else(|| nested.and_then(|t| t.rope_parameters.as_ref().and_then(|rp| rp.rope_theta)))
-        .unwrap_or(10000.0);
+    let text_model_type = cfg
+        .text_config
+        .as_ref()
+        .and_then(|t| t.model_type.as_deref());
+    let top_model_type = cfg.model_type.as_deref();
+    let is_gemma4_text = text_model_type
+        .or(top_model_type)
+        .map(|s| s.starts_with("gemma4"))
+        .unwrap_or(false);
+
+    let rope_theta = if is_gemma4_text {
+        cfg.rope_theta
+            .or_else(|| nested.and_then(|t| t.rope_theta))
+            .or_else(|| {
+                nested.and_then(|t| {
+                    t.rope_parameters
+                        .as_ref()
+                        .and_then(|rp| rp.full_attention.as_ref())
+                        .and_then(|v| v.rope_theta)
+                })
+            })
+            .or_else(|| {
+                nested.and_then(|t| {
+                    t.rope_parameters
+                        .as_ref()
+                        .and_then(|rp| rp.rope_theta)
+                })
+            })
+            .or_else(|| {
+                nested.and_then(|t| {
+                    t.rope_parameters
+                        .as_ref()
+                        .and_then(|rp| rp.sliding_attention.as_ref())
+                        .and_then(|v| v.rope_theta)
+                })
+            })
+            .unwrap_or(10000.0)
+    } else {
+        cfg.rope_theta
+            .or_else(|| nested.and_then(|t| t.rope_theta))
+            .or_else(|| nested.and_then(|t| t.rope_parameters.as_ref().and_then(|rp| rp.rope_theta)))
+            .unwrap_or(10000.0)
+    };
 
     let model_type = cfg
         .text_config
@@ -3136,11 +3576,9 @@ fn select_text_config(cfg: &HfConfigRoot) -> Result<SelectedTextConfig> {
         num_key_value_heads,
         rms_norm_eps,
         rope_theta,
-        bos_token_id: cfg
-            .bos_token_id
+        bos_token_id: parse_token_id(cfg.bos_token_id.as_ref())
             .or_else(|| nested.and_then(|t| t.bos_token_id)),
-        eos_token_id: cfg
-            .eos_token_id
+        eos_token_id: parse_token_id(cfg.eos_token_id.as_ref())
             .or_else(|| nested.and_then(|t| t.eos_token_id)),
         max_position_embeddings: cfg
             .max_position_embeddings

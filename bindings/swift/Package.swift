@@ -17,7 +17,8 @@ let package = Package(
             name: "CellmSmoke",
             dependencies: ["CellmSDK"],
             linkerSettings: [
-                .linkedFramework("Metal")
+                .linkedFramework("Metal"),
+                .linkedLibrary("c++")
             ]
         ),
         .binaryTarget(

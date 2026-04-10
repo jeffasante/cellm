@@ -1,9 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "ios"))]
-use std::process::Command;
+// use std::process::Command; // Removed as LiteRtProxy (which used it) is gone.
 
-use anyhow::Result;
 use cellm_cache::{KVCache, KvEncodingKind, KvStorageKind, PageTable};
 use cellm_core::KvCacheLayout;
 use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, qwen::QwenRunner, CellmFile, ModelConfig};
@@ -72,143 +71,6 @@ enum Runner {
     Llama(LlamaRunner),
     Gemma(GemmaRunner),
     Qwen(QwenRunner),
-    LiteRtProxy(LiteRtProxyRunner),
-}
-
-#[allow(dead_code)]
-struct LiteRtProxyRunner {
-    model_path: PathBuf,
-    tensor_name: String,
-}
-
-impl LiteRtProxyRunner {
-    fn run_prompt(&self, prompt: &str, backend: BackendKind) -> Result<String> {
-        if !allow_litert_proxy() {
-            anyhow::bail!(
-                "litertlm_proxy is disabled in Python-free mode. \
-Use native llama/gemma/qwen .cellm/.cellmd models, or set CELLM_ALLOW_LITERT_PROXY=1 to opt in explicitly."
-            );
-        }
-        self.run_prompt_multimodal(prompt, backend, None, None)
-    }
-
-    fn run_prompt_multimodal(
-        &self,
-        prompt: &str,
-        backend: BackendKind,
-        image_path: Option<&Path>,
-        audio_path: Option<&Path>,
-    ) -> Result<String> {
-        #[cfg(target_os = "ios")]
-        {
-            let _ = (prompt, backend, image_path, audio_path);
-            anyhow::bail!(
-                "litert proxy is not executable on iOS in this build (external litert-lm process spawning is unavailable on iOS). Use native cellm models for on-device iOS inference."
-            );
-        }
-
-        #[cfg(not(target_os = "ios"))]
-        {
-        let file = CellmFile::load(&self.model_path)?;
-        let bundle = file
-            .tensor_bytes(&self.tensor_name)
-            .map_err(|e| anyhow::anyhow!("litert proxy: failed to read embedded bundle: {e}"))?;
-
-        let temp_name = format!(
-            "cellm_sdk_litert_proxy_{}_{}.litertlm",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-        );
-        let temp_path = std::env::temp_dir().join(temp_name);
-        std::fs::write(&temp_path, bundle).map_err(|e| {
-            anyhow::anyhow!(
-                "litert proxy: failed to write temporary model {:?}: {e}",
-                temp_path
-            )
-        })?;
-
-        if image_path.is_some() || audio_path.is_some() {
-            let _ = std::fs::remove_file(&temp_path);
-            anyhow::bail!(
-                "litert proxy multimodal is not supported in Rust-only mode yet. Use text-only prompts for litert proxy models."
-            );
-        }
-
-        let bin = resolve_tool_bin("CELLM_LITERT_LM_BIN", ".venv-hf/bin/litert-lm", "litert-lm");
-        let litert_backend = match backend {
-            BackendKind::Cpu => "cpu",
-            BackendKind::Metal => {
-                let _ = std::fs::remove_file(&temp_path);
-                anyhow::bail!(
-                    "litert proxy gpu backend is disabled in cellm SDK because it routes through WebGPU. Use CPU for litert proxy models, or use native non-proxy .cellm/.cellmd models for strict Metal execution."
-                );
-            }
-        };
-        let mut cmd = Command::new(&bin);
-        cmd.arg("run")
-            .arg(&temp_path)
-            .arg("--prompt")
-            .arg(prompt)
-            .arg("-b")
-            .arg(litert_backend);
-        apply_litert_cpu_thread_tuning(&mut cmd, litert_backend);
-        let output = cmd
-            .output()
-            .map_err(|e| anyhow::anyhow!("litert proxy: failed to execute {:?}: {e}", bin))?;
-        let _ = std::fs::remove_file(&temp_path);
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "litert proxy: run failed with status {}: {}",
-                output.status,
-                stderr.trim()
-            );
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn resolve_tool_bin(env_var: &str, local_rel_path: &str, fallback: &str) -> PathBuf {
-    if let Ok(p) = std::env::var(env_var) {
-        let pb = PathBuf::from(p);
-        if pb.exists() {
-            return pb;
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        let candidate = cwd.join(local_rel_path);
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-    PathBuf::from(fallback)
-}
-
-fn apply_litert_cpu_thread_tuning(cmd: &mut Command, backend: &str) {
-    if backend != "cpu" {
-        return;
-    }
-    let has_tflite_threads = std::env::var_os("TFLITE_NUM_THREADS").is_some();
-    let has_omp_threads = std::env::var_os("OMP_NUM_THREADS").is_some();
-    if has_tflite_threads && has_omp_threads {
-        return;
-    }
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(4, 32)
-        .to_string();
-    if !has_tflite_threads {
-        cmd.env("TFLITE_NUM_THREADS", &threads);
-    }
-    if !has_omp_threads {
-        cmd.env("OMP_NUM_THREADS", &threads);
-    }
 }
 
 /// cellm public API engine.
@@ -234,7 +96,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(model_path: &Path, engine_cfg: EngineConfig) -> Result<Self> {
+    pub fn new(model_path: &Path, engine_cfg: EngineConfig) -> anyhow::Result<Self> {
         apply_turboquant_runtime_config(&engine_cfg);
         let selected_backend = resolve_backend(engine_cfg.backend);
         let file = CellmFile::load(model_path)?;
@@ -242,31 +104,9 @@ impl Engine {
 
         let text_model_type = effective_text_model_type(&header);
         let mut runner = match text_model_type.as_str() {
-            "llama" => Runner::Llama(LlamaRunner::load(model_path)?),
+            "llama" | "smollm3" => Runner::Llama(LlamaRunner::load(model_path)?),
             t if t.starts_with("gemma") => Runner::Gemma(GemmaRunner::load(model_path)?),
             t if t.starts_with("qwen") => Runner::Qwen(QwenRunner::load(model_path)?),
-            "litertlm_proxy" => {
-                if !allow_litert_proxy() {
-                    anyhow::bail!(
-                        "model_type=litertlm_proxy is disabled in Python-free mode. \
-This model requires external litert-lm process execution. \
-Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PROXY=1 to opt in explicitly."
-                    );
-                }
-                let tensor_name = if file.tensor_index("litert.bundle").is_some() {
-                    "litert.bundle".to_string()
-                } else {
-                    header
-                        .tensors
-                        .first()
-                        .map(|t| t.name.clone())
-                        .ok_or_else(|| anyhow::anyhow!("litertlm_proxy has no tensors"))?
-                };
-                Runner::LiteRtProxy(LiteRtProxyRunner {
-                    model_path: model_path.to_path_buf(),
-                    tensor_name,
-                })
-            }
             other => anyhow::bail!(
                 "unsupported model_type for Engine: model_type={} effective_text_model_type={other}",
                 header.model_type
@@ -289,7 +129,6 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                         anyhow::bail!("Llama full-metal backend requested but unavailable");
                     }
                 }
-                Runner::LiteRtProxy(_) => {}
             }
         }
 
@@ -297,23 +136,12 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             Runner::Llama(r) => r.config().clone(),
             Runner::Gemma(r) => r.config().clone(),
             Runner::Qwen(r) => r.config().clone(),
-            Runner::LiteRtProxy(_) => ModelConfig {
-                vocab_size: 0,
-                hidden_size: 0,
-                num_hidden_layers: 1,
-                num_attention_heads: 1,
-                num_key_value_heads: 1,
-                intermediate_size: 0,
-                rms_norm_eps: 1e-6,
-                rope_theta: 10_000.0,
-            },
         };
 
         let head_dim = match &runner {
             Runner::Llama(_) => cfg.hidden_size / cfg.num_attention_heads,
             Runner::Gemma(_) => infer_gemma_kv_head_dim(&file)?,
             Runner::Qwen(_) => infer_qwen_kv_head_dim(&file)?,
-            Runner::LiteRtProxy(_) => 1,
         };
 
         let layout = KvCacheLayout {
@@ -359,27 +187,21 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         }
     }
 
-    pub fn is_litert_proxy(&self) -> bool {
-        matches!(self.runner, Runner::LiteRtProxy(_))
-    }
-
-    pub fn generate_text_litert(&self, prompt: &str) -> Result<String> {
-        let Runner::LiteRtProxy(r) = &self.runner else {
-            anyhow::bail!("generate_text_litert is only supported for litertlm_proxy engines");
-        };
-        r.run_prompt(prompt, self.backend)
+    pub fn generate_text_litert(&mut self, _prompt: &str) -> anyhow::Result<String> {
+        anyhow::bail!("LiteRT proxy text generation is not enabled in this build")
     }
 
     pub fn generate_multimodal_litert(
-        &self,
-        prompt: &str,
-        image_path: Option<&Path>,
-        audio_path: Option<&Path>,
-    ) -> Result<String> {
-        let Runner::LiteRtProxy(r) = &self.runner else {
-            anyhow::bail!("generate_multimodal_litert is only supported for litertlm_proxy engines");
-        };
-        r.run_prompt_multimodal(prompt, self.backend, image_path, audio_path)
+        &mut self,
+        _prompt: &str,
+        _image_path: Option<&Path>,
+        _audio_path: Option<&Path>,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("LiteRT proxy multimodal generation is not enabled in this build")
+    }
+
+    pub fn is_litert_proxy(&self) -> bool {
+        false
     }
 
     pub fn create_session(&mut self) -> SessionId {
@@ -409,14 +231,14 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
     }
 
     /// Submit token ids (already-tokenized) and return the next token id (greedy).
-    pub fn submit_tokens(&mut self, id: SessionId, tokens: &[u32]) -> Result<u32> {
+    pub fn submit_tokens(&mut self, id: SessionId, tokens: &[u32]) -> anyhow::Result<u32> {
         let (next, _cache_hit) = self.submit_tokens_cached(id, tokens)?;
         Ok(next)
     }
 
     /// Submit token ids and optionally reuse cached prefill state for identical prompts.
     /// Returns `(next_token, cache_hit)`.
-    pub fn submit_tokens_cached(&mut self, id: SessionId, tokens: &[u32]) -> Result<(u32, bool)> {
+    pub fn submit_tokens_cached(&mut self, id: SessionId, tokens: &[u32]) -> anyhow::Result<(u32, bool)> {
         let temperature = self.temperature;
         let repeat_penalty = self.repeat_penalty;
         let repeat_window = self.repeat_window;
@@ -487,9 +309,6 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                 Runner::Qwen(r) => {
                     r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
                 }
-                Runner::LiteRtProxy(_) => {
-                    anyhow::bail!("submit_tokens is not supported for litertlm_proxy; use generate_text_litert");
-                }
             };
             if let Runner::Gemma(r) = &self.runner {
                 if r.is_gemma3_text() {
@@ -521,7 +340,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
     }
 
     /// Run a single decode step for the next scheduled session (greedy).
-    pub fn step_decode(&mut self) -> Result<Option<(SessionId, u32)>> {
+    pub fn step_decode(&mut self) -> anyhow::Result<Option<(SessionId, u32)>> {
         if self.thermal.should_pause_decode() || self.rr.is_empty() {
             return Ok(None);
         }
@@ -542,7 +361,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         Ok(None)
     }
 
-    pub fn cancel_session(&mut self, id: SessionId) -> Result<()> {
+    pub fn cancel_session(&mut self, id: SessionId) -> anyhow::Result<()> {
         self.rr.remove(id);
         let mut s = self
             .sessions
@@ -562,7 +381,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
     }
 
     /// Reset session decode state while preserving any cached prefill snapshot.
-    pub fn reset_session(&mut self, id: SessionId) -> Result<()> {
+    pub fn reset_session(&mut self, id: SessionId) -> anyhow::Result<()> {
         self.rr.remove(id);
         let s = self
             .sessions
@@ -600,7 +419,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         Ok(())
     }
 
-    pub fn suspend_session(&mut self, id: SessionId) -> Result<()> {
+    pub fn suspend_session(&mut self, id: SessionId) -> anyhow::Result<()> {
         let meta = self
             .session_meta
             .get_mut(&id)
@@ -611,7 +430,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         Ok(())
     }
 
-    pub fn resume_session(&mut self, id: SessionId) -> Result<()> {
+    pub fn resume_session(&mut self, id: SessionId) -> anyhow::Result<()> {
         let s = self
             .sessions
             .get(&id)
@@ -728,7 +547,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         None
     }
 
-    fn pump_decode_burst(&mut self, budget: usize) -> Result<usize> {
+    fn pump_decode_burst(&mut self, budget: usize) -> anyhow::Result<usize> {
         if budget == 0 {
             return Ok(0);
         }
@@ -769,7 +588,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         None
     }
 
-    fn decode_one_for_session(&mut self, id: SessionId) -> Result<Option<u32>> {
+    fn decode_one_for_session(&mut self, id: SessionId) -> anyhow::Result<Option<u32>> {
         let temperature = self.temperature;
         let repeat_penalty = self.repeat_penalty;
         let repeat_window = self.repeat_window;
@@ -788,7 +607,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             }
         };
 
-        let out = (|| -> Result<Option<u32>> {
+        let out = (|| -> anyhow::Result<Option<u32>> {
             if matches!(meta.state(), SessionState::Suspended | SessionState::Terminal) {
                 return Ok(None);
             }
@@ -803,9 +622,6 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                     r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?
                 }
                 Runner::Qwen(r) => r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
-                Runner::LiteRtProxy(_) => {
-                    anyhow::bail!("step_decode is not supported for litertlm_proxy; use generate_text_litert");
-                }
             };
             if let Runner::Gemma(r) = &self.runner {
                 if r.is_gemma3_text() {
@@ -862,12 +678,7 @@ fn effective_text_model_type(header: &cellm_model::CellmHeader) -> String {
     header.model_type.clone()
 }
 
-fn allow_litert_proxy() -> bool {
-    matches!(
-        std::env::var("CELLM_ALLOW_LITERT_PROXY").ok().as_deref(),
-        Some("1" | "true" | "TRUE" | "yes" | "YES")
-    )
-}
+// allow_litert_proxy() was removed.
 
 #[derive(Debug, Clone, Copy)]
 struct XorShift64(u64);
@@ -901,7 +712,7 @@ fn select_next_with_params(
     candidates: &[(u32, f32)],
     recent: &[u32],
     rng: &mut XorShift64,
-) -> Result<u32> {
+) -> anyhow::Result<u32> {
     if candidates.is_empty() {
         anyhow::bail!("no candidates");
     }
@@ -1046,7 +857,7 @@ pub struct SamplingParams {
     pub repeat_window: usize,
 }
 
-fn infer_qwen_kv_head_dim(file: &CellmFile) -> Result<usize> {
+fn infer_qwen_kv_head_dim(file: &CellmFile) -> anyhow::Result<usize> {
     let h = &file.header;
     let kv_heads = h.num_kv_heads.max(1);
     for t in &h.tensors {
@@ -1062,7 +873,7 @@ fn infer_qwen_kv_head_dim(file: &CellmFile) -> Result<usize> {
     )
 }
 
-fn infer_gemma_kv_head_dim(file: &CellmFile) -> Result<usize> {
+fn infer_gemma_kv_head_dim(file: &CellmFile) -> anyhow::Result<usize> {
     let h = &file.header;
     let kv_heads = h.num_kv_heads.max(1);
     let mut max_head_dim = 0usize;

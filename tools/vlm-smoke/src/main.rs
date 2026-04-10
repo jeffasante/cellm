@@ -22,6 +22,26 @@ struct Args {
     /// backend: cpu|metal
     #[arg(long, default_value = "metal")]
     backend: String,
+
+    /// max generated tokens
+    #[arg(long, default_value_t = 48)]
+    gen: usize,
+
+    /// sampling temperature (0 = greedy)
+    #[arg(long, default_value_t = 0.0)]
+    temperature: f32,
+
+    /// top-k for sampling
+    #[arg(long, default_value_t = 40)]
+    top_k: usize,
+
+    /// repetition penalty
+    #[arg(long, default_value_t = 1.1)]
+    repeat_penalty: f32,
+
+    /// repetition window
+    #[arg(long, default_value_t = 96)]
+    repeat_window: usize,
 }
 
 fn main() -> Result<()> {
@@ -35,11 +55,11 @@ fn main() -> Result<()> {
             cellm_sdk::ffi::cellm_engine_create_v3(
                 cstr(&model).as_ptr(),
                 16,
-                256,
-                40,
-                0.7,
-                1.15,
-                128,
+                args.gen as u32,
+                args.top_k as u32,
+                args.temperature,
+                args.repeat_penalty,
+                args.repeat_window as u32,
                 1,
                 1,
             )
@@ -47,11 +67,11 @@ fn main() -> Result<()> {
             cellm_sdk::ffi::cellm_engine_create_v3(
                 cstr(&model).as_ptr(),
                 16,
-                256,
-                40,
-                0.7,
-                1.15,
-                128,
+                args.gen as u32,
+                args.top_k as u32,
+                args.temperature,
+                args.repeat_penalty,
+                args.repeat_window as u32,
                 1,
                 0,
             )

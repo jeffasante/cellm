@@ -1,0 +1,4 @@
+backend,pass,prompt_idx,prompt,startup_s,prefill_tokens,prefill_s,prefill_tps,decode_tokens,decode_s,decode_tps,output_sanitized,status,error
+metal,1,1,"What is consciousness?",5.53,12,9.95,1.21,16,6.94,2.31,"This is a a profound and multifaceted question that touches upon the deepest realms of **",ok,
+metal,1,2,"What's twitch.com?",2.10,15,10.38,1.45,16,6.76,2.37,"It sounds like you are asking **\'What is Twitch.com?**  ",ok,
+metal,1,3,"Explain TCP vs UDP in simple terms.",1.94,16,13.06,1.23,16,14.11,1.13,"This is a great request! Let's break down the concepts of **TCP",ok,

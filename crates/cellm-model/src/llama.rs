@@ -3,7 +3,7 @@ use std::path::Path;
 use bytemuck::cast_slice;
 use cellm_cache::{KVCache, PageTable};
 use cellm_core::CoreError;
-use cellm_kernels::cpu_kernels::{rms_norm_f32, rope_inplace_f32};
+use cellm_kernels::cpu_kernels::{rms_norm_f32, rope_inplace_f32, rope_non_interleaved_inplace_f32};
 use cellm_kernels::metal::MetalMatmul;
 use cellm_kernels::{MetalKernels, MetalOps};
 use half::f16;
@@ -24,6 +24,7 @@ pub struct LlamaRunner {
     use_metal_mv: bool,
     use_metal_norm: bool,
     use_metal_rope: bool,
+    rope_interleaved: bool,
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     graph_state: Option<LlamaGraphState>,
 }
@@ -71,6 +72,12 @@ impl LlamaRunner {
             use_metal_rope: std::env::var("CELLM_LLAMA_USE_METAL_ROPE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            // Some HF Llama-family checkpoints (for example SmolLM2) use
+            // non-interleaved rotary embedding layout (rotate_half).
+            // Keep current interleaved default for backwards compatibility.
+            rope_interleaved: std::env::var("CELLM_LLAMA_ROPE_INTERLEAVED")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(true),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             graph_state: None,
         })
@@ -288,7 +295,7 @@ impl LlamaRunner {
 
         for layer in 0..self.max_layers {
             let use_metal_norm = self.metal_ops.is_some() && self.use_metal_norm;
-            let use_metal_rope = self.metal_ops.is_some() && self.use_metal_rope;
+            let use_metal_rope = self.metal_ops.is_some() && self.use_metal_rope && self.rope_interleaved;
 
             // Attention input norm.
             if use_metal_norm {
@@ -336,9 +343,12 @@ impl LlamaRunner {
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
                 ops.rope_adj_f32(&mut k, n_kv_heads, head_dim, pos, cfg.rope_theta)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
-            } else {
+            } else if self.rope_interleaved {
                 rope_inplace_f32(&mut q, n_heads, head_dim, pos, cfg.rope_theta);
                 rope_inplace_f32(&mut k, n_kv_heads, head_dim, pos, cfg.rope_theta);
+            } else {
+                rope_non_interleaved_inplace_f32(&mut q, n_heads, head_dim, pos, cfg.rope_theta);
+                rope_non_interleaved_inplace_f32(&mut k, n_kv_heads, head_dim, pos, cfg.rope_theta);
             }
 
             // Write new token K/V into paged cache.

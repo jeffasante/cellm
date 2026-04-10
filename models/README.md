@@ -9,30 +9,85 @@ tags:
 
 # Cellm Models Hub
 
-This repository contains a collection of optimized Large Language Models (LLMs) in the `.cellm` format. These models are specifically tuned for high-performance inference using the [Cellm](https://github.com/jeffasante/cellm) engine, featuring Metal-accelerated kernels and memory-mapped efficiency.
+This folder contains `.cellm` model artifacts tested with the Cellm Rust CLI.
 
 ## Models
 
-### Gemma 3 1B IT (Int8)
-- **Path**: `gemma-3-1b-it-int8/gemma-3-1b-it-int8.cellmd`
-- **Size**: 1.3 GB
-- **Type**: Quantized Int8 (Symmetric Weight-Only)
+### SmolLM2 360M Instruct (INT8)
+- **Path**: `models/smollm2-360m-int8-v1.cellm`
+- **Size**: ~391 MB
+- **Tokenizer**: `models/hf/smollm2-360m/tokenizer.json`
+- **Type**: INT8 symmetric weight-only
+- **Runtime note**: set `CELLM_LLAMA_ROPE_INTERLEAVED=0` when running SmolLM2
 
-### Gemma 4 2.3B IT (LiteRT)
-- **Path**: `gemma-4-2p3b-it-litert/gemma-4-2p3b-it-litert.cellm`
-- **Size**: 2.4 GB
-- **Type**: LiteRT-optimized for Cellm
+### Qwen2.5 0.5B Instruct (INT8)
+- **Path**: `models/qwen2.5-0.5b-int8-v1.cellm`
+- **Size**: ~472 MB
+- **Tokenizer**: `models/qwen2.5-0.5b-bnb4/tokenizer.json`
+- **Type**: INT8 symmetric weight-only
+
+### Gemma-3 1B IT (INT4, smallest)
+- **Path**: `models/gemma-3-1b-it-int4-v1.cellm`
+- **Size**: ~478 MB
+- **Tokenizer**: `models/hf/gemma-3-1b-it-full/tokenizer.json`
+- **Type**: INT4 symmetric weight-only
+
+### Gemma-3 1B IT (Mixed INT4, recommended)
+- **Path**: `models/gemma-3-1b-it-mixed-int4-v1.cellm`
+- **Size**: ~1.0 GB
+- **Tokenizer**: `models/hf/gemma-3-1b-it-full/tokenizer.json`
+- **Type**: Mixed precision (attention/embeddings higher precision, MLP mostly INT4)
+
+### Gemma-3 1B IT (INT8, most stable)
+- **Path**: `models/gemma-3-1b-it-int8-v1.cellm`
+- **Size**: ~1.2 GB
+- **Tokenizer**: `models/hf/gemma-3-1b-it-full/tokenizer.json`
+- **Type**: INT8 symmetric weight-only
 
 ## Usage
 
-You can use these models directly with the Cellm CLI or in your applications:
+From `.`, run:
 
 ```bash
-cellm run --model-path jeffasante/cellm-models/gemma-4-2p3b-it-litert/gemma-4-2p3b-it-litert.cellm
+CELLM_LLAMA_ROPE_INTERLEAVED=0 ./target/release/infer \
+  --model models/smollm2-360m-int8-v1.cellm \
+  --tokenizer models/hf/smollm2-360m/tokenizer.json \
+  --prompt "What is sycophancy?" \
+  --chat \
+  --chat-format auto \
+  --gen 48 \
+  --temperature 0 \
+  --backend metal \
+  --kv-encoding f16
+```
+
+```bash
+./target/release/infer \
+  --model models/qwen2.5-0.5b-int8-v1.cellm \
+  --tokenizer models/qwen2.5-0.5b-bnb4/tokenizer.json \
+  --prompt "What is sycophancy?" \
+  --chat \
+  --gen 64 \
+  --temperature 0 \
+  --backend metal \
+  --kv-encoding f16
+```
+
+```bash
+./target/release/infer \
+  --model models/gemma-3-1b-it-mixed-int4-v1.cellm \
+  --tokenizer models/hf/gemma-3-1b-it-full/tokenizer.json \
+  --prompt "What is consciousness?" \
+  --chat \
+  --chat-format plain \
+  --gen 48 \
+  --temperature 0 \
+  --backend metal \
+  --kv-encoding f16
 ```
 
 ## About Cellm
-Cellm is a high-performance inference engine for local LLMs, written in Rust with a focus on Metal GPU acceleration and minimal memory overhead.
+Cellm is a Rust-native inference runtime focused on mobile/desktop local LLM serving with Metal acceleration and memory-mapped model loading.
 
 ## License
-This model is subject to the **Gemma Terms of Use**. By downloading or using these weights, you agree to the terms listed at [ai.google.dev/gemma/terms](https://ai.google.dev/gemma/terms).
+Please follow each upstream model license (Qwen and Gemma terms) when redistributing weights and tokenizers.

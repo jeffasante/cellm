@@ -8,6 +8,7 @@ use cellm_kernels::MetalOps;
 use cellm_kernels::metal::MetalMatmul;
 use cellm_kernels::MetalKernels;
 use half::f16;
+use rayon::prelude::*;
 
 use crate::{CellmFile, ModelConfig};
 use serde_json::Value;
@@ -123,9 +124,14 @@ impl GemmaRunner {
             } else if is_gemma4_text {
                 // Gemma4 GGUF metadata defaults:
                 //   sliding_window=512, sliding_window_pattern=[T,T,T,T,F,...], rope.freq_base_swa=10000.
-                // Infer sliding mask directly from layer attention shape: smaller q_dim layers are SWA.
+                // Prefer explicit layer_types metadata from source config, then fallback
+                // to inferring sliding layers from smaller q_dim.
                 let max_q = max_q_dim.max(1);
-                let mask = layer_attn.iter().map(|s| s.q_dim < max_q).collect::<Vec<_>>();
+                let mask = infer_gemma4_sliding_mask_from_cfg(
+                    h.source_text_config.as_ref(),
+                    cfg.num_hidden_layers,
+                )
+                .unwrap_or_else(|| layer_attn.iter().map(|s| s.q_dim < max_q).collect::<Vec<_>>());
                 // Shared-KV layout varies by checkpoint/export. Prefer explicit metadata,
                 // then infer from missing trailing K/V projection tensors; otherwise disable.
                 let shared_kv = infer_gemma4_shared_kv_layers(
@@ -134,7 +140,12 @@ impl GemmaRunner {
                     cfg.num_hidden_layers,
                     h.source_text_config.as_ref(),
                 );
-                (512usize, usize::MAX, mask, shared_kv, 10_000.0f32)
+                let rope_theta_sliding = source_text_cfg_rope_theta(
+                    h.source_text_config.as_ref(),
+                    &["rope_parameters", "sliding_attention", "rope_theta"],
+                )
+                .unwrap_or(10_000.0);
+                (512usize, usize::MAX, mask, shared_kv, rope_theta_sliding)
             } else {
                 (usize::MAX, usize::MAX, Vec::new(), 0usize, cfg.rope_theta)
             };
@@ -481,6 +492,7 @@ impl GemmaRunner {
                 self.linear_f16_out_in(&x_norm, &q_name, q_dim, hidden, q_slice)?;
             }
 
+
             // ── Gemma per-head Q/K RMSNorm before RoPE ────────────────────────
             if use_metal_norm {
                 let qw = self.tensor_f16(
@@ -758,27 +770,37 @@ impl GemmaRunner {
             }
 
             if self.is_gemma4_text && !self.gemma4_disable_layer_output_scale {
-                let scale_name = self.resolve_name(&format!("model.layers.{layer}.layer_output_scale.weight"))?;
-                let scale = self.tensor_f16_by_exact_name(&scale_name)?;
-                if scale.len() == 1 {
-                    let s = f16::from_bits(scale[0]).to_f32();
-                    for i in 0..hidden {
-                        x[i] *= s;
+                let scale_candidates = [
+                    format!("model.layers.{layer}.layer_output_scale.weight"),
+                    format!("model.layers.{layer}.layer_scalar"),
+                ];
+                for cand in scale_candidates {
+                    if let Ok(scale_name) = self.resolve_name(&cand) {
+                        let scale = self.tensor_f16_by_exact_name(&scale_name)?;
+                        if scale.len() == 1 {
+                            let s = f16::from_bits(scale[0]).to_f32();
+                            for i in 0..hidden {
+                                x[i] *= s;
+                            }
+                        } else if scale.len() == hidden {
+                            for i in 0..hidden {
+                                let s = f16::from_bits(scale[i]).to_f32();
+                                x[i] *= s;
+                            }
+                        } else {
+                            return Err(CoreError::Backend(format!(
+                                "gemma: invalid layer scale shape at layer {} from {} (len={} expected 1 or {})",
+                                layer,
+                                scale_name,
+                                scale.len(),
+                                hidden
+                            )));
+                        }
+                        break;
                     }
-                } else if scale.len() == hidden {
-                    for i in 0..hidden {
-                        let s = f16::from_bits(scale[i]).to_f32();
-                        x[i] *= s;
-                    }
-                } else {
-                    return Err(CoreError::Backend(format!(
-                        "gemma: invalid layer_output_scale shape at layer {} (len={} expected 1 or {})",
-                        layer,
-                        scale.len(),
-                        hidden
-                    )));
                 }
             }
+
         }
 
         // Final norm.
@@ -800,8 +822,6 @@ impl GemmaRunner {
         let vocab = cfg.vocab_size;
         let k = top_k.max(1).min(vocab);
 
-        let use_metal_logits = self.metal_ops.is_some() && self.use_metal_logits;
-
         let lm_head_name = self.resolve_name("lm_head.weight");
         let maybe_lm_head = lm_head_name
             .as_ref()
@@ -815,6 +835,7 @@ impl GemmaRunner {
             .tensor_meta_by_exact_name(&lm_src_resolved)
             .ok_or_else(|| CoreError::Backend(format!("unknown tensor {}", lm_src_resolved)))?;
         let lm_dtype = lm_meta.dtype.clone();
+        let use_metal_logits = self.metal_ops.is_some() && self.use_metal_logits && lm_dtype != "i4";
 
         // Compute all vocab logits on GPU when Metal is active, otherwise CPU.
         let all_logits: Vec<f32>;
@@ -849,21 +870,64 @@ impl GemmaRunner {
             let lm_src_scales = if lm_dtype == "i8" {
                 Some(self.tensor_f16_by_exact_name(&format!("{lm_src_resolved}.qscale"))?)
             } else { None };
+            let lm_src_i4 = if lm_dtype == "i4" {
+                Some(self.tensor_u8_by_exact_name(&lm_src_resolved)?)
+            } else { None };
+            let lm_src_i4_scales = if lm_dtype == "i4" {
+                Some(self.tensor_f16_by_exact_name(&format!("{lm_src_resolved}.qscale"))?)
+            } else { None };
             let mut buf = vec![0.0f32; vocab];
-            for vid in 0..vocab {
-                let mut dot = 0.0f32;
-                if let Some(wf16) = lm_src_f16 {
-                    let row = &wf16[vid * hidden..(vid + 1) * hidden];
-                    for i in 0..hidden { dot += x_final[i] * f16::from_bits(row[i]).to_f32(); }
-                } else if let (Some(wi8), Some(scales)) = (lm_src_i8, lm_src_scales) {
-                    let row = &wi8[vid * hidden..(vid + 1) * hidden];
-                    let scale = f16::from_bits(scales[vid]).to_f32();
-                    for i in 0..hidden { dot += x_final[i] * (row[i] as f32) * scale; }
-                } else {
-                    return Err(CoreError::Backend(format!(
-                        "unsupported lm dtype {lm_dtype} for {lm_src_resolved}")));
+            if should_parallel_linear_cpu(vocab, hidden) {
+                buf.par_iter_mut().enumerate().for_each(|(vid, out_v)| {
+                    let mut dot = 0.0f32;
+                    if let Some(wf16) = lm_src_f16 {
+                        let row = &wf16[vid * hidden..(vid + 1) * hidden];
+                        for i in 0..hidden {
+                            dot += x_final[i] * f16::from_bits(row[i]).to_f32();
+                        }
+                    } else if let (Some(wi8), Some(scales)) = (lm_src_i8, lm_src_scales) {
+                        let row = &wi8[vid * hidden..(vid + 1) * hidden];
+                        let scale = f16::from_bits(scales[vid]).to_f32();
+                        for i in 0..hidden {
+                            dot += x_final[i] * (row[i] as f32) * scale;
+                        }
+                    } else if let (Some(wi4), Some(scales)) = (lm_src_i4, lm_src_i4_scales) {
+                        let row_stride = hidden.div_ceil(2);
+                        let row = &wi4[vid * row_stride..(vid + 1) * row_stride];
+                        let scale = f16::from_bits(scales[vid]).to_f32();
+                        dot = dot_i4_scaled_row(row, x_final.as_slice(), scale);
+                    }
+                    *out_v = dot;
+                });
+            } else {
+                for vid in 0..vocab {
+                    let mut dot = 0.0f32;
+                    if let Some(wf16) = lm_src_f16 {
+                        let row = &wf16[vid * hidden..(vid + 1) * hidden];
+                        for i in 0..hidden {
+                            dot += x_final[i] * f16::from_bits(row[i]).to_f32();
+                        }
+                    } else if let (Some(wi8), Some(scales)) = (lm_src_i8, lm_src_scales) {
+                        let row = &wi8[vid * hidden..(vid + 1) * hidden];
+                        let scale = f16::from_bits(scales[vid]).to_f32();
+                        for i in 0..hidden {
+                            dot += x_final[i] * (row[i] as f32) * scale;
+                        }
+                    } else if let (Some(wi4), Some(scales)) = (lm_src_i4, lm_src_i4_scales) {
+                        let row_stride = hidden.div_ceil(2);
+                        let row = &wi4[vid * row_stride..(vid + 1) * row_stride];
+                        let scale = f16::from_bits(scales[vid]).to_f32();
+                        dot = dot_i4_scaled_row(row, &x_final, scale);
+                    } else {
+                        dot = f32::NAN;
+                    }
+                    buf[vid] = dot;
                 }
-                buf[vid] = dot;
+            }
+            if buf.iter().any(|v| v.is_nan()) {
+                return Err(CoreError::Backend(format!(
+                    "unsupported lm dtype {lm_dtype} for {lm_src_resolved}"
+                )));
             }
             all_logits = buf;
         }
@@ -893,7 +957,7 @@ impl GemmaRunner {
                 }
             }
         }
-        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        top.sort_by(|a, b| b.1.total_cmp(&a.1));
         Ok(top)
     }
 
@@ -915,23 +979,62 @@ impl GemmaRunner {
         Ok(cast_slice(bytes))
     }
 
+    fn tensor_u8_by_exact_name(&self, resolved: &str) -> Result<&[u8], CoreError> {
+        self.file.tensor_bytes(resolved)
+    }
+
     fn tensor_meta_by_exact_name(&self, resolved: &str) -> Option<&crate::CellmTensorIndex> {
         self.file.tensor_index(resolved)
     }
 
     fn embed_token(&self, token: u32, out: &mut [f32]) -> Result<(), CoreError> {
         let hidden = out.len();
-        let embed = self.tensor_f16("model.embed_tokens.weight")?;
+        let name = "model.embed_tokens.weight";
+        let resolved = self.resolve_name(name)?;
+        let meta = self.tensor_meta_by_exact_name(&resolved).ok_or_else(|| {
+            CoreError::Backend(format!("unknown tensor {resolved}"))
+        })?;
         let vocab = self.cfg.vocab_size;
         let t = (token as usize) % vocab;
-        let row = &embed[t * hidden..(t + 1) * hidden];
+
         let embed_scale = if self.is_gemma4_text && self.gemma4_disable_embed_scale {
             1.0
         } else {
             (hidden as f32).sqrt()
         };
-        for i in 0..hidden {
-            out[i] = f16::from_bits(row[i]).to_f32() * embed_scale;
+
+        match meta.dtype.as_str() {
+            "f16" => {
+                let embed = self.tensor_f16_by_exact_name(&resolved)?;
+                let row = &embed[t * hidden..(t + 1) * hidden];
+                for i in 0..hidden {
+                    out[i] = f16::from_bits(row[i]).to_f32() * embed_scale;
+                }
+            }
+            "i8" => {
+                let embed = self.tensor_i8_by_exact_name(&resolved)?;
+                let scales = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
+                let scale = f16::from_bits(scales[t]).to_f32() * embed_scale;
+                let row = &embed[t * hidden..(t + 1) * hidden];
+                for i in 0..hidden {
+                    out[i] = (row[i] as f32) * scale;
+                }
+            }
+            "i4" => {
+                let embed = self.tensor_u8_by_exact_name(&resolved)?;
+                let scales = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
+                let scale = f16::from_bits(scales[t]).to_f32() * embed_scale;
+                let row_stride = hidden.div_ceil(2);
+                let row = &embed[t * row_stride..(t + 1) * row_stride];
+                for i in 0..hidden {
+                    out[i] = unpack_i4(row, i) * scale;
+                }
+            }
+            other => {
+                return Err(CoreError::Backend(format!(
+                    "unsupported embed dtype for {name}: {other}"
+                )));
+            }
         }
         Ok(())
     }
@@ -963,15 +1066,48 @@ impl GemmaRunner {
         let mut per_token = vec![0.0f32; per_total_dim];
         if let Some(tok) = token {
             let t = (tok as usize) % self.cfg.vocab_size;
-            let te = self.tensor_f16_by_exact_name(&token_embd_name)?;
-            let te_row = &te[t * per_total_dim..(t + 1) * per_total_dim];
             let scale = if self.gemma4_disable_per_token_embed_scale {
                 1.0
             } else {
                 (per_layer_dim as f32).sqrt()
             };
-            for i in 0..per_total_dim {
-                per_token[i] = f16::from_bits(te_row[i]).to_f32() * scale;
+            let te_meta = self
+                .tensor_meta_by_exact_name(&token_embd_name)
+                .ok_or_else(|| CoreError::Backend(format!("unknown tensor {token_embd_name}")))?;
+            match te_meta.dtype.as_str() {
+                "f16" => {
+                    let te = self.tensor_f16_by_exact_name(&token_embd_name)?;
+                    let te_row = &te[t * per_total_dim..(t + 1) * per_total_dim];
+                    for i in 0..per_total_dim {
+                        per_token[i] = f16::from_bits(te_row[i]).to_f32() * scale;
+                    }
+                }
+                "i8" => {
+                    let te = self.tensor_i8_by_exact_name(&token_embd_name)?;
+                    let te_scales =
+                        self.tensor_f16_by_exact_name(&format!("{token_embd_name}.qscale"))?;
+                    let row_scale = f16::from_bits(te_scales[t]).to_f32() * scale;
+                    let te_row = &te[t * per_total_dim..(t + 1) * per_total_dim];
+                    for i in 0..per_total_dim {
+                        per_token[i] = (te_row[i] as f32) * row_scale;
+                    }
+                }
+                "i4" => {
+                    let te = self.tensor_u8_by_exact_name(&token_embd_name)?;
+                    let te_scales =
+                        self.tensor_f16_by_exact_name(&format!("{token_embd_name}.qscale"))?;
+                    let row_scale = f16::from_bits(te_scales[t]).to_f32() * scale;
+                    let row_stride = per_total_dim.div_ceil(2);
+                    let te_row = &te[t * row_stride..(t + 1) * row_stride];
+                    for i in 0..per_total_dim {
+                        per_token[i] = unpack_i4(te_row, i) * row_scale;
+                    }
+                }
+                other => {
+                    return Err(CoreError::Backend(format!(
+                        "unsupported per-layer token embed dtype for {token_embd_name}: {other}"
+                    )));
+                }
             }
         }
 
@@ -1065,6 +1201,10 @@ impl GemmaRunner {
             )));
         }
         let dtype = meta.dtype.clone();
+        let disable_metal_i4 = self.is_gemma4_text
+            && std::env::var("CELLM_GEMMA4_I4_DISABLE_METAL_LINEAR")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
 
         // Fast path: use MetalOps matrix-vector kernels with internal GPU-side caching.
         if self.metal_ops.is_some() {
@@ -1097,11 +1237,22 @@ impl GemmaRunner {
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                     return Ok(());
                 }
+                "i4" => {
+                    if disable_metal_i4 {
+                        // Gemma4 INT4 currently runs faster on the CPU-parallel path than
+                        // the mixed CPU-unpack/GPU-matmul tiered path.
+                    } else {
+                        // Fall back to tiered matmul logic for i4 until MetalOps supports it directly.
+                    }
+                }
                 _ => {}
             }
         }
 
         if let GemmaLinearBackend::Metal { ctx } = &self.linear_backend {
+            if dtype == "i4" && disable_metal_i4 {
+                // Skip Metal linear for Gemma4 INT4 unless explicitly re-enabled.
+            } else {
             let max_cols = if in_dim == 0 {
                 1
             } else {
@@ -1130,6 +1281,49 @@ impl GemmaRunner {
                                 let row_idx = row_start + c;
                                 weight_t_chunk[i * cols_n + c] =
                                     f16::from_bits(w[row_idx * in_dim + i]).to_f32();
+                            }
+                        }
+                        let out_slice = &mut out_chunk[..cols_n];
+                        if ctx
+                            .matmul_row_major_f32(
+                                x,
+                                1,
+                                in_dim,
+                                &weight_t_chunk[..in_dim * cols_n],
+                                cols_n,
+                                out_slice,
+                            )
+                            .is_err()
+                        {
+                            metal_ok = false;
+                            break;
+                        }
+                        out[row_start..row_start + cols_n].copy_from_slice(out_slice);
+                        row_start += cols_n;
+                    }
+                }
+                "i4" => {
+                    let w = self.tensor_u8_by_exact_name(&resolved)?;
+                    let scales = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
+                    let row_stride = in_dim.div_ceil(2);
+                    if w.len() != out_dim * row_stride || scales.len() != out_dim {
+                        return Err(CoreError::Backend(format!(
+                            "weight {weight_name} i4/qscale len mismatch: w={} scales={} expected w={} scales={}",
+                            w.len(),
+                            scales.len(),
+                            out_dim * row_stride,
+                            out_dim
+                        )));
+                    }
+                    let mut row_start = 0usize;
+                    while row_start < out_dim {
+                        let cols_n = (out_dim - row_start).min(chunk_cols);
+                        for i in 0..in_dim {
+                            for c in 0..cols_n {
+                                let row_idx = row_start + c;
+                                let row = &w[row_idx * row_stride..(row_idx + 1) * row_stride];
+                                let scale = f16::from_bits(scales[row_idx]).to_f32();
+                                weight_t_chunk[i * cols_n + c] = unpack_i4(row, i) * scale;
                             }
                         }
                         let out_slice = &mut out_chunk[..cols_n];
@@ -1206,6 +1400,7 @@ impl GemmaRunner {
                     "gemma full-metal: linear kernel failed for {weight_name}; CPU fallback disabled"
                 )));
             }
+            }
         }
 
         match dtype.as_str() {
@@ -1218,13 +1413,24 @@ impl GemmaRunner {
                         out_dim * in_dim
                     )));
                 }
-                for j in 0..out_dim {
-                    let row = &w[j * in_dim..(j + 1) * in_dim];
-                    let mut acc = 0.0f32;
-                    for i in 0..in_dim {
-                        acc += x[i] * f16::from_bits(row[i]).to_f32();
+                if should_parallel_linear_cpu(out_dim, in_dim) {
+                    out.par_iter_mut().enumerate().for_each(|(j, out_j)| {
+                        let row = &w[j * in_dim..(j + 1) * in_dim];
+                        let mut acc = 0.0f32;
+                        for i in 0..in_dim {
+                            acc += x[i] * f16::from_bits(row[i]).to_f32();
+                        }
+                        *out_j = acc;
+                    });
+                } else {
+                    for j in 0..out_dim {
+                        let row = &w[j * in_dim..(j + 1) * in_dim];
+                        let mut acc = 0.0f32;
+                        for i in 0..in_dim {
+                            acc += x[i] * f16::from_bits(row[i]).to_f32();
+                        }
+                        out[j] = acc;
                     }
-                    out[j] = acc;
                 }
             }
             "i8" => {
@@ -1244,14 +1450,45 @@ impl GemmaRunner {
                         out_dim
                     )));
                 }
-                for j in 0..out_dim {
-                    let row = &w[j * in_dim..(j + 1) * in_dim];
-                    let scale = f16::from_bits(scales[j]).to_f32();
-                    let mut acc = 0.0f32;
-                    for i in 0..in_dim {
-                        acc += x[i] * ((row[i] as f32) * scale);
+                if should_parallel_linear_cpu(out_dim, in_dim) {
+                    out.par_iter_mut().enumerate().for_each(|(j, out_j)| {
+                        let row = &w[j * in_dim..(j + 1) * in_dim];
+                        let scale = f16::from_bits(scales[j]).to_f32();
+                        let mut acc = 0.0f32;
+                        for i in 0..in_dim {
+                            acc += x[i] * ((row[i] as f32) * scale);
+                        }
+                        *out_j = acc;
+                    });
+                } else {
+                    for j in 0..out_dim {
+                        let row = &w[j * in_dim..(j + 1) * in_dim];
+                        let scale = f16::from_bits(scales[j]).to_f32();
+                        let mut acc = 0.0f32;
+                        for i in 0..in_dim {
+                            acc += x[i] * ((row[i] as f32) * scale);
+                        }
+                        out[j] = acc;
                     }
-                    out[j] = acc;
+                }
+            }
+            "i4" => {
+                let w = self.tensor_u8_by_exact_name(&resolved)?;
+                let scales = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
+                let row_stride = in_dim.div_ceil(2);
+                if should_parallel_linear_cpu(out_dim, in_dim) {
+                    out.par_iter_mut().enumerate().for_each(|(j, out_j)| {
+                        let row = &w[j * row_stride..(j + 1) * row_stride];
+                        let scale = f16::from_bits(scales[j]).to_f32();
+                        *out_j = dot_i4_scaled_row(row, x, scale);
+                    });
+                } else {
+                    for j in 0..out_dim {
+                        let row = &w[j * row_stride..(j + 1) * row_stride];
+                        let scale = f16::from_bits(scales[j]).to_f32();
+                        let acc = dot_i4_scaled_row(row, x, scale);
+                        out[j] = acc;
+                    }
                 }
             }
             other => {
@@ -1264,19 +1501,30 @@ impl GemmaRunner {
     }
 
     fn resolve_name(&self, name: &str) -> Result<String, CoreError> {
-        if self.file.tensor_index(name).is_some() {
-            return Ok(name.to_string());
+        let mut candidates = vec![name.to_string()];
+        if let Some(base) = name.strip_suffix(".weight") {
+            candidates.push(format!("{base}.linear.weight"));
         }
-        if !self.tensor_prefix.is_empty() {
-            let prefixed = format!("{}{}", self.tensor_prefix, name);
-            if self.file.tensor_index(&prefixed).is_some() {
-                return Ok(prefixed);
+
+        for cand in candidates {
+            if self.file.tensor_index(&cand).is_some() {
+                return Ok(cand);
             }
-        }
-        if let Some(suffix) = name.strip_prefix("model.") {
-            let text_model = format!("model.text_model.{suffix}");
-            if self.file.tensor_index(&text_model).is_some() {
-                return Ok(text_model);
+            if !self.tensor_prefix.is_empty() {
+                let prefixed = format!("{}{}", self.tensor_prefix, cand);
+                if self.file.tensor_index(&prefixed).is_some() {
+                    return Ok(prefixed);
+                }
+            }
+            if let Some(suffix) = cand.strip_prefix("model.") {
+                let text_model = format!("model.text_model.{suffix}");
+                if self.file.tensor_index(&text_model).is_some() {
+                    return Ok(text_model);
+                }
+                let language_model = format!("model.language_model.{suffix}");
+                if self.file.tensor_index(&language_model).is_some() {
+                    return Ok(language_model);
+                }
             }
         }
         Err(CoreError::Backend(format!("unknown tensor {name}")))
@@ -1392,6 +1640,31 @@ impl GemmaRunner {
     }
 }
 
+fn should_parallel_linear_cpu(out_dim: usize, in_dim: usize) -> bool {
+    let elems = out_dim.saturating_mul(in_dim);
+    elems >= 262_144 && std::thread::available_parallelism().map(|n| n.get() > 1).unwrap_or(false)
+}
+
+fn dot_i4_scaled_row(row_packed: &[u8], x: &[f32], scale: f32) -> f32 {
+    let mut acc = 0.0f32;
+    let mut xi = 0usize;
+    for &b in row_packed {
+        if xi >= x.len() {
+            break;
+        }
+        let lo = ((b & 0x0f) as i8) - 8;
+        acc += x[xi] * ((lo as f32) * scale);
+        xi += 1;
+        if xi >= x.len() {
+            break;
+        }
+        let hi = ((b >> 4) as i8) - 8;
+        acc += x[xi] * ((hi as f32) * scale);
+        xi += 1;
+    }
+    acc
+}
+
 fn gelu_tanh_f32(x: f32) -> f32 {
     let k = 0.797_884_6f32;
     let c = 0.044_715f32;
@@ -1438,6 +1711,13 @@ fn detect_gemma_prefix(file: &CellmFile) -> Result<String, CoreError> {
     {
         return Ok(String::new());
     }
+    if file
+        .tensor_index("model.language_model.embed_tokens.weight")
+        .is_some()
+        && file.tensor_index("model.language_model.norm.weight").is_some()
+    {
+        return Ok(String::new());
+    }
     Err(CoreError::Backend(
         "missing required gemma tensors: model.embed_tokens.weight/model.norm.weight".into(),
     ))
@@ -1459,14 +1739,42 @@ fn infer_gemma_layer_attn_specs(
     let mut max_q_dim = 0usize;
     let mut max_kv_dim = 0usize;
     let mut max_ffn_dim = 0usize;
+
+    let resolve_meta = |name: &str| {
+        let mut candidates = vec![name.to_string()];
+        if let Some(base) = name.strip_suffix(".weight") {
+            candidates.push(format!("{base}.linear.weight"));
+        }
+        for cand in candidates {
+            if let Some(t) = file.tensor_index(&cand) {
+                return Some(t);
+            }
+            if !prefix.is_empty() {
+                let prefixed = format!("{prefix}{cand}");
+                if let Some(t) = file.tensor_index(&prefixed) {
+                    return Some(t);
+                }
+            }
+            if let Some(suffix) = cand.strip_prefix("model.") {
+                let text_model = format!("model.text_model.{suffix}");
+                if let Some(t) = file.tensor_index(&text_model) {
+                    return Some(t);
+                }
+                let language_model = format!("model.language_model.{suffix}");
+                if let Some(t) = file.tensor_index(&language_model) {
+                    return Some(t);
+                }
+            }
+        }
+        None
+    };
+
     for layer in 0..num_layers {
         let q_name = format!("{prefix}model.layers.{layer}.self_attn.q_proj.weight");
         let k_name = format!("{prefix}model.layers.{layer}.self_attn.k_proj.weight");
-        let q_meta = file
-            .tensor_index(&q_name)
+        let q_meta = resolve_meta(&q_name)
             .ok_or_else(|| CoreError::Backend(format!("gemma: missing tensor {q_name}")))?;
-        let k_meta = file
-            .tensor_index(&k_name)
+        let k_meta = resolve_meta(&k_name)
             .ok_or_else(|| CoreError::Backend(format!("gemma: missing tensor {k_name}")))?;
         if q_meta.shape.len() != 2 || k_meta.shape.len() != 2 {
             return Err(CoreError::Backend(format!(
@@ -1478,23 +1786,18 @@ fn infer_gemma_layer_attn_specs(
         let gate_name = format!("{prefix}model.layers.{layer}.mlp.gate_proj.weight");
         let up_name = format!("{prefix}model.layers.{layer}.mlp.up_proj.weight");
         let down_name = format!("{prefix}model.layers.{layer}.mlp.down_proj.weight");
-        let gate_meta = file
-            .tensor_index(&gate_name)
+        let gate_meta = resolve_meta(&gate_name)
             .ok_or_else(|| CoreError::Backend(format!("gemma: missing tensor {gate_name}")))?;
-        let up_meta = file
-            .tensor_index(&up_name)
+        let up_meta = resolve_meta(&up_name)
             .ok_or_else(|| CoreError::Backend(format!("gemma: missing tensor {up_name}")))?;
-        let down_meta = file
-            .tensor_index(&down_name)
+        let down_meta = resolve_meta(&down_name)
             .ok_or_else(|| CoreError::Backend(format!("gemma: missing tensor {down_name}")))?;
 
         let q_norm_name = format!("{prefix}model.layers.{layer}.self_attn.q_norm.weight");
         let k_norm_name = format!("{prefix}model.layers.{layer}.self_attn.k_norm.weight");
-        let q_norm_dim = file
-            .tensor_index(&q_norm_name)
+        let q_norm_dim = resolve_meta(&q_norm_name)
             .and_then(|t| (t.shape.len() == 1).then_some(t.shape[0]));
-        let k_norm_dim = file
-            .tensor_index(&k_norm_name)
+        let k_norm_dim = resolve_meta(&k_norm_name)
             .and_then(|t| (t.shape.len() == 1).then_some(t.shape[0]));
 
         let mut n_heads = default_n_heads;
@@ -1600,15 +1903,45 @@ fn infer_gemma_per_layer_input_spec(
     hidden_size: usize,
     num_layers: usize,
 ) -> Result<Option<GemmaPerLayerInputSpec>, CoreError> {
-    let cand = |name: &str| -> Option<String> {
-        if file.tensor_index(name).is_some() {
-            Some(name.to_string())
-        } else if !prefix.is_empty() {
-            let p = format!("{prefix}{name}");
-            file.tensor_index(&p).map(|_| p)
-        } else {
-            None
+    let candidates_for = |name: &str| -> Vec<String> {
+        let mut out = vec![name.to_string()];
+        match name {
+            "model.per_layer_token_embd.weight" => {
+                out.push("model.embed_tokens_per_layer.weight".to_string());
+            }
+            "model.per_layer_model_proj.weight" => {
+                out.push("model.per_layer_model_projection.weight".to_string());
+            }
+            "model.per_layer_proj_norm.weight" => {
+                out.push("model.per_layer_projection_norm.weight".to_string());
+            }
+            _ => {}
         }
+        out
+    };
+    let cand = |name: &str| -> Option<String> {
+        for base in candidates_for(name) {
+            if file.tensor_index(&base).is_some() {
+                return Some(base);
+            }
+            if !prefix.is_empty() {
+                let p = format!("{prefix}{base}");
+                if file.tensor_index(&p).is_some() {
+                    return Some(p);
+                }
+            }
+            if let Some(suffix) = base.strip_prefix("model.") {
+                let text_model = format!("model.text_model.{suffix}");
+                if file.tensor_index(&text_model).is_some() {
+                    return Some(text_model);
+                }
+                let language_model = format!("model.language_model.{suffix}");
+                if file.tensor_index(&language_model).is_some() {
+                    return Some(language_model);
+                }
+            }
+        }
+        None
     };
     let Some(token_embd_name) = cand("model.per_layer_token_embd.weight") else {
         return Ok(None);
@@ -1704,18 +2037,16 @@ fn infer_gemma_per_layer_input_spec(
             )));
         }
 
-        let scale_name = cand(&format!("model.layers.{layer}.layer_output_scale.weight"))
-            .ok_or_else(|| CoreError::Backend(format!(
-                "gemma: missing model.layers.{layer}.layer_output_scale.weight"
-            )))?;
-        let scale_meta = file.tensor_index(&scale_name).ok_or_else(|| {
-            CoreError::Backend(format!("gemma: missing tensor {}", scale_name))
-        })?;
-        if scale_meta.shape != vec![1] && scale_meta.shape != vec![hidden_size] {
-            return Err(CoreError::Backend(format!(
-                "gemma: layer_output_scale shape mismatch at layer {}: {:?}, expected [1] or [{}]",
-                layer, scale_meta.shape, hidden_size
-            )));
+        if let Some(scale_name) = cand(&format!("model.layers.{layer}.layer_output_scale.weight")) {
+            let scale_meta = file.tensor_index(&scale_name).ok_or_else(|| {
+                CoreError::Backend(format!("gemma: missing tensor {}", scale_name))
+            })?;
+            if scale_meta.shape != vec![1] && scale_meta.shape != vec![hidden_size] {
+                return Err(CoreError::Backend(format!(
+                    "gemma: layer_output_scale shape mismatch at layer {}: {:?}, expected [1] or [{}]",
+                    layer, scale_meta.shape, hidden_size
+                )));
+            }
         }
     }
     Ok(Some(GemmaPerLayerInputSpec {
@@ -1768,6 +2099,45 @@ fn source_text_cfg_usize(cfg: Option<&Value>, keys: &[&str]) -> Option<usize> {
     None
 }
 
+fn source_text_cfg_rope_theta(cfg: Option<&Value>, path: &[&str]) -> Option<f32> {
+    let mut cur = cfg?;
+    for key in path {
+        let Value::Object(obj) = cur else {
+            return None;
+        };
+        cur = obj.get(*key)?;
+    }
+    match cur {
+        Value::Number(n) => n.as_f64().map(|v| v as f32),
+        Value::String(s) => s.parse::<f32>().ok(),
+        _ => None,
+    }
+}
+
+fn infer_gemma4_sliding_mask_from_cfg(cfg: Option<&Value>, num_layers: usize) -> Option<Vec<bool>> {
+    let Value::Object(obj) = cfg? else {
+        return None;
+    };
+    let Value::Array(layer_types) = obj.get("layer_types")? else {
+        return None;
+    };
+    if layer_types.len() != num_layers {
+        return None;
+    }
+    let mut out = Vec::with_capacity(num_layers);
+    for v in layer_types {
+        let Value::String(s) = v else {
+            return None;
+        };
+        match s.as_str() {
+            "sliding_attention" => out.push(true),
+            "full_attention" => out.push(false),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 fn infer_gemma4_shared_kv_layers(
     file: &CellmFile,
     tensor_prefix: &str,
@@ -1808,4 +2178,14 @@ fn infer_gemma4_shared_kv_layers(
     } else {
         num_layers - first_missing
     }
+}
+
+fn unpack_i4(packed_row: &[u8], idx: usize) -> f32 {
+    let byte = packed_row[idx / 2];
+    let nibble = if idx % 2 == 0 {
+        byte & 0x0f
+    } else {
+        (byte >> 4) & 0x0f
+    };
+    (nibble as i8 - 8) as f32
 }

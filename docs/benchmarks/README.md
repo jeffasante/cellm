@@ -34,6 +34,35 @@ BACKENDS="cpu" tools/bench/run_llm_backend_matrix.sh
 
 Note: in restricted/sandboxed shells, Metal may be unavailable and report `n/a` for Metal rows.
 
+### Gemma4 mobile production profile (automated)
+
+```bash
+tools/bench/run_gemma4_mobile_profile.sh
+```
+
+Outputs:
+- Markdown summary table: `docs/benchmarks/runs/gemma4_mobile_profile_<timestamp>_summary.md`
+- Raw run CSV: `docs/benchmarks/runs/gemma4_mobile_profile_<timestamp>.csv`
+
+Useful overrides:
+
+```bash
+# Fast local smoke (CPU only)
+PASSES=1 BACKENDS="cpu" GEN_TOKENS=16 tools/bench/run_gemma4_mobile_profile.sh
+```
+
+```bash
+# Real Metal run (outside restricted sandbox)
+PASSES=1 BACKENDS="metal" GEN_TOKENS=16 tools/bench/run_gemma4_mobile_profile.sh
+```
+
+```bash
+# Custom model/tokenizer
+MODEL_PATH=models/gemma-4-E2B-it-int4-aggr-v5.cellmd \
+TOKENIZER_PATH=models/gemma-4-E2B-it/tokenizer.json \
+tools/bench/run_gemma4_mobile_profile.sh
+```
+
 ### Text benchmark (`infer`)
 
 ```bash

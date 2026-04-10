@@ -82,6 +82,35 @@ pub fn rope_inplace_f32(x: &mut [f32], n_heads: usize, head_dim: usize, pos: usi
     }
 }
 
+/// Rotary position embedding (non-interleaved / rotate_half style), applied in-place.
+///
+/// `x` is shaped [n_heads, head_dim] flattened. Pairs are formed between the
+/// first and second halves of each head: `(i, i + head_dim/2)`.
+pub fn rope_non_interleaved_inplace_f32(
+    x: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    pos: usize,
+    theta: f32,
+) {
+    debug_assert_eq!(x.len(), n_heads * head_dim);
+    debug_assert!(head_dim % 2 == 0, "head_dim must be even for RoPE");
+    let half = head_dim / 2;
+
+    for h in 0..n_heads {
+        let base = h * head_dim;
+        for i in 0..half {
+            let inv_freq = theta.powf(-(2.0 * i as f32) / head_dim as f32);
+            let angle = pos as f32 * inv_freq;
+            let (sin, cos) = angle.sin_cos();
+            let x0 = x[base + i];
+            let x1 = x[base + i + half];
+            x[base + i] = x0 * cos - x1 * sin;
+            x[base + i + half] = x0 * sin + x1 * cos;
+        }
+    }
+}
+
 /// Single-token grouped-query attention.
 ///
 /// - `q`: [n_heads, head_dim]
@@ -164,4 +193,3 @@ mod tests {
         assert!((out[0] - (1.0 * 7.0 + 2.0 * 9.0 + 3.0 * 11.0)).abs() < 1e-5);
     }
 }
-

@@ -3,7 +3,7 @@ use memmap2::Mmap;
 
 fn main() {
     let device = Device::system_default().unwrap();
-    let f = std::fs::File::open("models/README.md").unwrap();
+    let f = std::fs::File::open("../../models/README.md").unwrap();
     let mmap = unsafe { Mmap::map(&f).unwrap() };
     let ptr = mmap.as_ptr() as *mut std::ffi::c_void;
     let len = mmap.len() as u64;

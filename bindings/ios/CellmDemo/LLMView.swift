@@ -1232,12 +1232,20 @@ Assistant:
     private func downloadGemma4LiteRtAssets() {
         errorText = nil
         selectedSampleLabel = "Gemma-4-2P3B-IT (LiteRT)"
+        if let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bFileName),
+           let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma42p3bTokenizerFileName) {
+            modelURL = model
+            tokenizerURL = tok
+            downloadStatus = "Using existing files in Documents."
+            downloadProgress = 0
+            return
+        }
         downloadStatus = ""
         downloadProgress = 0
         currentDownloadFile = ""
         currentDownloadSizeText = ""
         isDownloading = false
-        errorText = "Gemma-4 LiteRT proxy is disabled in this iOS build (Python-free mode). Use native .cellm/.cellmd models."
+        errorText = "Please download the Gemma-4 LiteRT bundle from the Models Hub tab first."
     }
 
     private func downloadQwenModelOnly() {

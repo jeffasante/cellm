@@ -244,10 +244,8 @@ pub fn describe_image_with_cellm_timed(
             tok.token_to_id("<|turn>").is_some() && tok.token_to_id("<turn|>").is_some(),
         )
     };
-    let enc = tok
-        .encode(prompt, false)
-        .map_err(|e| anyhow::anyhow!("tokenize failed: {e}"))?;
-    let mut input_ids: Vec<i64> = enc.get_ids().iter().map(|&x| x as i64).collect();
+    let enc_ids = encode_with_explicit_added_tokens(&tok, &tokenizer_path, &prompt)?;
+    let mut input_ids: Vec<i64> = enc_ids.into_iter().map(|x| x as i64).collect();
     if gemma4_prefix_image {
         if let Some(bos) = file.header.bos_token_id.map(|v| v as i64) {
             if input_ids.first().copied() != Some(bos) {
@@ -2666,6 +2664,91 @@ fn load_vlm_processor_hints(model_path: &Path, tokenizer_path: &Path, tok: &Toke
     }
 
     hints
+}
+
+fn encode_with_explicit_added_tokens(
+    tok: &Tokenizer,
+    tokenizer_json_path: &Path,
+    text: &str,
+) -> Result<Vec<u32>> {
+    let added = load_added_token_ids(tokenizer_json_path)?;
+    if added.is_empty() {
+        let enc = tok
+            .encode(text, false)
+            .map_err(|e| anyhow::anyhow!("tokenize failed: {e}"))?;
+        return Ok(enc.get_ids().to_vec());
+    }
+
+    let mut specials: Vec<(&str, u32)> = added.iter().map(|(k, &v)| (k.as_str(), v)).collect();
+    specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+    let mut out: Vec<u32> = Vec::new();
+    let mut i = 0usize;
+    let mut chunk_start = 0usize;
+    let bytes = text.as_bytes();
+
+    while i < bytes.len() {
+        let rest = &text[i..];
+        let mut matched: Option<(&str, u32)> = None;
+        for &(token, id) in &specials {
+            if rest.starts_with(token) {
+                matched = Some((token, id));
+                break;
+            }
+        }
+
+        if let Some((token, id)) = matched {
+            if chunk_start < i {
+                let chunk = &text[chunk_start..i];
+                let enc = tok
+                    .encode(chunk, false)
+                    .map_err(|e| anyhow::anyhow!("tokenize failed: {e}"))?;
+                out.extend_from_slice(enc.get_ids());
+            }
+            out.push(id);
+            i += token.len();
+            chunk_start = i;
+        } else {
+            let ch = rest
+                .chars()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("tokenize failed: invalid utf-8 boundary"))?;
+            i += ch.len_utf8();
+        }
+    }
+
+    if chunk_start < text.len() {
+        let chunk = &text[chunk_start..];
+        let enc = tok
+            .encode(chunk, false)
+            .map_err(|e| anyhow::anyhow!("tokenize failed: {e}"))?;
+        out.extend_from_slice(enc.get_ids());
+    }
+
+    Ok(out)
+}
+
+fn load_added_token_ids(tokenizer_json_path: &Path) -> Result<HashMap<String, u32>> {
+    let bytes = std::fs::read(tokenizer_json_path).map_err(|e| {
+        anyhow::anyhow!("read tokenizer {:?} failed: {e}", tokenizer_json_path)
+    })?;
+    let v: Value = serde_json::from_slice(&bytes).map_err(|e| {
+        anyhow::anyhow!("parse tokenizer {:?} failed: {e}", tokenizer_json_path)
+    })?;
+
+    let mut out = HashMap::new();
+    if let Some(arr) = v.get("added_tokens").and_then(|x| x.as_array()) {
+        for item in arr {
+            let Some(content) = item.get("content").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            let Some(id) = item.get("id").and_then(|x| x.as_u64()) else {
+                continue;
+            };
+            out.insert(content.to_string(), id as u32);
+        }
+    }
+    Ok(out)
 }
 
 fn banned_token_ids(tok: &Tokenizer) -> Vec<i64> {

@@ -55,10 +55,14 @@ struct ChatView: View {
     @State private var runDiagnostics: String = ""
     @State private var isInitializing = false
     @FocusState private var isComposerFocused: Bool
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var generationTask: Task<Void, Never>?
+    @State private var initTask: Task<Void, Never>?
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            Color(.systemBackground).ignoresSafeArea()
             
             VStack(spacing: 0) {
                 premiumHeader
@@ -112,6 +116,18 @@ struct ChatView: View {
             initializeEngine()
         }
         .onChange(of: llmTokenizerURL) { _ in persistSharedSelection() }
+        .onChange(of: scenePhase) { phase in
+            guard phase != .active else { return }
+            generationTask?.cancel()
+            generationTask = nil
+            initTask?.cancel()
+            initTask = nil
+            if isRunning || isInitializing {
+                isRunning = false
+                isInitializing = false
+                errorText = "Generation stopped: app moved to background/inactive. Reopen app and send again."
+            }
+        }
     }
 
     private var diagnosticsBar: some View {
@@ -133,7 +149,7 @@ struct ChatView: View {
                 } label: {
                     Image(systemName: "chevron.left")
                         .font(.title3)
-                        .foregroundStyle(.gray)
+                        .foregroundStyle(.secondary)
                 }
                 
                 Spacer()
@@ -154,14 +170,14 @@ struct ChatView: View {
                     } label: {
                         Image(systemName: "slider.horizontal.3")
                             .font(.title3)
-                            .foregroundStyle(.gray)
+                            .foregroundStyle(.secondary)
                     }
                     Button {
                         // New Chat action
                     } label: {
                         Image(systemName: "plus.circle")
                             .font(.title3)
-                            .foregroundStyle(.gray)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -171,7 +187,7 @@ struct ChatView: View {
             // Model Selector Pill
             Menu {
                 Section("Smart Presets") {
-                    Button("Gemma-4-E4B-it (Native)") { selectGemma4E4BPreset() }
+                    Button("Gemma 3 (Stable)") { selectGemmaPreset() }
                     Button("Qwen 3.5 (Stable)") { selectQwenPreset() }
                     Button("SmolLM 2 (Fast)") { selectSmolPreset() }
                 }
@@ -191,9 +207,9 @@ struct ChatView: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
                 .background(Color(.systemGray6).opacity(0.1))
-                .foregroundStyle(.white)
+                .foregroundStyle(.primary)
                 .clipShape(Capsule())
-                .overlay(Capsule().stroke(Color.white.opacity(0.1), lineWidth: 0.5))
+                .overlay(Capsule().stroke(Color(.separator).opacity(0.35), lineWidth: 0.5))
             }
             
             // Initializing Status Pill
@@ -212,6 +228,17 @@ struct ChatView: View {
                 .clipShape(Capsule())
                 .transition(.opacity.combined(with: .scale))
             }
+
+            if let errorText, !errorText.isEmpty {
+                Text(errorText)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color.red.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .padding(.horizontal, 16)
+            }
         }
         .padding(.bottom, 16)
     }
@@ -220,12 +247,12 @@ struct ChatView: View {
         VStack(spacing: 12) {
             Text("AI Chat")
                 .font(.system(size: 40, weight: .medium, design: .rounded))
-                .foregroundStyle(.white)
+                .foregroundStyle(.primary)
             
             Text("Chat with an on-device large\nlanguage model")
                 .font(.title3)
                 .multilineTextAlignment(.center)
-                .foregroundStyle(.gray)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -253,11 +280,11 @@ struct ChatView: View {
                         pendingAudioURL = nil
                     } label: {
                         Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.gray)
+                            .foregroundStyle(.secondary)
                     }
                 }
                 .padding(8)
-                .background(Color.white.opacity(0.05))
+                .background(Color(.secondarySystemGroupedBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 10))
                 .padding(.horizontal, 16)
             }
@@ -271,29 +298,30 @@ struct ChatView: View {
                     Image(systemName: "plus")
                         .font(.title3.bold())
                         .padding(10)
-                        .background(Color.white.opacity(0.1))
-                        .foregroundStyle(.white)
+                        .background(Color(.secondarySystemGroupedBackground))
+                        .foregroundStyle(.primary)
                         .clipShape(Circle())
                 }
                 
                 ZStack(alignment: .leading) {
                     if inputText.isEmpty {
                         Text("Type prompt...")
-                            .foregroundColor(.gray)
+                            .foregroundStyle(.secondary)
                             .padding(.horizontal, 12)
                             .padding(.vertical, 14)
                     }
                     TextEditor(text: $inputText)
                         .scrollContentBackground(.hidden)
                         .background(Color.clear)
+                        .foregroundStyle(.primary)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 8)
-                        .frame(minHeight: 44, maxHeight: 120)
+                        .frame(minHeight: 44, maxHeight: 96)
                         .focused($isComposerFocused)
                 }
-                .background(Color.white.opacity(0.05))
+                .background(Color(.secondarySystemGroupedBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 24))
-                .overlay(RoundedRectangle(cornerRadius: 24).stroke(Color.white.opacity(0.1), lineWidth: 1))
+                .overlay(RoundedRectangle(cornerRadius: 24).stroke(Color(.separator).opacity(0.35), lineWidth: 1))
                 
                 Button {
                     sendMessage()
@@ -301,8 +329,8 @@ struct ChatView: View {
                     Image(systemName: "paperplane.fill")
                         .font(.title3)
                         .padding(12)
-                        .background(inputText.isEmpty || isRunning ? Color.white.opacity(0.05) : Color.white.opacity(0.15))
-                        .foregroundStyle(inputText.isEmpty || isRunning ? .gray : .white)
+                        .background(inputText.isEmpty || isRunning ? Color(.secondarySystemGroupedBackground) : Color.accentColor)
+                        .foregroundStyle(inputText.isEmpty || isRunning ? Color.secondary : Color.white)
                         .clipShape(Circle())
                 }
                 .disabled(inputText.isEmpty || isRunning)
@@ -428,8 +456,8 @@ struct ChatView: View {
             Text(msg.text)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
-                .background(msg.role == "User" ? Color.blue.opacity(0.2) : Color.white.opacity(0.08))
-                .foregroundStyle(.white)
+                .background(msg.role == "User" ? Color.accentColor.opacity(colorScheme == .dark ? 0.35 : 0.18) : Color(.secondarySystemGroupedBackground))
+                .foregroundStyle(.primary)
                 .clipShape(RoundedRectangle(cornerRadius: 18))
                 .textSelection(.enabled)
         }
@@ -437,6 +465,10 @@ struct ChatView: View {
     }
 
     private func sendMessage() {
+        guard scenePhase == .active else {
+            errorText = "Bring app to foreground before running Metal generation."
+            return
+        }
         dismissKeyboard()
         errorText = nil
         runDiagnostics = ""
@@ -465,14 +497,17 @@ struct ChatView: View {
         let assistantIndex = messages.count - 1
 
         let backend = selectedBackend
-        let textTranscript = conversationPrompt(maxTurns: 8, includeAssistantPlaceholder: true)
+        // Let model-specific prompt formatting in the engine handle role wrapping.
+        // Passing a raw transcript here can degrade quality for gemma_turn/chat templates.
+        let textPrompt = text
         let imagePrompt = vlmPrompt(userText: text)
         let currentVLMModelURL = vlmModelURL
         let currentLLMModelURL = llmModelURL
         let currentLLMTokenizerURL = llmTokenizerURL
         let currentAudioURL = attachedAudio
 
-        Task.detached(priority: .userInitiated) {
+        generationTask?.cancel()
+        generationTask = Task.detached(priority: .userInitiated) {
             do {
                 let initStart = Date()
                 var diag: [String] = []
@@ -484,21 +519,12 @@ struct ChatView: View {
                 let tok = try CellmTokenizer(tokenizerURL: llmTokenizerURL)
                 let initTokenizerMs = Date().timeIntervalSince(initTokenizerStart) * 1000.0
                 
-                // Log performance metrics
-                print("--- PERFORMANCE REPORT ---")
-                print("Model: \(selectedSampleLabel)")
-                print("Backend: \(engineBackend == BackendKind.Metal ? "Metal" : "CPU")")
-                print("Generation Latency: \(String(format: "%.0f ms", totalGenLatency * 1000.0))")
-                print("Tokens: \(totalGenTokens)")
-                print("Avg Speed: \(String(format: "%.2f t/s", avgSpeed))")
-                print("--------------------------")
-                
                 let eng = try CellmEngine(
                     modelURL: llmModelURL,
                     tokenizer: tok,
-                    topK: 20,
-                    temperature: 0.2,
-                    repeatPenalty: 1.08,
+                    topK: 1,
+                    temperature: 0.0,
+                    repeatPenalty: 1.12,
                     repeatWindow: 96,
                     backend: backend
                 )
@@ -533,8 +559,8 @@ struct ChatView: View {
                 }
 
                 let reply = try eng.generate(
-                    prompt: textTranscript,
-                    maxNewTokens: 128,
+                    prompt: textPrompt,
+                    maxNewTokens: 80,
                     thermalLevel: .nominal,
                     exerciseSuspendResume: false,
                     onToken: { piece in
@@ -562,6 +588,7 @@ struct ChatView: View {
                     runDiagnostics = diag.joined(separator: "\n")
                     messages[assistantIndex] = ChatMessage(role: "Assistant", text: prettyOutput(reply), imageData: nil, audioFileName: nil)
                     isRunning = false
+                    generationTask = nil
                 }
             } catch {
                 await MainActor.run {
@@ -571,6 +598,7 @@ struct ChatView: View {
                         messages[assistantIndex] = ChatMessage(role: "Assistant", text: "", imageData: nil, audioFileName: nil)
                     }
                     isRunning = false
+                    generationTask = nil
                 }
             }
         }
@@ -674,7 +702,9 @@ struct ChatView: View {
            let tokPath = UserDefaults.standard.string(forKey: SharedSelection.llmTokenizerPath) {
             let model = URL(fileURLWithPath: modelPath)
             let tok = URL(fileURLWithPath: tokPath)
-            if FileManager.default.fileExists(atPath: model.path),
+            let isSupportedModel = model.pathExtension.lowercased() == "cellm" || model.pathExtension.lowercased() == "cellmd"
+            if isSupportedModel,
+               FileManager.default.fileExists(atPath: model.path),
                FileManager.default.fileExists(atPath: tok.path) {
                 llmModelURL = model
                 llmTokenizerURL = tok
@@ -683,7 +713,7 @@ struct ChatView: View {
         }
 
         if llmModelURL == nil || llmTokenizerURL == nil {
-            selectGemmaPreset()
+            selectGemmaPreset(silentOnMissing: true)
             if llmModelURL == nil || llmTokenizerURL == nil {
                 selectQwenPreset(silentOnMissing: true)
             }
@@ -712,15 +742,24 @@ struct ChatView: View {
     }
 
     private func selectGemma4E4BPreset() {
-        llmModelURL = RemoteAssets.documentsURL(fileName: "models/google_gemma-4-E4B-it-Q4_K_M.gguf")
-        llmTokenizerURL = RemoteAssets.documentsURL(fileName: "tokenizers/gemma-tokenizer.json")
-        selectedSampleLabel = "Gemma-4-E4B-it"
+        // Kept for compatibility with older UI hooks; maps to stable Gemma3 preset.
+        selectGemmaPreset()
     }
 
-                : "Gemma3-1B-IT"
+    private func selectGemmaPreset(silentOnMissing: Bool = false) {
+        let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3FileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "gemma-3-1b-it-int8-v1.cellm")
+            ?? RemoteAssets.existingDocumentsFile(fileName: "gemma-3-1b-it-int8.cellmd")
+        let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerFileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "tokenizer-gemma-3-1b-it.json")
+        if let model, let tok {
+            llmModelURL = model
+            llmTokenizerURL = tok
+            selectedSampleLabel = "Gemma3-1B-IT (int8)"
             errorText = nil
-    private func selectGemmaPreset() {
-        selectGemma4E4BPreset()
+        } else if !silentOnMissing {
+            errorText = "Gemma3 files not found in Documents/samples. Download Gemma3 model + tokenizer from LLM tab."
+        }
     }
 
     private func selectQwenPreset(silentOnMissing: Bool = false) {
@@ -776,20 +815,27 @@ struct ChatView: View {
 
     private func initializeEngine() {
         guard let modelURL = llmModelURL, let tokURL = llmTokenizerURL else { return }
-        
-        Task {
+
+        initTask?.cancel()
+        initTask = Task {
             await MainActor.run { isInitializing = true }
             do {
                 let tok = try CellmTokenizer(tokenizerURL: tokURL)
                 _ = try CellmEngine(
                     modelURL: modelURL,
                     tokenizer: tok,
-                    backend: selectedBackend
+                    backend: scenePhase == .active ? selectedBackend : .cpu
                 )
+                await MainActor.run { errorText = nil }
             } catch {
-                print("Proactive init failed: \(error)")
+                await MainActor.run {
+                    errorText = "Model init failed: \(String(describing: error))"
+                }
             }
-            await MainActor.run { isInitializing = false }
+            await MainActor.run {
+                isInitializing = false
+                initTask = nil
+            }
         }
     }
 }

@@ -31,7 +31,10 @@ m.md
 cellm.md
 
 # Large local model artifacts (keep out of git history)
-models/
+models/*
+!models/test_images/
+
+
 
 
 turboquant-main/

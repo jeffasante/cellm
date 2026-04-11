@@ -835,7 +835,8 @@ impl GemmaRunner {
             .tensor_meta_by_exact_name(&lm_src_resolved)
             .ok_or_else(|| CoreError::Backend(format!("unknown tensor {}", lm_src_resolved)))?;
         let lm_dtype = lm_meta.dtype.clone();
-        let use_metal_logits = self.metal_ops.is_some() && self.use_metal_logits && lm_dtype != "i4";
+        let use_metal_logits =
+            self.metal_ops.is_some() && self.use_metal_logits && lm_dtype != "i4" && lm_dtype != "i2";
 
         // Compute all vocab logits on GPU when Metal is active, otherwise CPU.
         let all_logits: Vec<f32>;
@@ -876,6 +877,12 @@ impl GemmaRunner {
             let lm_src_i4_scales = if lm_dtype == "i4" {
                 Some(self.tensor_f16_by_exact_name(&format!("{lm_src_resolved}.qscale"))?)
             } else { None };
+            let lm_src_i2 = if lm_dtype == "i2" {
+                Some(self.tensor_u8_by_exact_name(&lm_src_resolved)?)
+            } else { None };
+            let lm_src_i2_scales = if lm_dtype == "i2" {
+                Some(self.tensor_f16_by_exact_name(&format!("{lm_src_resolved}.qscale"))?)
+            } else { None };
             let mut buf = vec![0.0f32; vocab];
             if should_parallel_linear_cpu(vocab, hidden) {
                 buf.par_iter_mut().enumerate().for_each(|(vid, out_v)| {
@@ -896,6 +903,11 @@ impl GemmaRunner {
                         let row = &wi4[vid * row_stride..(vid + 1) * row_stride];
                         let scale = f16::from_bits(scales[vid]).to_f32();
                         dot = dot_i4_scaled_row(row, x_final.as_slice(), scale);
+                    } else if let (Some(wi2), Some(scales)) = (lm_src_i2, lm_src_i2_scales) {
+                        let row_stride = hidden.div_ceil(4);
+                        let row = &wi2[vid * row_stride..(vid + 1) * row_stride];
+                        let scale = f16::from_bits(scales[vid]).to_f32();
+                        dot = dot_i2_scaled_row(row, x_final.as_slice(), scale);
                     }
                     *out_v = dot;
                 });
@@ -918,6 +930,11 @@ impl GemmaRunner {
                         let row = &wi4[vid * row_stride..(vid + 1) * row_stride];
                         let scale = f16::from_bits(scales[vid]).to_f32();
                         dot = dot_i4_scaled_row(row, &x_final, scale);
+                    } else if let (Some(wi2), Some(scales)) = (lm_src_i2, lm_src_i2_scales) {
+                        let row_stride = hidden.div_ceil(4);
+                        let row = &wi2[vid * row_stride..(vid + 1) * row_stride];
+                        let scale = f16::from_bits(scales[vid]).to_f32();
+                        dot = dot_i2_scaled_row(row, &x_final, scale);
                     } else {
                         dot = f32::NAN;
                     }
@@ -1030,6 +1047,16 @@ impl GemmaRunner {
                     out[i] = unpack_i4(row, i) * scale;
                 }
             }
+            "i2" => {
+                let embed = self.tensor_u8_by_exact_name(&resolved)?;
+                let scales = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
+                let scale = f16::from_bits(scales[t]).to_f32() * embed_scale;
+                let row_stride = hidden.div_ceil(4);
+                let row = &embed[t * row_stride..(t + 1) * row_stride];
+                for i in 0..hidden {
+                    out[i] = unpack_i2(row, i) * scale;
+                }
+            }
             other => {
                 return Err(CoreError::Backend(format!(
                     "unsupported embed dtype for {name}: {other}"
@@ -1101,6 +1128,17 @@ impl GemmaRunner {
                     let te_row = &te[t * row_stride..(t + 1) * row_stride];
                     for i in 0..per_total_dim {
                         per_token[i] = unpack_i4(te_row, i) * row_scale;
+                    }
+                }
+                "i2" => {
+                    let te = self.tensor_u8_by_exact_name(&token_embd_name)?;
+                    let te_scales =
+                        self.tensor_f16_by_exact_name(&format!("{token_embd_name}.qscale"))?;
+                    let row_scale = f16::from_bits(te_scales[t]).to_f32() * scale;
+                    let row_stride = per_total_dim.div_ceil(4);
+                    let te_row = &te[t * row_stride..(t + 1) * row_stride];
+                    for i in 0..per_total_dim {
+                        per_token[i] = unpack_i2(te_row, i) * row_scale;
                     }
                 }
                 other => {
@@ -1245,12 +1283,13 @@ impl GemmaRunner {
                         // Fall back to tiered matmul logic for i4 until MetalOps supports it directly.
                     }
                 }
+                "i2" => {}
                 _ => {}
             }
         }
 
         if let GemmaLinearBackend::Metal { ctx } = &self.linear_backend {
-            if dtype == "i4" && disable_metal_i4 {
+            if (dtype == "i4" && disable_metal_i4) || dtype == "i2" {
                 // Skip Metal linear for Gemma4 INT4 unless explicitly re-enabled.
             } else {
             let max_cols = if in_dim == 0 {
@@ -1344,6 +1383,9 @@ impl GemmaRunner {
                         out[row_start..row_start + cols_n].copy_from_slice(out_slice);
                         row_start += cols_n;
                     }
+                }
+                "i2" => {
+                    metal_ok = false;
                 }
                 "i8" => {
                     let w = self.tensor_i8_by_exact_name(&resolved)?;
@@ -1487,6 +1529,25 @@ impl GemmaRunner {
                         let row = &w[j * row_stride..(j + 1) * row_stride];
                         let scale = f16::from_bits(scales[j]).to_f32();
                         let acc = dot_i4_scaled_row(row, x, scale);
+                        out[j] = acc;
+                    }
+                }
+            }
+            "i2" => {
+                let w = self.tensor_u8_by_exact_name(&resolved)?;
+                let scales = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
+                let row_stride = in_dim.div_ceil(4);
+                if should_parallel_linear_cpu(out_dim, in_dim) {
+                    out.par_iter_mut().enumerate().for_each(|(j, out_j)| {
+                        let row = &w[j * row_stride..(j + 1) * row_stride];
+                        let scale = f16::from_bits(scales[j]).to_f32();
+                        *out_j = dot_i2_scaled_row(row, x, scale);
+                    });
+                } else {
+                    for j in 0..out_dim {
+                        let row = &w[j * row_stride..(j + 1) * row_stride];
+                        let scale = f16::from_bits(scales[j]).to_f32();
+                        let acc = dot_i2_scaled_row(row, x, scale);
                         out[j] = acc;
                     }
                 }
@@ -1661,6 +1722,22 @@ fn dot_i4_scaled_row(row_packed: &[u8], x: &[f32], scale: f32) -> f32 {
         let hi = ((b >> 4) as i8) - 8;
         acc += x[xi] * ((hi as f32) * scale);
         xi += 1;
+    }
+    acc
+}
+
+fn dot_i2_scaled_row(row_packed: &[u8], x: &[f32], scale: f32) -> f32 {
+    let mut acc = 0.0f32;
+    let mut xi = 0usize;
+    for &b in row_packed {
+        for lane in 0..4 {
+            if xi >= x.len() {
+                return acc;
+            }
+            let q = (b >> (lane * 2)) & 0x03;
+            acc += x[xi] * (dequant_i2(q) * scale);
+            xi += 1;
+        }
     }
     acc
 }
@@ -2188,4 +2265,19 @@ fn unpack_i4(packed_row: &[u8], idx: usize) -> f32 {
         (byte >> 4) & 0x0f
     };
     (nibble as i8 - 8) as f32
+}
+
+fn unpack_i2(packed_row: &[u8], idx: usize) -> f32 {
+    let byte = packed_row[idx / 4];
+    let q = (byte >> ((idx % 4) * 2)) & 0x03;
+    dequant_i2(q)
+}
+
+fn dequant_i2(q: u8) -> f32 {
+    match q & 0x03 {
+        0 => -1.5,
+        1 => -0.5,
+        2 => 0.5,
+        _ => 1.5,
+    }
 }

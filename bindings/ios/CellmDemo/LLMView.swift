@@ -377,6 +377,12 @@ struct LLMView: View {
             if showAdvancedDownloads {
                 actionButton(modelURL == nil ? "Pick .cellm model" : modelURL!.lastPathComponent, icon: "externaldrive") { showModelPicker = true }
                 actionButton(tokenizerURL == nil ? "Pick tokenizer.json" : tokenizerURL!.lastPathComponent, icon: "doc.text") { showTokenizerPicker = true }
+                actionButton(isDownloading ? "Downloading sample files…" : "Download Gemma3 model only (~1.2 GB)", icon: "shippingbox", disabled: isDownloading || isRunning) {
+                    downloadGemmaModelOnly()
+                }
+                actionButton(isDownloading ? "Downloading sample files…" : "Download Gemma3 tokenizer JSON only", icon: "arrow.down.doc", disabled: isDownloading || isRunning) {
+                    downloadGemmaTokenizerOnly()
+                }
                 actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen stable model only (~1.6 GB)", icon: "shippingbox", disabled: isDownloading || isRunning) {
                     downloadQwenModelOnly()
                 }
@@ -1246,6 +1252,88 @@ Assistant:
         currentDownloadSizeText = ""
         isDownloading = false
         errorText = "Please download the Gemma-4 LiteRT bundle from the Models Hub tab first."
+    }
+
+    private func downloadGemmaModelOnly() {
+        errorText = nil
+        selectedSampleLabel = "Gemma3-1B-IT (int8)"
+        downloadStatus = "Downloading Gemma3 model only..."
+        downloadProgress = 0
+        currentDownloadFile = ""
+        currentDownloadSizeText = ""
+        isDownloading = true
+        Task {
+            do {
+                let modelPath = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.gemma3Int8,
+                    fileName: DemoAssetLinks.gemma3FileName,
+                    progress: { p in
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: 1.0, label: "Gemma3 model", fileName: DemoAssetLinks.gemma3FileName)
+                    }
+                )
+                await MainActor.run {
+                    self.modelURL = modelPath
+                    self.downloadProgress = 1.0
+                    self.downloadStatus = "Saved model: \(modelPath.lastPathComponent)"
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
+                    self.isDownloading = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorText = String(describing: error)
+                    self.downloadStatus = ""
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
+                    self.isDownloading = false
+                }
+            }
+        }
+    }
+
+    private func downloadGemmaTokenizerOnly() {
+        errorText = nil
+        selectedSampleLabel = "Gemma3-1B-IT (int8)"
+        downloadStatus = "Downloading Gemma3 tokenizer JSONs..."
+        downloadProgress = 0
+        currentDownloadFile = ""
+        currentDownloadSizeText = ""
+        isDownloading = true
+        Task {
+            do {
+                let totalFiles = 2.0
+                let tokPath = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.gemma3Tokenizer,
+                    fileName: DemoAssetLinks.gemma3TokenizerFileName,
+                    progress: { p in
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "Gemma3 tokenizer", fileName: DemoAssetLinks.gemma3TokenizerFileName)
+                    }
+                )
+                _ = try await RemoteAssets.downloadToDocuments(
+                    from: DemoAssetLinks.gemma3TokenizerConfig,
+                    fileName: DemoAssetLinks.gemma3TokenizerConfigFileName,
+                    progress: { p in
+                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "Gemma3 tokenizer", fileName: DemoAssetLinks.gemma3TokenizerConfigFileName)
+                    }
+                )
+                await MainActor.run {
+                    self.tokenizerURL = tokPath
+                    self.downloadProgress = 1.0
+                    self.downloadStatus = "Saved tokenizer JSONs for Gemma3."
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
+                    self.isDownloading = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorText = String(describing: error)
+                    self.downloadStatus = ""
+                    self.currentDownloadFile = ""
+                    self.currentDownloadSizeText = ""
+                    self.isDownloading = false
+                }
+            }
+        }
     }
 
     private func downloadQwenModelOnly() {

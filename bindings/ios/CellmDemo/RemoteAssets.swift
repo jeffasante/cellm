@@ -24,11 +24,11 @@ enum DemoAssetLinks {
     static let smollm2TokenizerFileName = "\(smollm2Dir)/tokenizer-smollm2-135m.json"
     static let smollm2TokenizerConfigFileName = "\(smollm2Dir)/tokenizer_config.json"
 
-    static let gemma3Int8 = "https://huggingface.co/jeffasante/gemma-3-1b-it-int8-cellm/resolve/main/gemma-3-1b-it-int8.cellmd"
-    static let gemma3Tokenizer = "https://huggingface.co/unsloth/gemma-3-1b-it/resolve/main/tokenizer.json"
-    static let gemma3TokenizerConfig = "https://huggingface.co/unsloth/gemma-3-1b-it/resolve/main/tokenizer_config.json"
+    static let gemma3Int8 = "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-3-1b-it-int8-v1/gemma-3-1b-it-int8-v1.cellm?download=true"
+    static let gemma3Tokenizer = "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-3-1b-it-int8-v1/tokenizer.json?download=true"
+    static let gemma3TokenizerConfig = "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-3-1b-it-int8-v1/tokenizer_config.json?download=true"
     static let gemma3Dir = "samples/gemma-3-1b-it"
-    static let gemma3FileName = "\(gemma3Dir)/gemma-3-1b-it-int8.cellmd"
+    static let gemma3FileName = "\(gemma3Dir)/gemma-3-1b-it-int8-v1.cellm"
     static let gemma3TokenizerFileName = "\(gemma3Dir)/tokenizer-gemma-3-1b-it.json"
     static let gemma3TokenizerConfigFileName = "\(gemma3Dir)/tokenizer_config.json"
 

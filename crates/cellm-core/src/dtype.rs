@@ -4,6 +4,7 @@ pub enum DType {
     F32,
     F16,
     BF16,
+    I2,
     I8,
     U8,
     /// 8-bit symmetric block quantization (block size = 32)
@@ -17,6 +18,7 @@ impl DType {
             DType::F32 => 4,
             DType::F16 => 2,
             DType::BF16 => 2,
+            DType::I2 => 1,
             DType::I8 => 1,
             DType::U8 => 1,
             // Q8_0: 32 int8 values + 1 f32 scale = 36 bytes per block of 32
@@ -27,7 +29,7 @@ impl DType {
 
     /// True if this dtype requires a backend that understands block quantization.
     pub fn is_quantized(&self) -> bool {
-        matches!(self, DType::Q8_0)
+        matches!(self, DType::I2 | DType::Q8_0)
     }
 
     pub fn name(&self) -> &'static str {
@@ -35,6 +37,7 @@ impl DType {
             DType::F32 => "f32",
             DType::F16 => "f16",
             DType::BF16 => "bf16",
+            DType::I2 => "i2",
             DType::I8 => "i8",
             DType::U8 => "u8",
             DType::Q8_0 => "q8_0",
@@ -55,6 +58,7 @@ impl TryFrom<&str> for DType {
             "f32" => Ok(DType::F32),
             "f16" => Ok(DType::F16),
             "bf16" => Ok(DType::BF16),
+            "i2" => Ok(DType::I2),
             "i8" => Ok(DType::I8),
             "u8" => Ok(DType::U8),
             "q8_0" => Ok(DType::Q8_0),

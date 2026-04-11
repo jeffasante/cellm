@@ -52,6 +52,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     quantize_int4_symmetric: bool,
 
+    /// Quantize eligible text 2D weights to packed 2-bit rows (+ f16 scales).
+    ///
+    /// This is an extremely aggressive weight-only mode intended for Gemma experiments.
+    #[arg(long, default_value_t = false)]
+    quantize_int2_symmetric: bool,
+
     /// Gemma4-only aggressive INT4 profile:
     /// quantize most 2D text weights (including embeddings / lm_head when present)
     /// while keeping norm-style tensors in f16.
@@ -233,6 +239,8 @@ enum TensorOp {
     QuantizeI8Scales { weight_name: String },
     QuantizeI4Data,
     QuantizeI4Scales { weight_name: String },
+    QuantizeI2Data,
+    QuantizeI2Scales { weight_name: String },
 }
 
 fn main() -> Result<()> {
@@ -321,6 +329,13 @@ fn main() -> Result<()> {
     if args.quantize_int4_symmetric && args.quantize_int8_symmetric && !args.gemma4_mixed_i8_i4 {
         anyhow::bail!("choose only one quantization mode: --quantize-int8-symmetric or --quantize-int4-symmetric");
     }
+    if args.quantize_int2_symmetric
+        && (args.quantize_int4_symmetric || args.quantize_int8_symmetric)
+    {
+        anyhow::bail!(
+            "choose only one quantization mode: --quantize-int2-symmetric, --quantize-int4-symmetric, or --quantize-int8-symmetric"
+        );
+    }
     if (args.gemma4_aggressive_int4 as u8
         + args.gemma4_balanced_int4 as u8
         + args.gemma4_awq_lite_int4 as u8
@@ -344,6 +359,12 @@ fn main() -> Result<()> {
             selected.model_type
         );
     }
+    if args.quantize_int2_symmetric && !selected.model_type.starts_with("gemma") {
+        anyhow::bail!(
+            "--quantize-int2-symmetric is currently supported for gemma text stacks only (detected model_type={}).",
+            selected.model_type
+        );
+    }
 
     let plans = build_tensor_plans(
         &safetensors_paths,
@@ -352,6 +373,7 @@ fn main() -> Result<()> {
         quant_group_size,
         args.quantize_int8_symmetric,
         args.quantize_int4_symmetric,
+        args.quantize_int2_symmetric,
         args.gemma4_aggressive_int4,
         args.gemma4_balanced_int4,
         args.gemma4_awq_lite_int4,
@@ -559,6 +581,18 @@ fn main() -> Result<()> {
                     format!("tensor {} in {:?}", weight_name, safetensors_paths[p.file_idx])
                 })?;
                 write_quant_i4_scales_per_row_symmetric(t.data(), t.shape(), t.dtype(), &mut w)?;
+            }
+            TensorOp::QuantizeI2Data => {
+                let t = st.tensor(&p.name).with_context(|| {
+                    format!("tensor {} in {:?}", p.name, safetensors_paths[p.file_idx])
+                })?;
+                write_quant_i2_data_per_row_symmetric(t.data(), t.shape(), t.dtype(), &mut w)?;
+            }
+            TensorOp::QuantizeI2Scales { weight_name } => {
+                let t = st.tensor(weight_name).with_context(|| {
+                    format!("tensor {} in {:?}", weight_name, safetensors_paths[p.file_idx])
+                })?;
+                write_quant_i2_scales_per_row_symmetric(t.data(), t.shape(), t.dtype(), &mut w)?;
             }
         }
 
@@ -914,8 +948,10 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
     let mut out_tensors: Vec<GgufOutTensor> = Vec::new();
     // Safety valve: Gemma4 int4 conversion can stall on the large per-layer-input tensor family.
     // Skip those tensors in this mode so conversion can complete on constrained machines.
-    let skip_gemma4_per_layer =
-        arch == "gemma4" && (args.quantize_int4_symmetric || args.quantize_int8_symmetric);
+    let skip_gemma4_per_layer = arch == "gemma4"
+        && (args.quantize_int2_symmetric
+            || args.quantize_int4_symmetric
+            || args.quantize_int8_symmetric);
     for src in &parsed.tensors {
         let Some((dst_name, reverse_2d, layer_idx)) = map_fn(&src.name) else {
             continue;
@@ -968,15 +1004,57 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
             .checked_mul(2)
             .ok_or_else(|| anyhow::anyhow!("output nbytes overflow for {}", src.name))?;
 
-        let mut op = TensorOp::CopyAsF16;
         let mut final_out_nbytes = out_nbytes;
 
         // Apply quantization if requested and if the tensor is a candidate (usually 2D weights)
+        if args.quantize_int2_symmetric
+            && shape.len() == 2
+            && !is_quantization_excluded_name(&dst_name)
+        {
+            final_out_nbytes = i2_packed_nbytes_for_shape(&shape)?;
+
+            out_tensors.push(GgufOutTensor {
+                src_name: src.name.clone(),
+                src_dims: src.dims.clone(),
+                name: dst_name.clone(),
+                shape: shape.clone(),
+                header_shape: shape.clone(),
+                out_dtype: "i2".to_string(),
+                src_type: src.ggml_type,
+                src_offset,
+                src_nbytes,
+                out_nbytes: final_out_nbytes,
+                out_offset: 0,
+                reverse_2d,
+                is_q8_head: false,
+                layer_idx,
+                op: TensorOp::QuantizeI2Data,
+            });
+
+            out_tensors.push(GgufOutTensor {
+                src_name: src.name.clone(),
+                src_dims: src.dims.clone(),
+                name: format!("{}.qscale", dst_name),
+                shape: shape.clone(),
+                header_shape: vec![shape[0]],
+                out_dtype: "f16".to_string(),
+                src_type: src.ggml_type,
+                src_offset,
+                src_nbytes,
+                out_nbytes: shape[0] * 2,
+                out_offset: 0,
+                reverse_2d,
+                is_q8_head: false,
+                layer_idx,
+                op: TensorOp::QuantizeI2Scales { weight_name: dst_name },
+            });
+            continue;
+        }
+
         if args.quantize_int4_symmetric
             && shape.len() == 2
             && !is_quantization_excluded_name(&dst_name)
         {
-            op = TensorOp::QuantizeI4Data;
             // int4 is packed per row, so odd in_dim needs row-wise ceil(in_dim/2).
             final_out_nbytes = i4_packed_nbytes_for_shape(&shape)?;
             
@@ -1024,7 +1102,6 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
             && shape.len() == 2
             && !is_quantization_excluded_name(&dst_name)
         {
-            op = TensorOp::QuantizeI8Data;
             final_out_nbytes = numel;
 
             out_tensors.push(GgufOutTensor {
@@ -1284,6 +1361,24 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
         match &p.op {
             TensorOp::CopyAsF16 => {
                 write_gguf_tensor_as_f16(src, p.src_type, numel, &mut w)?;
+            }
+            TensorOp::QuantizeI2Data => {
+                let f16_data = decode_gguf_all_f16(src, p.src_type, numel)?;
+                write_quant_i2_data_per_row_symmetric(
+                    cast_slice(&f16_data),
+                    &p.shape,
+                    Dtype::F16,
+                    &mut w,
+                )?;
+            }
+            TensorOp::QuantizeI2Scales { weight_name: _ } => {
+                let f16_data = decode_gguf_all_f16(src, p.src_type, numel)?;
+                write_quant_i2_scales_per_row_symmetric(
+                    cast_slice(&f16_data),
+                    &p.shape,
+                    Dtype::F16,
+                    &mut w,
+                )?;
             }
             TensorOp::QuantizeI4Data => {
                 // First decode GGUF specialized quant to f16, then re-quant to cellm int4
@@ -2691,6 +2786,7 @@ fn build_tensor_plans(
     group_size: usize,
     quantize_int8_symmetric: bool,
     quantize_int4_symmetric: bool,
+    quantize_int2_symmetric: bool,
     gemma4_aggressive_int4: bool,
     gemma4_balanced_int4: bool,
     gemma4_awq_lite_int4: bool,
@@ -2768,6 +2864,11 @@ fn build_tensor_plans(
             {
                 out_dtype = "i4".to_string();
                 TensorOp::QuantizeI4Data
+            } else if quantize_int2_symmetric
+                && should_quantize_i2_weight(model_type, name, &shape)
+            {
+                out_dtype = "i2".to_string();
+                TensorOp::QuantizeI2Data
             } else {
                 TensorOp::CopyAsF16
             };
@@ -2792,6 +2893,8 @@ fn build_tensor_plans(
             let numel = out_shape.iter().product::<usize>();
             let out_nbytes = if out_dtype == "i8" {
                 numel
+            } else if out_dtype == "i2" {
+                i2_packed_nbytes_for_shape(&out_shape)?
             } else if out_dtype == "i4" {
                 i4_packed_nbytes_for_shape(&out_shape)?
             } else {
@@ -2849,6 +2952,20 @@ fn build_tensor_plans(
                         weight_name: name.to_string(),
                     },
                 });
+            } else if out_dtype == "i2" {
+                let out_dim = shape[0];
+                plans.push(TensorPlan {
+                    name: format!("{name}.qscale"),
+                    shape: vec![out_dim],
+                    header_shape: vec![out_dim],
+                    file_idx,
+                    offset_bytes: 0,
+                    out_nbytes: out_dim * 2,
+                    out_dtype: "f16".to_string(),
+                    op: TensorOp::QuantizeI2Scales {
+                        weight_name: name.to_string(),
+                    },
+                });
             }
         }
     }
@@ -2873,6 +2990,16 @@ fn i4_packed_nbytes_for_shape(shape: &[usize]) -> Result<usize> {
         .ok_or_else(|| anyhow::anyhow!("i4 packed byte size overflow for shape={shape:?}"))
 }
 
+fn i2_packed_nbytes_for_shape(shape: &[usize]) -> Result<usize> {
+    if shape.len() != 2 {
+        anyhow::bail!("i2 packed byte size expects 2D shape, got {shape:?}");
+    }
+    let rows = shape[0];
+    let cols = shape[1];
+    rows.checked_mul(cols.div_ceil(4))
+        .ok_or_else(|| anyhow::anyhow!("i2 packed byte size overflow for shape={shape:?}"))
+}
+
 fn is_quantization_excluded_name(name: &str) -> bool {
     name.contains("norm")
         || name.contains("per_layer_model_proj")
@@ -2894,7 +3021,11 @@ fn infer_tensor_prefixes(
         None
     };
 
-    let vision = if has("model.vision_model.") {
+    let vision = if has("model.vision_tower.vision_model.") {
+        Some("model.vision_tower.vision_model.".to_string())
+    } else if has("vision_tower.vision_model.") {
+        Some("vision_tower.vision_model.".to_string())
+    } else if has("model.vision_model.") {
         Some("model.vision_model.".to_string())
     } else if has("vision_model.") {
         Some("vision_model.".to_string())
@@ -2906,6 +3037,8 @@ fn infer_tensor_prefixes(
         Some("model.connector.".to_string())
     } else if has("connector.") {
         Some("connector.".to_string())
+    } else if has("multi_modal_projector.") {
+        Some("multi_modal_projector.".to_string())
     } else {
         None
     };
@@ -3007,6 +3140,36 @@ fn should_quantize_i4_qwen_weight(name: &str, shape: &[usize]) -> bool {
             || name.starts_with("model.text_model.");
     }
     false
+}
+
+fn should_quantize_i2_weight(model_type: &str, name: &str, shape: &[usize]) -> bool {
+    if !model_type.starts_with("gemma") {
+        return false;
+    }
+    if shape.len() != 2 || !name.ends_with(".weight") {
+        return false;
+    }
+    let in_gemma_layer = name.contains("model.layers.")
+        || name.contains("model.text_model.layers.")
+        || name.contains("model.language_model.layers.");
+    if !in_gemma_layer {
+        return false;
+    }
+    if name.contains("norm")
+        || name.contains("q_norm")
+        || name.contains("k_norm")
+        || name.contains("embed_tokens")
+        || name.contains("lm_head")
+        || name.contains("per_layer_token_embd")
+        || name.contains("embed_tokens_per_layer")
+        || name.contains("per_layer_model_proj")
+        || name.contains("per_layer_proj_norm")
+        || name.contains("rope_freqs")
+        || name.contains("layer_output_scale")
+    {
+        return false;
+    }
+    name.contains(".self_attn.") || name.contains(".mlp.")
 }
 
 fn should_quantize_i8_weight(
@@ -3427,6 +3590,105 @@ fn write_quant_i4_scales_per_row_symmetric(
             }
         }
         let scale = if max_abs > 0.0 { max_abs / 7.0 } else { 1.0 };
+        let h = f16::from_f32(scale);
+        w.write_all(&h.to_bits().to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn quantize_i2_centroid(v: f32, scale: f32) -> u8 {
+    if scale <= 0.0 {
+        return 1;
+    }
+    let norm = v / scale;
+    if norm < -1.0 {
+        0
+    } else if norm < 0.0 {
+        1
+    } else if norm < 1.0 {
+        2
+    } else {
+        3
+    }
+}
+
+fn write_quant_i2_data_per_row_symmetric(
+    data: &[u8],
+    shape: &[usize],
+    dtype: Dtype,
+    w: &mut impl Write,
+) -> Result<()> {
+    if shape.len() != 2 {
+        anyhow::bail!("int2 quantization expects 2D weight, got shape={shape:?}");
+    }
+    let out_dim = shape[0];
+    let in_dim = shape[1];
+    let values = tensor_data_to_f32(data, dtype)?;
+    if values.len() != out_dim * in_dim {
+        anyhow::bail!(
+            "int2 quantization data length mismatch: {} vs {}",
+            values.len(),
+            out_dim * in_dim
+        );
+    }
+
+    for r in 0..out_dim {
+        let row = &values[r * in_dim..(r + 1) * in_dim];
+        let mut max_abs = 0.0f32;
+        for &v in row {
+            let a = v.abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+        let scale = if max_abs > 0.0 { max_abs / 1.5 } else { 1.0 };
+        for i in (0..in_dim).step_by(4) {
+            let mut packed = 0u8;
+            for lane in 0..4 {
+                let idx = i + lane;
+                let q = if idx < in_dim {
+                    quantize_i2_centroid(row[idx], scale)
+                } else {
+                    1
+                };
+                packed |= (q & 0x03) << (lane * 2);
+            }
+            w.write_all(&[packed])?;
+        }
+    }
+    Ok(())
+}
+
+fn write_quant_i2_scales_per_row_symmetric(
+    data: &[u8],
+    shape: &[usize],
+    dtype: Dtype,
+    w: &mut impl Write,
+) -> Result<()> {
+    if shape.len() != 2 {
+        anyhow::bail!("int2 quantization expects 2D weight, got shape={shape:?}");
+    }
+    let out_dim = shape[0];
+    let in_dim = shape[1];
+    let values = tensor_data_to_f32(data, dtype)?;
+    if values.len() != out_dim * in_dim {
+        anyhow::bail!(
+            "int2 quantization data length mismatch: {} vs {}",
+            values.len(),
+            out_dim * in_dim
+        );
+    }
+
+    for r in 0..out_dim {
+        let row = &values[r * in_dim..(r + 1) * in_dim];
+        let mut max_abs = 0.0f32;
+        for &v in row {
+            let a = v.abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+        let scale = if max_abs > 0.0 { max_abs / 1.5 } else { 1.0 };
         let h = f16::from_f32(scale);
         w.write_all(&h.to_bits().to_le_bytes())?;
     }

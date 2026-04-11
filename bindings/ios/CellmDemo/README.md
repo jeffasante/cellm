@@ -67,14 +67,16 @@ Note: backend selection is strict in this build. If `Metal` is requested and una
 - `https://github.com/jeffasante/cellm/blob/main/models/qwen3.5-0.8b.cellm` (stable quality)
 - `https://github.com/jeffasante/cellm/blob/main/models/qwen3.5-0.8b-int4-textonly.cellm` (compact/experimental)
 - `https://github.com/jeffasante/cellm/blob/main/models/smollm2-135m-int8.cellm`
-- `https://huggingface.co/jeffasante/gemma-3-1b-it-int8-cellm/resolve/main/gemma-3-1b-it-int8.cellmd`
+- `https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-3-1b-it-int8-v1/gemma-3-1b-it-int8-v1.cellm?download=true`
 - `https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/tokenizer.json`
-- `https://huggingface.co/unsloth/gemma-3-1b-it/resolve/main/tokenizer.json`
+- `https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-3-1b-it-int8-v1/tokenizer.json?download=true`
+- `https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-3-1b-it-int8-v1/tokenizer_config.json?download=true`
 - `https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/main/tokenizer.json`
 - `https://github.com/jeffasante/cellm/blob/main/models/smolvlm-256m-int8.cellm`
 - `https://github.com/jeffasante/cellm/blob/main/models/test_images/rococo_1.jpg`
 
 The app normalizes GitHub `blob` URLs to raw-download URLs before fetching.
+For Gemma3 in LLM tab, Advanced Actions now support downloading model-only or tokenizer JSONs-only for phone import workflows.
 
 ## Notes
 

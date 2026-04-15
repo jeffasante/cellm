@@ -69,7 +69,10 @@ private struct ChatMLProcessor: ModelDataProcessor {
 
     func wrapPrompt(_ prompt: String) -> String {
         let cleanPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        var s = "<|im_start|>user\n\(cleanPrompt)<|im_end|>\n<|im_start|>assistant\n"
+        // Qwen and SmolLM models can heavily hallucinate conversational formatting
+        // (like "Human:" and "assistant:") if the system prompt is completely omitted.
+        var s = "<|im_start|>system\nYou are a helpful AI assistant.<|im_end|>\n"
+        s += "<|im_start|>user\n\(cleanPrompt)<|im_end|>\n<|im_start|>assistant\n"
         if includeThinkPrefill {
             s += "<think>\n\n</think>\n\n"
         }
@@ -78,7 +81,7 @@ private struct ChatMLProcessor: ModelDataProcessor {
 
     func isStopPiece(_ piece: String) -> Bool {
         let p = piece.trimmingCharacters(in: .whitespacesAndNewlines)
-        return p == "<|im_end|>" || p == "<|endoftext|>"
+        return p == "<|im_end|>" || p == "<|endoftext|>" || p.hasSuffix("<|im_end|>")
     }
 }
 

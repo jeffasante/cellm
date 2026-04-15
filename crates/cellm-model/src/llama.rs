@@ -77,7 +77,7 @@ impl LlamaRunner {
             // Keep current interleaved default for backwards compatibility.
             rope_interleaved: std::env::var("CELLM_LLAMA_ROPE_INTERLEAVED")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(true),
+                .unwrap_or(false),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             graph_state: None,
         })

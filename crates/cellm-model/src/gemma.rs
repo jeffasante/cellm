@@ -451,7 +451,7 @@ impl GemmaRunner {
                 self.metal_ops
                     .as_mut()
                     .unwrap()
-                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &mut x_norm)
+                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, "gemma.norm", &mut x_norm)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
             } else {
                 self.rmsnorm_weight(
@@ -508,11 +508,11 @@ impl GemmaRunner {
                     None
                 };
                 let add_one = self.rmsnorm_weight_is_offset;
-                let ops = self.metal_ops.as_mut().unwrap();
+                let ops = self.metal_ops.as_ref().unwrap();
                 for hidx in 0..n_heads {
                     let seg = &mut q_slice[hidx * head_dim..(hidx + 1) * head_dim];
                     let inp = seg.to_vec();
-                    ops.rms_norm_f16w(&inp, &qw, cfg.rms_norm_eps, add_one, seg)
+                    ops.rms_norm_f16w(&inp, &qw, cfg.rms_norm_eps, add_one, "gemma.norm", seg)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                 }
                 if !is_kv_shared_layer {
@@ -520,7 +520,7 @@ impl GemmaRunner {
                     for hidx in 0..n_kv_heads {
                         let seg = &mut k_slice[hidx * kv_head_dim..(hidx + 1) * kv_head_dim];
                         let inp = seg.to_vec();
-                        ops.rms_norm_f16w(&inp, &kw, cfg.rms_norm_eps, add_one, seg)
+                        ops.rms_norm_f16w(&inp, &kw, cfg.rms_norm_eps, add_one, "gemma.norm", seg)
                             .map_err(|e| CoreError::Backend(e.to_string()))?;
                     }
                 }
@@ -560,7 +560,7 @@ impl GemmaRunner {
 
             // ── RoPE ──────────────
             if use_metal_rope {
-                let ops = self.metal_ops.as_mut().unwrap();
+                let ops = self.metal_ops.as_ref().unwrap();
                 ops.rope_half_f32(q_slice, n_heads, head_dim, head_dim, pos, layer_rope_theta)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
                 if !is_kv_shared_layer {
@@ -630,7 +630,7 @@ impl GemmaRunner {
                 q_for_attn,
                 n_heads,
                 n_kv_heads,
-                head_dim,
+                head_dim, None,
                 attn_out_slice,
             )?;
 
@@ -651,8 +651,8 @@ impl GemmaRunner {
                     &format!("model.layers.{layer}.post_attention_layernorm.weight"))?.to_vec();
                 let add_one = self.rmsnorm_weight_is_offset;
                 let mut x_out = vec![0.0f32; hidden];
-                self.metal_ops.as_mut().unwrap()
-                    .rms_norm_f16w(&attn_proj, &w, cfg.rms_norm_eps, add_one, &mut x_out)
+                self.metal_ops.as_ref().unwrap()
+                    .rms_norm_f16w(&attn_proj, &w, cfg.rms_norm_eps, add_one, "gemma.norm", &mut x_out)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
                 for i in 0..hidden { x[i] = x_out[i] + x_residual[i]; }
             } else {
@@ -669,8 +669,9 @@ impl GemmaRunner {
                 let w = self.tensor_f16(
                     &format!("model.layers.{layer}.pre_feedforward_layernorm.weight"))?.to_vec();
                 let add_one = self.rmsnorm_weight_is_offset;
-                self.metal_ops.as_mut().unwrap()
-                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &mut mlp_in)
+                let ck = format!("gemma.layer.{layer}.attn_norm");
+                self.metal_ops.as_ref().unwrap()
+                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &ck, &mut mlp_in)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
             } else {
                 self.rmsnorm_weight(
@@ -712,8 +713,9 @@ impl GemmaRunner {
                     &format!("model.layers.{layer}.post_feedforward_layernorm.weight"))?.to_vec();
                 let add_one = self.rmsnorm_weight_is_offset;
                 let mut x_out = vec![0.0f32; hidden];
-                self.metal_ops.as_mut().unwrap()
-                    .rms_norm_f16w(&down, &wffn, cfg.rms_norm_eps, add_one, &mut x_out)
+                let ck = format!("gemma.layer.{layer}.ffn_norm");
+                self.metal_ops.as_ref().unwrap()
+                    .rms_norm_f16w(&down, &wffn, cfg.rms_norm_eps, add_one, &ck, &mut x_out)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
                 for i in 0..hidden { x[i] = x_out[i] + x_residual[i]; }
             } else {
@@ -809,8 +811,8 @@ impl GemmaRunner {
         if use_metal_norm {
             let w = self.tensor_f16("model.norm.weight")?.to_vec();
             let add_one = self.rmsnorm_weight_is_offset;
-            self.metal_ops.as_mut().unwrap()
-                .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &mut x_final)
+            self.metal_ops.as_ref().unwrap()
+                .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, "gemma.final_norm", &mut x_final)
                 .map_err(|e| CoreError::Backend(e.to_string()))?;
         } else {
             let mut norm_w = vec![0.0f32; hidden];
@@ -844,16 +846,16 @@ impl GemmaRunner {
             let mut buf = vec![0.0f32; vocab];
             match lm_dtype.as_str() {
                 "f16" => {
-                    let w = self.tensor_f16_by_exact_name(&lm_src_resolved)?.to_vec();
-                    self.metal_ops.as_mut().unwrap()
-                        .logits_f16(&x_final, &w, vocab, hidden, &lm_src_resolved, &mut buf)
+                    let w = self.tensor_f16_by_exact_name(&lm_src_resolved)?;
+                    self.metal_ops.as_ref().unwrap()
+                        .logits_f16(&x_final, w, vocab, hidden, &lm_src_resolved, &mut buf)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                 }
                 "i8" => {
-                    let w = self.tensor_i8_by_exact_name(&lm_src_resolved)?.to_vec();
-                    let s = self.tensor_f16_by_exact_name(&format!("{lm_src_resolved}.qscale"))?.to_vec();
-                    self.metal_ops.as_mut().unwrap()
-                        .logits_i8(&x_final, &w, &s, vocab, hidden, &lm_src_resolved, &mut buf)
+                    let w = self.tensor_i8_by_exact_name(&lm_src_resolved)?;
+                    let s = self.tensor_f16_by_exact_name(&format!("{lm_src_resolved}.qscale"))?;
+                    self.metal_ops.as_ref().unwrap()
+                        .logits_i8(&x_final, w, s, vocab, hidden, &lm_src_resolved, &mut buf)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                 }
                 other => return Err(CoreError::Backend(format!(
@@ -1243,205 +1245,24 @@ impl GemmaRunner {
             && std::env::var("CELLM_GEMMA4_I4_DISABLE_METAL_LINEAR")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true);
-
-        // Fast path: use MetalOps matrix-vector kernels with internal GPU-side caching.
-        if self.metal_ops.is_some() {
+        let use_metal = self.metal_ops.is_some();
+        if use_metal {
+            let ctx = self.metal_ops.as_ref().unwrap();
             match dtype.as_str() {
                 "f16" => {
                     let w = self.tensor_f16_by_exact_name(&resolved)?;
-                    let w_ptr = w.as_ptr();
-                    let w_len = w.len();
-                    let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
-                    self.metal_ops
-                        .as_mut()
-                        .unwrap()
-                        .logits_f16(x, w, out_dim, in_dim, &resolved, out)
+                    ctx.logits_f16(x, w, out_dim, in_dim, &resolved, out)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                     return Ok(());
                 }
                 "i8" => {
                     let w = self.tensor_i8_by_exact_name(&resolved)?;
                     let s = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
-                    let w_ptr = w.as_ptr();
-                    let w_len = w.len();
-                    let s_ptr = s.as_ptr();
-                    let s_len = s.len();
-                    let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
-                    let s = unsafe { std::slice::from_raw_parts(s_ptr, s_len) };
-                    self.metal_ops
-                        .as_mut()
-                        .unwrap()
-                        .logits_i8(x, w, s, out_dim, in_dim, &resolved, out)
+                    ctx.logits_i8(x, w, s, out_dim, in_dim, &resolved, out)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                     return Ok(());
                 }
-                "i4" => {
-                    if disable_metal_i4 {
-                        // Gemma4 INT4 currently runs faster on the CPU-parallel path than
-                        // the mixed CPU-unpack/GPU-matmul tiered path.
-                    } else {
-                        // Fall back to tiered matmul logic for i4 until MetalOps supports it directly.
-                    }
-                }
-                "i2" => {}
                 _ => {}
-            }
-        }
-
-        if let GemmaLinearBackend::Metal { ctx } = &self.linear_backend {
-            if (dtype == "i4" && disable_metal_i4) || dtype == "i2" {
-                // Skip Metal linear for Gemma4 INT4 unless explicitly re-enabled.
-            } else {
-            let max_cols = if in_dim == 0 {
-                1
-            } else {
-                (GEMMA_METAL_LINEAR_MAX_ELEMS / in_dim).max(1)
-            };
-            let chunk_cols = max_cols.min(out_dim.max(1));
-            let mut weight_t_chunk = vec![0.0f32; in_dim * chunk_cols];
-            let mut out_chunk = vec![0.0f32; chunk_cols];
-            let mut metal_ok = true;
-
-            match dtype.as_str() {
-                "f16" => {
-                    let w = self.tensor_f16_by_exact_name(&resolved)?;
-                    if w.len() != out_dim * in_dim {
-                        return Err(CoreError::Backend(format!(
-                            "weight {weight_name} len mismatch: {} expected {}",
-                            w.len(),
-                            out_dim * in_dim
-                        )));
-                    }
-                    let mut row_start = 0usize;
-                    while row_start < out_dim {
-                        let cols_n = (out_dim - row_start).min(chunk_cols);
-                        for i in 0..in_dim {
-                            for c in 0..cols_n {
-                                let row_idx = row_start + c;
-                                weight_t_chunk[i * cols_n + c] =
-                                    f16::from_bits(w[row_idx * in_dim + i]).to_f32();
-                            }
-                        }
-                        let out_slice = &mut out_chunk[..cols_n];
-                        if ctx
-                            .matmul_row_major_f32(
-                                x,
-                                1,
-                                in_dim,
-                                &weight_t_chunk[..in_dim * cols_n],
-                                cols_n,
-                                out_slice,
-                            )
-                            .is_err()
-                        {
-                            metal_ok = false;
-                            break;
-                        }
-                        out[row_start..row_start + cols_n].copy_from_slice(out_slice);
-                        row_start += cols_n;
-                    }
-                }
-                "i4" => {
-                    let w = self.tensor_u8_by_exact_name(&resolved)?;
-                    let scales = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
-                    let row_stride = in_dim.div_ceil(2);
-                    if w.len() != out_dim * row_stride || scales.len() != out_dim {
-                        return Err(CoreError::Backend(format!(
-                            "weight {weight_name} i4/qscale len mismatch: w={} scales={} expected w={} scales={}",
-                            w.len(),
-                            scales.len(),
-                            out_dim * row_stride,
-                            out_dim
-                        )));
-                    }
-                    let mut row_start = 0usize;
-                    while row_start < out_dim {
-                        let cols_n = (out_dim - row_start).min(chunk_cols);
-                        for i in 0..in_dim {
-                            for c in 0..cols_n {
-                                let row_idx = row_start + c;
-                                let row = &w[row_idx * row_stride..(row_idx + 1) * row_stride];
-                                let scale = f16::from_bits(scales[row_idx]).to_f32();
-                                weight_t_chunk[i * cols_n + c] = unpack_i4(row, i) * scale;
-                            }
-                        }
-                        let out_slice = &mut out_chunk[..cols_n];
-                        if ctx
-                            .matmul_row_major_f32(
-                                x,
-                                1,
-                                in_dim,
-                                &weight_t_chunk[..in_dim * cols_n],
-                                cols_n,
-                                out_slice,
-                            )
-                            .is_err()
-                        {
-                            metal_ok = false;
-                            break;
-                        }
-                        out[row_start..row_start + cols_n].copy_from_slice(out_slice);
-                        row_start += cols_n;
-                    }
-                }
-                "i2" => {
-                    metal_ok = false;
-                }
-                "i8" => {
-                    let w = self.tensor_i8_by_exact_name(&resolved)?;
-                    let scales = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
-                    if w.len() != out_dim * in_dim || scales.len() != out_dim {
-                        return Err(CoreError::Backend(format!(
-                            "weight {weight_name} i8/qscale len mismatch: w={} scales={} expected w={} scales={}",
-                            w.len(),
-                            scales.len(),
-                            out_dim * in_dim,
-                            out_dim
-                        )));
-                    }
-                    let mut row_start = 0usize;
-                    while row_start < out_dim {
-                        let cols_n = (out_dim - row_start).min(chunk_cols);
-                        for i in 0..in_dim {
-                            for c in 0..cols_n {
-                                let row_idx = row_start + c;
-                                let scale = f16::from_bits(scales[row_idx]).to_f32();
-                                weight_t_chunk[i * cols_n + c] =
-                                    (w[row_idx * in_dim + i] as f32) * scale;
-                            }
-                        }
-                        let out_slice = &mut out_chunk[..cols_n];
-                        if ctx
-                            .matmul_row_major_f32(
-                                x,
-                                1,
-                                in_dim,
-                                &weight_t_chunk[..in_dim * cols_n],
-                                cols_n,
-                                out_slice,
-                            )
-                            .is_err()
-                        {
-                            metal_ok = false;
-                            break;
-                        }
-                        out[row_start..row_start + cols_n].copy_from_slice(out_slice);
-                        row_start += cols_n;
-                    }
-                }
-                _ => {
-                    metal_ok = false;
-                }
-            }
-
-            if metal_ok {
-                return Ok(());
-            }
-            if self.metal_strict {
-                return Err(CoreError::Backend(format!(
-                    "gemma full-metal: linear kernel failed for {weight_name}; CPU fallback disabled"
-                )));
-            }
             }
         }
 

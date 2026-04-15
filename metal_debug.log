@@ -1,0 +1,69 @@
+[2026-04-14T21:47:16Z INFO  infer] Backend: metal (smoke ok). Model-specific Metal acceleration enabled where available.
+Startup: backend check 0.05s
+Startup: model header load 0.00s ("models/to-huggingface/qwen2.5-0.5b-int8-v1/qwen2.5-0.5b-int8-v1.cellm")
+Startup: runner init 0.00s (type=qwen2)
+LLM backend: metal (Qwen full acceleration)
+Startup: metal init 0.00s
+Model: "models/to-huggingface/qwen2.5-0.5b-int8-v1/qwen2.5-0.5b-int8-v1.cellm"
+Config: layers=24 hidden=896 heads=14/2 vocab=151936
+RoPE theta: 1000000
+Max layers (active): 24
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|endoftext|>' was expected to have ID '151643' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|im_start|>' was expected to have ID '151644' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|im_end|>' was expected to have ID '151645' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|object_ref_start|>' was expected to have ID '151646' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|object_ref_end|>' was expected to have ID '151647' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|box_start|>' was expected to have ID '151648' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|box_end|>' was expected to have ID '151649' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|quad_start|>' was expected to have ID '151650' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|quad_end|>' was expected to have ID '151651' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|vision_start|>' was expected to have ID '151652' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|vision_end|>' was expected to have ID '151653' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|vision_pad|>' was expected to have ID '151654' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|image_pad|>' was expected to have ID '151655' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|video_pad|>' was expected to have ID '151656' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<tool_call>' was expected to have ID '151657' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '</tool_call>' was expected to have ID '151658' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|fim_prefix|>' was expected to have ID '151659' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|fim_middle|>' was expected to have ID '151660' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|fim_suffix|>' was expected to have ID '151661' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|fim_pad|>' was expected to have ID '151662' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|repo_name|>' was expected to have ID '151663' but was given ID 'None'
+[2026-04-14T21:47:16Z WARN  tokenizers::tokenizer::serialization] Warning: Token '<|file_sep|>' was expected to have ID '151664' but was given ID 'None'
+Startup: tokenizer load 0.10s
+Startup: prompt encode 0.07s
+Startup: KV init 0.00s
+KV cache: blocks=1 tokens_per_block=16 f16_bytes=196608
+KV encoding: F16
+Startup: total before prefill 0.23s
+[qwen-debug] pos=0 layer=0 kind=FullAttention in=0.417154 post_mixer=0.498079 out=7.750417
+[qwen-debug] pos=0 layer=1 kind=FullAttention in=7.750417 post_mixer=8.532605 out=9.095630
+[qwen-debug] pos=0 layer=2 kind=FullAttention in=9.095630 post_mixer=9.255111 out=184.945541
+[qwen-debug] pos=0 layer=3 kind=FullAttention in=184.945541 post_mixer=185.096573 out=198.433395
+[qwen-debug] pos=0 layer=4 kind=FullAttention in=198.433395 post_mixer=200.649628 out=201.052429
+[qwen-debug] pos=0 layer=5 kind=FullAttention in=201.052429 post_mixer=204.493988 out=206.964645
+[qwen-debug] pos=0 layer=6 kind=FullAttention in=206.964645 post_mixer=209.218552 out=209.460968
+[qwen-debug] pos=0 layer=7 kind=FullAttention in=209.460968 post_mixer=210.304123 out=210.535477
+[qwen-debug] pos=0 layer=8 kind=FullAttention in=210.535477 post_mixer=212.735580 out=212.844177
+[qwen-debug] pos=0 layer=9 kind=FullAttention in=212.844177 post_mixer=213.003647 out=213.191956
+[qwen-debug] pos=0 layer=10 kind=FullAttention in=213.191956 post_mixer=213.897797 out=214.033936
+[qwen-debug] pos=0 layer=11 kind=FullAttention in=214.033936 post_mixer=214.342514 out=214.290039
+[qwen-debug] pos=0 layer=12 kind=FullAttention in=214.290039 post_mixer=214.430466 out=214.175064
+[qwen-debug] pos=0 layer=13 kind=FullAttention in=214.175064 post_mixer=214.379044 out=213.871429
+[qwen-debug] pos=0 layer=14 kind=FullAttention in=213.871429 post_mixer=214.559128 out=214.248474
+[qwen-debug] pos=0 layer=15 kind=FullAttention in=214.248474 post_mixer=214.310486 out=214.004456
+[qwen-debug] pos=0 layer=16 kind=FullAttention in=214.004456 post_mixer=214.110992 out=213.719116
+[qwen-debug] pos=0 layer=17 kind=FullAttention in=213.719116 post_mixer=214.938187 out=214.616760
+[qwen-debug] pos=0 layer=18 kind=FullAttention in=214.616760 post_mixer=215.103699 out=214.712280
+[qwen-debug] pos=0 layer=19 kind=FullAttention in=214.712280 post_mixer=214.858643 out=214.146240
+[qwen-debug] pos=0 layer=20 kind=FullAttention in=214.146240 post_mixer=216.384811 out=214.530914
+[qwen-debug] pos=0 layer=21 kind=FullAttention in=214.530914 post_mixer=216.960724 out=196.306229
+[qwen-debug] pos=0 layer=22 kind=FullAttention in=196.306229 post_mixer=196.272705 out=185.342865
+[qwen-debug] pos=0 layer=23 kind=FullAttention in=185.342865 post_mixer=185.989182 out=183.554306
+[qwen-debug] pos=0 final pre_norm=183.554306 final=182.042877
+Prefill: 1 tokens in 0.21s (next=1299)
+step   0: token=1299 text=" rem"
+Decode: 1 tokens in 0.10s
+
+---
+rem

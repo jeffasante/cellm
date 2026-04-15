@@ -183,7 +183,7 @@ struct LLMView: View {
     private var qwenVariant: QwenVariant {
         guard isQwenSelected else { return .none }
         let modelName = modelURL?.lastPathComponent.lowercased() ?? ""
-        if modelName == "qwen3.5-0.8b.cellm" || modelName == "qwen3.5-0.8b-int8.cellm" {
+        if modelName == "qwen2.5-0.5b-int8-v1.cellm" {
             return .stable
         }
         if modelName.contains("qwen") {
@@ -262,18 +262,18 @@ struct LLMView: View {
                 .fontWeight(.semibold)
 
             modelDownloadCard(
-                title: "Gemma3-1B-IT (int8)",
-                subtitle: "Best on-device",
-                detail: "Native cellm model for iOS/Android. No LiteRT proxy runtime required.",
-                sizeText: "~1.2 GB",
-                isInstalled: hasGemma3Sample,
-                isSelected: selectedSampleLabel == "Gemma3-1B-IT (int8)",
+                title: "Gemma-4-E2B-IT (int4 aggr v5)",
+                subtitle: "Large native model",
+                detail: "Downloads the native `.cellmd` Gemma 4 model plus matching tokenizer from your Hugging Face repo.",
+                sizeText: "~3.34 GB + tokenizer",
+                isInstalled: hasGemma4E2BSample,
+                isSelected: selectedSampleLabel == "Gemma-4-E2B-IT (int4 aggr v5)",
                 onDownload: { downloadGemmaSampleAssets() },
                 onUseInstalled: {
                     selectInstalledSample(
-                        modelFile: DemoAssetLinks.gemma3FileName,
-                        tokenizerFile: DemoAssetLinks.gemma3TokenizerFileName,
-                        label: "Gemma3-1B-IT (int8)"
+                        modelFile: DemoAssetLinks.gemma4E2BFileName,
+                        tokenizerFile: DemoAssetLinks.gemma4E2BTokenizerFileName,
+                        label: "Gemma-4-E2B-IT (int4 aggr v5)"
                     )
                 }
             )
@@ -296,18 +296,18 @@ struct LLMView: View {
             )
 
             modelDownloadCard(
-                title: "Qwen3.5-0.8B",
-                subtitle: "Fast baseline",
-                detail: "Stable small model with good speed/quality tradeoff.",
-                sizeText: "~1.6 GB",
+                title: "Qwen2.5-0.5B (int8 v1)",
+                subtitle: "Small native model",
+                detail: "Downloads the Qwen 2.5 model and its matching tokenizer from your Hugging Face repo.",
+                sizeText: "~472 MB + tokenizer",
                 isInstalled: hasQwenStableSample,
-                isSelected: selectedSampleLabel == "Qwen3.5 (stable)",
+                isSelected: selectedSampleLabel == "Qwen2.5-0.5B (int8 v1)",
                 onDownload: { downloadQwenSampleAssets() },
                 onUseInstalled: {
                     selectInstalledSample(
-                        modelFile: DemoAssetLinks.qwen35StableFileName,
-                        tokenizerFile: DemoAssetLinks.qwen35TokenizerFileName,
-                        label: "Qwen3.5 (stable)"
+                        modelFile: DemoAssetLinks.qwen25FileName,
+                        tokenizerFile: DemoAssetLinks.qwen25TokenizerFileName,
+                        label: "Qwen2.5-0.5B (int8 v1)"
                     )
                 }
             )
@@ -377,17 +377,14 @@ struct LLMView: View {
             if showAdvancedDownloads {
                 actionButton(modelURL == nil ? "Pick .cellm model" : modelURL!.lastPathComponent, icon: "externaldrive") { showModelPicker = true }
                 actionButton(tokenizerURL == nil ? "Pick tokenizer.json" : tokenizerURL!.lastPathComponent, icon: "doc.text") { showTokenizerPicker = true }
-                actionButton(isDownloading ? "Downloading sample files…" : "Download Gemma3 model only (~1.2 GB)", icon: "shippingbox", disabled: isDownloading || isRunning) {
+                actionButton(isDownloading ? "Downloading sample files…" : "Download Gemma 4 model only (~3.34 GB)", icon: "shippingbox", disabled: isDownloading || isRunning) {
                     downloadGemmaModelOnly()
                 }
-                actionButton(isDownloading ? "Downloading sample files…" : "Download Gemma3 tokenizer JSON only", icon: "arrow.down.doc", disabled: isDownloading || isRunning) {
+                actionButton(isDownloading ? "Downloading sample files…" : "Download Gemma 4 tokenizer JSON only", icon: "arrow.down.doc", disabled: isDownloading || isRunning) {
                     downloadGemmaTokenizerOnly()
                 }
-                actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen stable model only (~1.6 GB)", icon: "shippingbox", disabled: isDownloading || isRunning) {
+                actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen 2.5 model only (~472 MB)", icon: "shippingbox", disabled: isDownloading || isRunning) {
                     downloadQwenModelOnly()
-                }
-                actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen compact model only (~361 MB, experimental)", icon: "shippingbox", disabled: isDownloading || isRunning) {
-                    downloadQwenCompactModelOnly()
                 }
                 actionButton(isDownloading ? "Downloading sample files…" : "Download Qwen tokenizer JSON only", icon: "arrow.down.doc", disabled: isDownloading || isRunning) {
                     downloadQwenTokenizerOnly()
@@ -408,11 +405,11 @@ struct LLMView: View {
         }
     }
 
-    private var hasGemma3Sample: Bool {
+    private var hasGemma4E2BSample: Bool {
         hasSampleFiles(
-            modelFile: DemoAssetLinks.gemma3FileName,
-            tokenizerFile: DemoAssetLinks.gemma3TokenizerFileName,
-            tokenizerConfigFile: DemoAssetLinks.gemma3TokenizerConfigFileName
+            modelFile: DemoAssetLinks.gemma4E2BFileName,
+            tokenizerFile: DemoAssetLinks.gemma4E2BTokenizerFileName,
+            tokenizerConfigFile: DemoAssetLinks.gemma4E2BTokenizerConfigFileName
         )
     }
 
@@ -426,9 +423,9 @@ struct LLMView: View {
 
     private var hasQwenStableSample: Bool {
         hasSampleFiles(
-            modelFile: DemoAssetLinks.qwen35StableFileName,
-            tokenizerFile: DemoAssetLinks.qwen35TokenizerFileName,
-            tokenizerConfigFile: DemoAssetLinks.qwen35TokenizerConfigFileName
+            modelFile: DemoAssetLinks.qwen25FileName,
+            tokenizerFile: DemoAssetLinks.qwen25TokenizerFileName,
+            tokenizerConfigFile: DemoAssetLinks.qwen25TokenizerConfigFileName
         )
     }
 
@@ -440,10 +437,14 @@ struct LLMView: View {
         )
     }
 
-    private func hasSampleFiles(modelFile: String, tokenizerFile: String, tokenizerConfigFile: String) -> Bool {
-        RemoteAssets.existingDocumentsFile(fileName: modelFile) != nil &&
-        RemoteAssets.existingDocumentsFile(fileName: tokenizerFile) != nil &&
-        RemoteAssets.existingDocumentsFile(fileName: tokenizerConfigFile) != nil
+    private func hasSampleFiles(modelFile: String, tokenizerFile: String, tokenizerConfigFile: String? = nil) -> Bool {
+        let hasConfig = tokenizerConfigFile.map {
+            RemoteAssets.existingDocumentsFile(fileName: $0) != nil
+        } ?? true
+        return
+            RemoteAssets.existingDocumentsFile(fileName: modelFile) != nil &&
+            RemoteAssets.existingDocumentsFile(fileName: tokenizerFile) != nil &&
+            hasConfig
     }
 
     private func selectInstalledSample(modelFile: String, tokenizerFile: String, label: String) {
@@ -620,11 +621,11 @@ struct LLMView: View {
             if isQwenSelected {
                 switch qwenVariant {
                 case .stable:
-                    Text("Qwen parity-fixed model selected. Recommended: qwen3.5-0.8b.cellm or qwen3.5-0.8b-int8.cellm.")
+                    Text("Qwen 2.5 native int8 model selected.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 case .experimental:
-                    Text("This Qwen model is experimental on current mobile runner (for example int8/int4) and may produce degraded output. Use qwen3.5-0.8b.cellm for best quality.")
+                    Text("This Qwen model is not one of the app's known presets and may produce degraded output.")
                         .font(.footnote)
                         .foregroundStyle(.orange)
                 case .none:
@@ -1048,10 +1049,10 @@ Assistant:
 
     private func downloadQwenSampleAssets() {
         errorText = nil
-        selectedSampleLabel = "Qwen3.5 (stable)"
-        if let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35StableFileName),
-           let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35TokenizerFileName),
-           RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35TokenizerConfigFileName) != nil {
+        selectedSampleLabel = "Qwen2.5-0.5B (int8 v1)"
+        if let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen25FileName),
+           let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen25TokenizerFileName),
+           RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen25TokenizerConfigFileName) != nil {
             modelURL = model
             tokenizerURL = tok
             downloadStatus = "Using existing files in Documents."
@@ -1068,24 +1069,24 @@ Assistant:
             do {
                 let totalFiles = 3.0
                 let modelPath = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.qwen35Stable,
-                    fileName: DemoAssetLinks.qwen35StableFileName,
+                    from: DemoAssetLinks.qwen25Int8,
+                    fileName: DemoAssetLinks.qwen25FileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "Qwen stable", fileName: DemoAssetLinks.qwen35StableFileName)
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "Qwen 2.5", fileName: DemoAssetLinks.qwen25FileName)
                     }
                 )
                 let tokPath = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.qwen35Tokenizer,
-                    fileName: DemoAssetLinks.qwen35TokenizerFileName,
+                    from: DemoAssetLinks.qwen25Tokenizer,
+                    fileName: DemoAssetLinks.qwen25TokenizerFileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "Qwen", fileName: DemoAssetLinks.qwen35TokenizerFileName)
+                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "Qwen 2.5", fileName: DemoAssetLinks.qwen25TokenizerFileName)
                     }
                 )
                 _ = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.qwen35TokenizerConfig,
-                    fileName: DemoAssetLinks.qwen35TokenizerConfigFileName,
+                    from: DemoAssetLinks.qwen25TokenizerConfig,
+                    fileName: DemoAssetLinks.qwen25TokenizerConfigFileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 2.0, progress: p, totalFiles: totalFiles, label: "Qwen", fileName: DemoAssetLinks.qwen35TokenizerConfigFileName)
+                        setDownloadProgress(completedFiles: 2.0, progress: p, totalFiles: totalFiles, label: "Qwen 2.5", fileName: DemoAssetLinks.qwen25TokenizerConfigFileName)
                     }
                 )
                 await MainActor.run {
@@ -1174,10 +1175,10 @@ Assistant:
 
     private func downloadGemmaSampleAssets() {
         errorText = nil
-        selectedSampleLabel = "Gemma3-1B-IT (int8)"
-        if let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3FileName),
-           let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerFileName),
-           RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerConfigFileName) != nil {
+        selectedSampleLabel = "Gemma-4-E2B-IT (int4 aggr v5)"
+        if let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma4E2BFileName),
+           let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma4E2BTokenizerFileName),
+           RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma4E2BTokenizerConfigFileName) != nil {
             modelURL = model
             tokenizerURL = tok
             downloadStatus = "Using existing files in Documents."
@@ -1194,24 +1195,24 @@ Assistant:
             do {
                 let totalFiles = 3.0
                 let modelPath = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.gemma3Int8,
-                    fileName: DemoAssetLinks.gemma3FileName,
+                    from: DemoAssetLinks.gemma4E2B,
+                    fileName: DemoAssetLinks.gemma4E2BFileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "Gemma3", fileName: DemoAssetLinks.gemma3FileName)
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "Gemma 4", fileName: DemoAssetLinks.gemma4E2BFileName)
                     }
                 )
                 let tokPath = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.gemma3Tokenizer,
-                    fileName: DemoAssetLinks.gemma3TokenizerFileName,
+                    from: DemoAssetLinks.gemma4E2BTokenizer,
+                    fileName: DemoAssetLinks.gemma4E2BTokenizerFileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "Gemma3 tokenizer", fileName: DemoAssetLinks.gemma3TokenizerFileName)
+                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "Gemma 4 tokenizer", fileName: DemoAssetLinks.gemma4E2BTokenizerFileName)
                     }
                 )
                 _ = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.gemma3TokenizerConfig,
-                    fileName: DemoAssetLinks.gemma3TokenizerConfigFileName,
+                    from: DemoAssetLinks.gemma4E2BTokenizerConfig,
+                    fileName: DemoAssetLinks.gemma4E2BTokenizerConfigFileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 2.0, progress: p, totalFiles: totalFiles, label: "Gemma3 tokenizer", fileName: DemoAssetLinks.gemma3TokenizerConfigFileName)
+                        setDownloadProgress(completedFiles: 2.0, progress: p, totalFiles: totalFiles, label: "Gemma 4 tokenizer", fileName: DemoAssetLinks.gemma4E2BTokenizerConfigFileName)
                     }
                 )
                 await MainActor.run {
@@ -1256,8 +1257,8 @@ Assistant:
 
     private func downloadGemmaModelOnly() {
         errorText = nil
-        selectedSampleLabel = "Gemma3-1B-IT (int8)"
-        downloadStatus = "Downloading Gemma3 model only..."
+        selectedSampleLabel = "Gemma-4-E2B-IT (int4 aggr v5)"
+        downloadStatus = "Downloading Gemma 4 model only..."
         downloadProgress = 0
         currentDownloadFile = ""
         currentDownloadSizeText = ""
@@ -1265,10 +1266,10 @@ Assistant:
         Task {
             do {
                 let modelPath = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.gemma3Int8,
-                    fileName: DemoAssetLinks.gemma3FileName,
+                    from: DemoAssetLinks.gemma4E2B,
+                    fileName: DemoAssetLinks.gemma4E2BFileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: 1.0, label: "Gemma3 model", fileName: DemoAssetLinks.gemma3FileName)
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: 1.0, label: "Gemma 4 model", fileName: DemoAssetLinks.gemma4E2BFileName)
                     }
                 )
                 await MainActor.run {
@@ -1293,8 +1294,8 @@ Assistant:
 
     private func downloadGemmaTokenizerOnly() {
         errorText = nil
-        selectedSampleLabel = "Gemma3-1B-IT (int8)"
-        downloadStatus = "Downloading Gemma3 tokenizer JSONs..."
+        selectedSampleLabel = "Gemma-4-E2B-IT (int4 aggr v5)"
+        downloadStatus = "Downloading Gemma 4 tokenizer JSONs..."
         downloadProgress = 0
         currentDownloadFile = ""
         currentDownloadSizeText = ""
@@ -1303,23 +1304,23 @@ Assistant:
             do {
                 let totalFiles = 2.0
                 let tokPath = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.gemma3Tokenizer,
-                    fileName: DemoAssetLinks.gemma3TokenizerFileName,
+                    from: DemoAssetLinks.gemma4E2BTokenizer,
+                    fileName: DemoAssetLinks.gemma4E2BTokenizerFileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "Gemma3 tokenizer", fileName: DemoAssetLinks.gemma3TokenizerFileName)
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "Gemma 4 tokenizer", fileName: DemoAssetLinks.gemma4E2BTokenizerFileName)
                     }
                 )
                 _ = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.gemma3TokenizerConfig,
-                    fileName: DemoAssetLinks.gemma3TokenizerConfigFileName,
+                    from: DemoAssetLinks.gemma4E2BTokenizerConfig,
+                    fileName: DemoAssetLinks.gemma4E2BTokenizerConfigFileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "Gemma3 tokenizer", fileName: DemoAssetLinks.gemma3TokenizerConfigFileName)
+                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "Gemma 4 tokenizer", fileName: DemoAssetLinks.gemma4E2BTokenizerConfigFileName)
                     }
                 )
                 await MainActor.run {
                     self.tokenizerURL = tokPath
                     self.downloadProgress = 1.0
-                    self.downloadStatus = "Saved tokenizer JSONs for Gemma3."
+                    self.downloadStatus = "Saved tokenizer JSONs for Gemma 4."
                     self.currentDownloadFile = ""
                     self.currentDownloadSizeText = ""
                     self.isDownloading = false
@@ -1338,8 +1339,8 @@ Assistant:
 
     private func downloadQwenModelOnly() {
         errorText = nil
-        selectedSampleLabel = "Qwen3.5 (stable)"
-        downloadStatus = "Downloading Qwen stable model only..."
+        selectedSampleLabel = "Qwen2.5-0.5B (int8 v1)"
+        downloadStatus = "Downloading Qwen 2.5 model only..."
         downloadProgress = 0
         currentDownloadFile = ""
         currentDownloadSizeText = ""
@@ -1347,10 +1348,10 @@ Assistant:
         Task {
             do {
                 let modelPath = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.qwen35Stable,
-                    fileName: DemoAssetLinks.qwen35StableFileName,
+                    from: DemoAssetLinks.qwen25Int8,
+                    fileName: DemoAssetLinks.qwen25FileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: 1.0, label: "Qwen stable", fileName: DemoAssetLinks.qwen35StableFileName)
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: 1.0, label: "Qwen 2.5 model", fileName: DemoAssetLinks.qwen25FileName)
                     }
                 )
                 await MainActor.run {
@@ -1375,8 +1376,8 @@ Assistant:
 
     private func downloadQwenTokenizerOnly() {
         errorText = nil
-        selectedSampleLabel = "Qwen3.5"
-        downloadStatus = "Downloading Qwen tokenizer JSONs..."
+        selectedSampleLabel = "Qwen2.5-0.5B (int8 v1)"
+        downloadStatus = "Downloading Qwen 2.5 tokenizer JSONs..."
         downloadProgress = 0
         currentDownloadFile = ""
         currentDownloadSizeText = ""
@@ -1385,23 +1386,23 @@ Assistant:
             do {
                 let totalFiles = 2.0
                 let tokPath = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.qwen35Tokenizer,
-                    fileName: DemoAssetLinks.qwen35TokenizerFileName,
+                    from: DemoAssetLinks.qwen25Tokenizer,
+                    fileName: DemoAssetLinks.qwen25TokenizerFileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "Qwen tokenizer", fileName: DemoAssetLinks.qwen35TokenizerFileName)
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: totalFiles, label: "Qwen 2.5 tokenizer", fileName: DemoAssetLinks.qwen25TokenizerFileName)
                     }
                 )
                 _ = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.qwen35TokenizerConfig,
-                    fileName: DemoAssetLinks.qwen35TokenizerConfigFileName,
+                    from: DemoAssetLinks.qwen25TokenizerConfig,
+                    fileName: DemoAssetLinks.qwen25TokenizerConfigFileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "Qwen tokenizer", fileName: DemoAssetLinks.qwen35TokenizerConfigFileName)
+                        setDownloadProgress(completedFiles: 1.0, progress: p, totalFiles: totalFiles, label: "Qwen 2.5 tokenizer", fileName: DemoAssetLinks.qwen25TokenizerConfigFileName)
                     }
                 )
                 await MainActor.run {
                     self.tokenizerURL = tokPath
                     self.downloadProgress = 1.0
-                    self.downloadStatus = "Saved tokenizer JSONs for Qwen."
+                    self.downloadStatus = "Saved tokenizer JSONs for Qwen 2.5."
                     self.currentDownloadFile = ""
                     self.currentDownloadSizeText = ""
                     self.isDownloading = false
@@ -1420,8 +1421,8 @@ Assistant:
 
     private func downloadQwenCompactModelOnly() {
         errorText = nil
-        selectedSampleLabel = "Qwen3.5 (compact/experimental)"
-        downloadStatus = "Downloading Qwen compact model only..."
+        selectedSampleLabel = "Qwen2.5-0.5B (int8 v1)"
+        downloadStatus = "Downloading Qwen 2.5 model only..."
         downloadProgress = 0
         currentDownloadFile = ""
         currentDownloadSizeText = ""
@@ -1429,16 +1430,16 @@ Assistant:
         Task {
             do {
                 let modelPath = try await RemoteAssets.downloadToDocuments(
-                    from: DemoAssetLinks.qwen35CompactInt4TextOnly,
-                    fileName: DemoAssetLinks.qwen35CompactFileName,
+                    from: DemoAssetLinks.qwen25Int8,
+                    fileName: DemoAssetLinks.qwen25FileName,
                     progress: { p in
-                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: 1.0, label: "Qwen compact", fileName: DemoAssetLinks.qwen35CompactFileName)
+                        setDownloadProgress(completedFiles: 0.0, progress: p, totalFiles: 1.0, label: "Qwen 2.5 model", fileName: DemoAssetLinks.qwen25FileName)
                     }
                 )
                 await MainActor.run {
                     self.modelURL = modelPath
                     self.downloadProgress = 1.0
-                    self.downloadStatus = "Saved compact model: \(modelPath.lastPathComponent)"
+                    self.downloadStatus = "Saved model: \(modelPath.lastPathComponent)"
                     self.currentDownloadFile = ""
                     self.currentDownloadSizeText = ""
                     self.isDownloading = false
@@ -1538,16 +1539,13 @@ Assistant:
     }
 
     private func restoreAssets() {
-        let gemmaModel = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3FileName)
-            ?? RemoteAssets.existingDocumentsFile(fileName: "gemma-3-1b-it-int8.cellmd")
-        let gemmaTok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerFileName)
-            ?? RemoteAssets.existingDocumentsFile(fileName: "tokenizer-gemma-3-1b-it.json")
-        let gemmaCfg = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerConfigFileName) != nil
-            || RemoteAssets.existingDocumentsFile(fileName: "tokenizer_config.json") != nil
+        let gemmaModel = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma4E2BFileName)
+        let gemmaTok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma4E2BTokenizerFileName)
+        let gemmaCfg = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma4E2BTokenizerConfigFileName) != nil
         if let gemmaModel, let gemmaTok, gemmaCfg {
             modelURL = gemmaModel
             tokenizerURL = gemmaTok
-            selectedSampleLabel = "Gemma3-1B-IT (int8)"
+            selectedSampleLabel = "Gemma-4-E2B-IT (int4 aggr v5)"
             if downloadStatus.isEmpty { downloadStatus = "Loaded local sample files." }
             return
         }
@@ -1563,21 +1561,18 @@ Assistant:
             return
         }
 
-        let qwenModel = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35StableFileName)
-            ?? RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35CompactFileName)
-            ?? RemoteAssets.existingDocumentsFile(fileName: "qwen3.5-0.8b-int4-textonly.cellm")
-            ?? RemoteAssets.existingDocumentsFile(fileName: "qwen3.5-0.8b.cellm")
-        let qwenTok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35TokenizerFileName)
-            ?? RemoteAssets.existingDocumentsFile(fileName: "tokenizer-qwen3.5-0.8b.json")
-        let qwenCfg = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35TokenizerConfigFileName) != nil
-            || RemoteAssets.existingDocumentsFile(fileName: "tokenizer_config.json") != nil
+        let qwenModel = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen25FileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "qwen2.5-0.5b-int8-v1.cellm")
+        let qwenTok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen25TokenizerFileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "tokenizer.json")
+        let qwenCfg = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen25TokenizerConfigFileName) != nil
         if let qwenModel, let qwenTok, qwenCfg {
             modelURL = qwenModel
             tokenizerURL = qwenTok
             let n = qwenModel.lastPathComponent.lowercased()
-            selectedSampleLabel = (n == "qwen3.5-0.8b.cellm" || n == "qwen3.5-0.8b-int8.cellm")
-                ? "Qwen3.5 (parity-fixed)"
-                : "Qwen3.5 (experimental)"
+            selectedSampleLabel = (n == "qwen2.5-0.5b-int8-v1.cellm")
+                ? "Qwen2.5-0.5B (int8 v1)"
+                : "Qwen (custom)"
             if downloadStatus.isEmpty { downloadStatus = "Loaded local sample files." }
             return
         }
@@ -1601,20 +1596,17 @@ Assistant:
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma42p3bFileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma42p3bTokenizerFileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma42p3bTokenizerConfigFileName)
-        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma3FileName)
-        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerFileName)
-        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerConfigFileName)
-        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.qwen35StableFileName)
-        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.qwen35CompactFileName)
-        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.qwen35TokenizerFileName)
-        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.qwen35TokenizerConfigFileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma4E2BFileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma4E2BTokenizerFileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.gemma4E2BTokenizerConfigFileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.qwen25FileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.qwen25TokenizerFileName)
+        RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.qwen25TokenizerConfigFileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smollm2FileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerFileName)
         RemoteAssets.removeDocumentsFile(fileName: DemoAssetLinks.smollm2TokenizerConfigFileName)
-        RemoteAssets.removeDocumentsFile(fileName: "qwen3.5-0.8b-int4-textonly.cellm")
-        RemoteAssets.removeDocumentsFile(fileName: "tokenizer-qwen3.5-0.8b.json")
+        RemoteAssets.removeDocumentsFile(fileName: "qwen2.5-0.5b-int8-v1.cellm")
         RemoteAssets.removeDocumentsFile(fileName: "smollm2-135m-int8.cellm")
-        RemoteAssets.removeDocumentsFile(fileName: "tokenizer-smollm2-135m.json")
         RemoteAssets.removeDocumentsFile(fileName: "tokenizer_config.json")
         RemoteAssets.removeDocumentsFile(fileName: "picked")
         modelURL = nil
@@ -1633,7 +1625,7 @@ Assistant:
             downloadSmolLMSampleAssets()
         } else if priorSelection == "Gemma-4-2P3B-IT (LiteRT)" {
             downloadGemma4LiteRtAssets()
-        } else if priorSelection == "Gemma3-1B-IT (int8)" {
+        } else if priorSelection == "Gemma-4-E2B-IT (int4 aggr v5)" {
             downloadGemmaSampleAssets()
         } else {
             downloadQwenSampleAssets()

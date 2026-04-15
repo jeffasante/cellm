@@ -58,6 +58,13 @@ struct Args {
     #[arg(long, default_value_t = false)]
     quantize_int2_symmetric: bool,
 
+    /// Quantize eligible text weights to FP8 E4M3.
+    ///
+    /// This keeps per-value exponents and is intended as a higher-quality,
+    /// smaller-than-f16 format for Gemma text experiments.
+    #[arg(long, default_value_t = false)]
+    quantize_fp8_e4m3: bool,
+
     /// Gemma4-only aggressive INT4 profile:
     /// quantize most 2D text weights (including embeddings / lm_head when present)
     /// while keeping norm-style tensors in f16.
@@ -241,6 +248,7 @@ enum TensorOp {
     QuantizeI4Scales { weight_name: String },
     QuantizeI2Data,
     QuantizeI2Scales { weight_name: String },
+    QuantizeFp8E4M3,
 }
 
 fn main() -> Result<()> {
@@ -336,6 +344,13 @@ fn main() -> Result<()> {
             "choose only one quantization mode: --quantize-int2-symmetric, --quantize-int4-symmetric, or --quantize-int8-symmetric"
         );
     }
+    if args.quantize_fp8_e4m3
+        && (args.quantize_int2_symmetric || args.quantize_int4_symmetric || args.quantize_int8_symmetric)
+    {
+        anyhow::bail!(
+            "choose only one quantization mode: --quantize-fp8-e4m3, --quantize-int2-symmetric, --quantize-int4-symmetric, or --quantize-int8-symmetric"
+        );
+    }
     if (args.gemma4_aggressive_int4 as u8
         + args.gemma4_balanced_int4 as u8
         + args.gemma4_awq_lite_int4 as u8
@@ -365,12 +380,19 @@ fn main() -> Result<()> {
             selected.model_type
         );
     }
+    if args.quantize_fp8_e4m3 && !selected.model_type.starts_with("gemma") {
+        anyhow::bail!(
+            "--quantize-fp8-e4m3 is currently supported for gemma text stacks only (detected model_type={}).",
+            selected.model_type
+        );
+    }
 
     let plans = build_tensor_plans(
         &safetensors_paths,
         args.dequant_4bit_affine,
         has_4bit_affine,
         quant_group_size,
+        args.quantize_fp8_e4m3,
         args.quantize_int8_symmetric,
         args.quantize_int4_symmetric,
         args.quantize_int2_symmetric,
@@ -563,6 +585,12 @@ fn main() -> Result<()> {
                     format!("tensor {} in {:?}", p.name, safetensors_paths[p.file_idx])
                 })?;
                 write_quant_i8_data_per_row_symmetric(t.data(), t.shape(), t.dtype(), &mut w)?;
+            }
+            TensorOp::QuantizeFp8E4M3 => {
+                let t = st.tensor(&p.name).with_context(|| {
+                    format!("tensor {} in {:?}", p.name, safetensors_paths[p.file_idx])
+                })?;
+                write_quant_fp8_e4m3(t.data(), t.dtype(), &mut w)?;
             }
             TensorOp::QuantizeI8Scales { weight_name } => {
                 let t = st.tensor(weight_name).with_context(|| {
@@ -950,6 +978,7 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
     // Skip those tensors in this mode so conversion can complete on constrained machines.
     let skip_gemma4_per_layer = arch == "gemma4"
         && (args.quantize_int2_symmetric
+            || args.quantize_fp8_e4m3
             || args.quantize_int4_symmetric
             || args.quantize_int8_symmetric);
     for src in &parsed.tensors {
@@ -1007,6 +1036,32 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
         let mut final_out_nbytes = out_nbytes;
 
         // Apply quantization if requested and if the tensor is a candidate (usually 2D weights)
+        if args.quantize_fp8_e4m3
+            && shape.len() >= 1
+            && !is_quantization_excluded_name(&dst_name)
+        {
+            final_out_nbytes = numel;
+
+            out_tensors.push(GgufOutTensor {
+                src_name: src.name.clone(),
+                src_dims: src.dims.clone(),
+                name: dst_name.clone(),
+                shape: shape.clone(),
+                header_shape: shape.clone(),
+                out_dtype: "f8e4m3".to_string(),
+                src_type: src.ggml_type,
+                src_offset,
+                src_nbytes,
+                out_nbytes: final_out_nbytes,
+                out_offset: 0,
+                reverse_2d,
+                is_q8_head: false,
+                layer_idx,
+                op: TensorOp::QuantizeFp8E4M3,
+            });
+            continue;
+        }
+
         if args.quantize_int2_symmetric
             && shape.len() == 2
             && !is_quantization_excluded_name(&dst_name)
@@ -1157,7 +1212,7 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
             reverse_2d,
             is_q8_head: false,
             layer_idx,
-            op,
+            op: TensorOp::CopyAsF16,
         });
     }
 
@@ -1379,6 +1434,10 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
                     Dtype::F16,
                     &mut w,
                 )?;
+            }
+            TensorOp::QuantizeFp8E4M3 => {
+                let f16_data = decode_gguf_all_f16(src, p.src_type, numel)?;
+                write_quant_fp8_e4m3(cast_slice(&f16_data), Dtype::F16, &mut w)?;
             }
             TensorOp::QuantizeI4Data => {
                 // First decode GGUF specialized quant to f16, then re-quant to cellm int4
@@ -2784,6 +2843,7 @@ fn build_tensor_plans(
     dequant_4bit_affine: bool,
     has_4bit_affine: bool,
     group_size: usize,
+    quantize_fp8_e4m3: bool,
     quantize_int8_symmetric: bool,
     quantize_int4_symmetric: bool,
     quantize_int2_symmetric: bool,
@@ -2848,6 +2908,11 @@ fn build_tensor_plans(
             {
                 out_dtype = "i8".to_string();
                 TensorOp::QuantizeI8Data
+            } else if quantize_fp8_e4m3
+                && should_quantize_fp8_weight(model_type, name, &shape)
+            {
+                out_dtype = "f8e4m3".to_string();
+                TensorOp::QuantizeFp8E4M3
             } else if quantize_int4_symmetric
                 && should_quantize_i4_weight(
                     model_type,
@@ -2891,7 +2956,7 @@ fn build_tensor_plans(
             }
 
             let numel = out_shape.iter().product::<usize>();
-            let out_nbytes = if out_dtype == "i8" {
+            let out_nbytes = if out_dtype == "i8" || out_dtype == "f8e4m3" {
                 numel
             } else if out_dtype == "i2" {
                 i2_packed_nbytes_for_shape(&out_shape)?
@@ -3172,6 +3237,27 @@ fn should_quantize_i2_weight(model_type: &str, name: &str, shape: &[usize]) -> b
     name.contains(".self_attn.") || name.contains(".mlp.")
 }
 
+fn should_quantize_fp8_weight(model_type: &str, name: &str, shape: &[usize]) -> bool {
+    if !model_type.starts_with("gemma") {
+        return false;
+    }
+    if shape.is_empty() || !name.ends_with(".weight") {
+        return false;
+    }
+    if name.contains("norm")
+        || name.contains("q_norm")
+        || name.contains("k_norm")
+        || name.contains("rope_freqs")
+        || name.contains("layer_output_scale")
+        || name.contains("per_layer_proj_norm")
+    {
+        return false;
+    }
+    name.starts_with("model.")
+        || name.starts_with("model.text_model.")
+        || name.starts_with("model.language_model.")
+}
+
 fn should_quantize_i8_weight(
     model_type: &str,
     name: &str,
@@ -3437,8 +3523,68 @@ fn tensor_data_to_f32(data: &[u8], dtype: Dtype) -> Result<Vec<f32>> {
         }
         Dtype::F16 => f16_bytes_to_f32_slice(data),
         Dtype::BF16 => bf16_bytes_to_f32_slice(data),
+        Dtype::U8 => Ok(data.iter().map(|&b| fp8_e4m3_to_f32(b)).collect()),
         other => anyhow::bail!("unsupported dtype for int8 quantization: {other:?}"),
     }
+}
+
+fn write_quant_fp8_e4m3(data: &[u8], dtype: Dtype, w: &mut impl Write) -> Result<()> {
+    let values = tensor_data_to_f32(data, dtype)?;
+    let packed: Vec<u8> = values.into_iter().map(f32_to_fp8_e4m3).collect();
+    w.write_all(&packed)?;
+    Ok(())
+}
+
+fn fp8_e4m3_to_f32(bits: u8) -> f32 {
+    let sign = if (bits & 0x80) != 0 { -1.0 } else { 1.0 };
+    let exp = ((bits >> 3) & 0x0f) as i32;
+    let mant = (bits & 0x07) as i32;
+    if exp == 0 {
+        if mant == 0 {
+            return if sign < 0.0 { -0.0 } else { 0.0 };
+        }
+        let frac = mant as f32 / 8.0;
+        return sign * frac * 2f32.powi(-6);
+    }
+    if exp == 0x0f {
+        return sign * 240.0;
+    }
+    let frac = 1.0 + (mant as f32 / 8.0);
+    sign * frac * 2f32.powi(exp - 7)
+}
+
+fn f32_to_fp8_e4m3(v: f32) -> u8 {
+    if !v.is_finite() {
+        return if v.is_sign_negative() { 0xff } else { 0x7f };
+    }
+    if v == 0.0 {
+        return if v.is_sign_negative() { 0x80 } else { 0x00 };
+    }
+    let sign = if v.is_sign_negative() { 0x80 } else { 0x00 };
+    let x = v.abs();
+    if x >= 240.0 {
+        return sign | 0x77;
+    }
+
+    // Smallest normal is 2^-6; below that we use 3-bit subnorm mantissas.
+    let min_normal = 2f32.powi(-6);
+    if x < min_normal {
+        let mant = (x / min_normal * 8.0).round().clamp(0.0, 7.0) as u8;
+        return sign | mant;
+    }
+
+    let exp_unbiased = x.log2().floor() as i32;
+    let mut exp_field = (exp_unbiased + 7).clamp(1, 14);
+    let base = 2f32.powi(exp_field - 7);
+    let mut mant = ((x / base - 1.0) * 8.0).round() as i32;
+    if mant >= 8 {
+        exp_field += 1;
+        mant = 0;
+    }
+    if exp_field >= 15 {
+        return sign | 0x77;
+    }
+    sign | ((exp_field as u8) << 3) | ((mant as u8) & 0x07)
 }
 
 fn write_quant_i8_data_per_row_symmetric(

@@ -2,6 +2,10 @@
 use metal::{Buffer, CommandQueue, ComputePipelineState, Device, Library, MTLResourceOptions};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use objc::rc::autoreleasepool;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::cell::RefCell;
+use std::sync::Mutex;
+use std::collections::HashMap;
 
 pub struct MetalKernels;
 
@@ -390,13 +394,14 @@ kernel void rms_norm_f16w(
         float v = x[i];
         local_sq += v * v;
     }
-    shared[tid] = local_sq;
+    float inv_n = 1.0f / float(n);
+    shared[tid] = (tid < n) ? (local_sq * inv_n) : 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = tgsize >> 1; stride > 0; stride >>= 1) {
         if (tid < stride) shared[tid] += shared[tid + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float inv_rms = rsqrt(shared[0] / float(n) + eps);
+    float inv_rms = rsqrt(shared[0] + eps);
     for (uint i = tid; i < n; i += tgsize) {
         float wf = float(as_type<half>(w[i]));
         if (w_add_one) wf += 1.0f;
@@ -570,6 +575,38 @@ kernel void mv2_f16(
     }
     out1[off] = acc;
 }
+
+// Fused dual matrix-vector (i8 weights): out0 and out1 in one launch.
+kernel void mv2_i8(
+    device const char*   w0   [[buffer(0)]],
+    device const char*   w1   [[buffer(1)]],
+    device const ushort* s0   [[buffer(2)]],
+    device const ushort* s1   [[buffer(3)]],
+    device const float*  x    [[buffer(4)]],
+    device       float*  o0   [[buffer(5)]],
+    device       float*  o1   [[buffer(6)]],
+    constant     uint&   r0   [[buffer(7)]],
+    constant     uint&   r1   [[buffer(8)]],
+    constant     uint&   c    [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = r0 + r1;
+    if (gid >= total) return;
+    if (gid < r0) {
+        float scale = float(as_type<half>(s0[gid]));
+        device const char* row_ptr = w0 + gid * c;
+        float acc = 0.0f;
+        for (uint i = 0; i < c; ++i) acc += x[i] * float(row_ptr[i]);
+        o0[gid] = acc * scale;
+    } else {
+        uint off = gid - r0;
+        float scale = float(as_type<half>(s1[off]));
+        device const char* row_ptr = w1 + off * c;
+        float acc = 0.0f;
+        for (uint i = 0; i < c; ++i) acc += x[i] * float(row_ptr[i]);
+        o1[off] = acc * scale;
+    }
+}
 "#;
 
 // Apple platform implementation
@@ -586,13 +623,15 @@ pub struct MetalOps {
     pub pso_mv_i8: ComputePipelineState,
     pub pso_mv_qkv_f16: ComputePipelineState,
     pub pso_mv2_f16: ComputePipelineState,
+    pub pso_mv2_i8: ComputePipelineState,
     pub pso_add_f32: ComputePipelineState,
     pub pso_silu_mul_f32: ComputePipelineState,
-    x_buf: Option<Buffer>,
-    w_buf: Option<Buffer>,
-    out_buf: Option<Buffer>,
-    /// Cache large tensor uploads (e.g. embedding table) by name.
-    tensor_cache: std::collections::HashMap<String, Buffer>,
+    // Scratch buffers
+    x_buf: RefCell<Option<Buffer>>,
+    w_buf: RefCell<Option<Buffer>>,
+    out_buf: RefCell<Option<Buffer>>,
+    /// Cache large tensor uploads by name.
+    tensor_cache: Mutex<HashMap<String, Buffer>>,
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -617,38 +656,45 @@ impl MetalOps {
         let pso_mv_i8     = build_pso_ops(&device, &lib, "mv_i8")?;
         let pso_mv_qkv_f16= build_pso_ops(&device, &lib, "mv_qkv_f16")?;
         let pso_mv2_f16   = build_pso_ops(&device, &lib, "mv2_f16")?;
+        let pso_mv2_i8    = build_pso_ops(&device, &lib, "mv2_i8")?;
         let pso_add_f32   = build_pso_ops(&device, &lib, "add_f32_inplace")?;
         let pso_silu_mul_f32 = build_pso_ops(&device, &lib, "silu_mul_f32_inplace")?;
         Ok(Self {
             device, queue, _lib: lib,
-            pso_rms_norm, pso_rope_adj, pso_rope_half, pso_mv_f16, pso_mv_i8, pso_mv_qkv_f16, pso_mv2_f16,
+            pso_rms_norm, pso_rope_adj, pso_rope_half, pso_mv_f16, pso_mv_i8, pso_mv_qkv_f16, pso_mv2_f16, pso_mv2_i8,
             pso_add_f32, pso_silu_mul_f32,
-            x_buf: None, w_buf: None, out_buf: None,
-            tensor_cache: std::collections::HashMap::new(),
+            x_buf: RefCell::new(None), w_buf: RefCell::new(None), out_buf: RefCell::new(None),
+            tensor_cache: Mutex::new(HashMap::new()),
         })
     }
 
     // RMSNorm 
     /// x: f32 input, w_f16: raw f16 weights, w_add_one: add 1.0 to weights (Gemma).
     pub fn rms_norm_f16w(
-        &mut self,
+        &self,
         x: &[f32],
         w_f16: &[u16],
         eps: f32,
         w_add_one: bool,
+        cache_key: &str,
         out: &mut [f32],
     ) -> anyhow::Result<()> {
         let n = x.len();
-        ensure_buf_f32(&self.device, &mut self.x_buf, n)?;
-        ensure_buf_u16(&self.device, &mut self.w_buf, n)?;
-        ensure_buf_f32(&self.device, &mut self.out_buf, n)?;
+        let w_key = format!("rmsnorm.w.{}", cache_key);
+        {
+            let mut cache = self.tensor_cache.lock().unwrap();
+            if !cache.contains_key(&w_key) { cache.insert(w_key.clone(), upload_u16(&self.device, w_f16)?); }
+        }
+        let cache = self.tensor_cache.lock().unwrap();
+        let wb = cache.get(&w_key).unwrap();
 
-        let xb = self.x_buf.as_ref().unwrap();
-        let wb = self.w_buf.as_ref().unwrap();
-        let ob = self.out_buf.as_ref().unwrap();
+        ensure_buf_f32(&self.device, &mut *self.x_buf.borrow_mut(), n)?;
+        ensure_buf_f32(&self.device, &mut *self.out_buf.borrow_mut(), n)?;
+
+        let xb_ref = self.x_buf.borrow(); let xb = xb_ref.as_ref().unwrap();
+        let ob_ref = self.out_buf.borrow(); let ob = ob_ref.as_ref().unwrap();
 
         write_f32(xb, x)?;
-        write_u16(wb, w_f16)?;
 
         let n_u32    = n as u32;
         let add_one  = w_add_one as u32;
@@ -685,7 +731,7 @@ impl MetalOps {
 
     // RoPE (adjacent-pair interleaved) 
     pub fn rope_adj_f32(
-        &mut self,
+        &self,
         x: &mut [f32],
         n_heads: usize,
         head_dim: usize,
@@ -693,8 +739,8 @@ impl MetalOps {
         theta: f32,
     ) -> anyhow::Result<()> {
         let n = x.len();
-        ensure_buf_f32(&self.device, &mut self.x_buf, n)?;
-        let xb = self.x_buf.as_ref().unwrap();
+        ensure_buf_f32(&self.device, &mut *self.x_buf.borrow_mut(), n)?;
+        let xb_ref = self.x_buf.borrow(); let xb = xb_ref.as_ref().unwrap();
         write_f32(xb, x)?;
 
         let threads = (n_heads * head_dim / 2) as u64;
@@ -730,7 +776,7 @@ impl MetalOps {
 
     // RoPE (half-split partial, Qwen-style)
     pub fn rope_half_f32(
-        &mut self,
+        &self,
         x: &mut [f32],
         n_heads: usize,
         head_dim: usize,
@@ -739,8 +785,8 @@ impl MetalOps {
         theta: f32,
     ) -> anyhow::Result<()> {
         let n = x.len();
-        ensure_buf_f32(&self.device, &mut self.x_buf, n)?;
-        let xb = self.x_buf.as_ref().unwrap();
+        ensure_buf_f32(&self.device, &mut *self.x_buf.borrow_mut(), n)?;
+        let xb_ref = self.x_buf.borrow(); let xb = xb_ref.as_ref().unwrap();
         write_f32(xb, x)?;
 
         let threads = (n_heads * rotary_dim / 2) as u64;
@@ -781,7 +827,7 @@ impl MetalOps {
     /// Computes logits[v] = dot(embed_f16[v*hidden..], x_final) for every v.
     /// The embedding table is uploaded once and cached by `cache_key`.
     pub fn logits_f16(
-        &mut self,
+        &self,
         x: &[f32],
         embed_f16: &[u16],
         vocab: usize,
@@ -790,23 +836,17 @@ impl MetalOps {
         logits_out: &mut [f32],
     ) -> anyhow::Result<()> {
         // Upload embedding table once; reuse on subsequent tokens.
-        if !self.tensor_cache.contains_key(cache_key) {
-            let bytes = (embed_f16.len() * 2) as u64;
-            let buf = self.device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
-            let ptr = buf.contents() as *mut u16;
-            if ptr.is_null() {
-                anyhow::bail!("MetalOps logits_f16: null buffer");
-            }
-            let dst = unsafe { std::slice::from_raw_parts_mut(ptr, embed_f16.len()) };
-            dst.copy_from_slice(embed_f16);
-            self.tensor_cache.insert(cache_key.to_string(), buf);
+        if !self.tensor_cache.lock().unwrap().contains_key(cache_key) {
+            let buf = upload_u16(&self.device, embed_f16)?;
+            self.tensor_cache.lock().unwrap().insert(cache_key.to_string(), buf);
         }
-        let embed_buf = self.tensor_cache.get(cache_key).unwrap();
+        let cache = self.tensor_cache.lock().unwrap();
+        let embed_buf = cache.get(cache_key).unwrap();
 
-        ensure_buf_f32(&self.device, &mut self.x_buf, hidden)?;
-        ensure_buf_f32(&self.device, &mut self.out_buf, vocab)?;
-        let xb  = self.x_buf.as_ref().unwrap();
-        let ob  = self.out_buf.as_ref().unwrap();
+        ensure_buf_f32(&self.device, &mut *self.x_buf.borrow_mut(), hidden)?;
+        ensure_buf_f32(&self.device, &mut *self.out_buf.borrow_mut(), vocab)?;
+        let xb_ref = self.x_buf.borrow(); let xb  = xb_ref.as_ref().unwrap();
+        let ob_ref = self.out_buf.borrow(); let ob  = ob_ref.as_ref().unwrap();
         write_f32(xb, x)?;
 
         let rows_u32 = vocab  as u32;
@@ -839,7 +879,7 @@ impl MetalOps {
 
     // Logits: all-vocab matrix-vector (i8 + scale weights)─
     pub fn logits_i8(
-        &mut self,
+        &self,
         x: &[f32],
         embed_i8: &[i8],
         scales_f16: &[u16],
@@ -851,19 +891,20 @@ impl MetalOps {
         let wkey   = format!("{cache_key}.w");
         let skey   = format!("{cache_key}.s");
 
-        if !self.tensor_cache.contains_key(&wkey) {
+        if !self.tensor_cache.lock().unwrap().contains_key(&wkey) {
             let wbuf = upload_i8(&self.device, embed_i8)?;
-            self.tensor_cache.insert(wkey.clone(), wbuf);
+            self.tensor_cache.lock().unwrap().insert(wkey.clone(), wbuf);
             let sbuf = upload_u16(&self.device, scales_f16)?;
-            self.tensor_cache.insert(skey.clone(), sbuf);
+            self.tensor_cache.lock().unwrap().insert(skey.clone(), sbuf);
         }
-        let wbuf = self.tensor_cache.get(&wkey).unwrap();
-        let sbuf = self.tensor_cache.get(&skey).unwrap();
+        let cache = self.tensor_cache.lock().unwrap();
+        let wbuf = cache.get(&wkey).unwrap();
+        let sbuf = cache.get(&skey).unwrap();
 
-        ensure_buf_f32(&self.device, &mut self.x_buf, hidden)?;
-        ensure_buf_f32(&self.device, &mut self.out_buf, vocab)?;
-        let xb = self.x_buf.as_ref().unwrap();
-        let ob = self.out_buf.as_ref().unwrap();
+        ensure_buf_f32(&self.device, &mut *self.x_buf.borrow_mut(), hidden)?;
+        ensure_buf_f32(&self.device, &mut *self.out_buf.borrow_mut(), vocab)?;
+        let xb_ref = self.x_buf.borrow(); let xb = xb_ref.as_ref().unwrap();
+        let ob_ref = self.out_buf.borrow(); let ob = ob_ref.as_ref().unwrap();
         write_f32(xb, x)?;
 
         let rows_u32 = vocab  as u32;
@@ -940,21 +981,22 @@ impl MetalOps {
             );
         }
 
-        if !self.tensor_cache.contains_key(cache_key_q) {
-            self.tensor_cache.insert(cache_key_q.to_string(), upload_u16(&self.device, w_q_f16)?);
+        if !self.tensor_cache.lock().unwrap().contains_key(cache_key_q) {
+            self.tensor_cache.lock().unwrap().insert(cache_key_q.to_string(), upload_u16(&self.device, w_q_f16)?);
         }
-        if !self.tensor_cache.contains_key(cache_key_k) {
-            self.tensor_cache.insert(cache_key_k.to_string(), upload_u16(&self.device, w_k_f16)?);
+        if !self.tensor_cache.lock().unwrap().contains_key(cache_key_k) {
+            self.tensor_cache.lock().unwrap().insert(cache_key_k.to_string(), upload_u16(&self.device, w_k_f16)?);
         }
-        if !self.tensor_cache.contains_key(cache_key_v) {
-            self.tensor_cache.insert(cache_key_v.to_string(), upload_u16(&self.device, w_v_f16)?);
+        if !self.tensor_cache.lock().unwrap().contains_key(cache_key_v) {
+            self.tensor_cache.lock().unwrap().insert(cache_key_v.to_string(), upload_u16(&self.device, w_v_f16)?);
         }
-        let wq = self.tensor_cache.get(cache_key_q).unwrap();
-        let wk = self.tensor_cache.get(cache_key_k).unwrap();
-        let wv = self.tensor_cache.get(cache_key_v).unwrap();
+        let cache = self.tensor_cache.lock().unwrap();
+        let wq = cache.get(cache_key_q).unwrap();
+        let wk = cache.get(cache_key_k).unwrap();
+        let wv = cache.get(cache_key_v).unwrap();
 
-        ensure_buf_f32(&self.device, &mut self.x_buf, cols)?;
-        let xb = self.x_buf.as_ref().unwrap();
+        ensure_buf_f32(&self.device, &mut *self.x_buf.borrow_mut(), cols)?;
+        let xb_ref = self.x_buf.borrow(); let xb = xb_ref.as_ref().unwrap();
         write_f32(xb, x)?;
 
         let q_bytes = (rows_q * std::mem::size_of::<f32>()) as u64;
@@ -988,6 +1030,72 @@ impl MetalOps {
         read_f32(&k_buf, k_out)?;
         read_f32(&v_buf, v_out)?;
         Ok(())
+    }
+
+    pub fn logits_mv2_i8(
+        &self,
+        x: &[f32],
+        k0: &str,
+        k1: &str,
+        v: usize,
+        h: usize,
+        o0: &mut [f32],
+        o1: &mut [f32],
+    ) -> anyhow::Result<()> {
+        let w0_key = format!("{k0}.w"); let s0_key = format!("{k0}.s");
+        let w1_key = format!("{k1}.w"); let s1_key = format!("{k1}.s");
+        let cache = self.tensor_cache.lock().unwrap();
+        let wb0 = cache.get(&w0_key).ok_or_else(|| anyhow::anyhow!("k0-w missing"))?;
+        let sb0 = cache.get(&s0_key).ok_or_else(|| anyhow::anyhow!("k0-s missing"))?;
+        let wb1 = cache.get(&w1_key).ok_or_else(|| anyhow::anyhow!("k1-w missing"))?;
+        let sb1 = cache.get(&s1_key).ok_or_else(|| anyhow::anyhow!("k1-s missing"))?;
+
+        ensure_buf_f32(&self.device, &mut *self.x_buf.borrow_mut(), h)?;
+        ensure_buf_f32(&self.device, &mut *self.out_buf.borrow_mut(), v * 2)?;
+        let xb_ref = self.x_buf.borrow(); let xb = xb_ref.as_ref().unwrap();
+        let ob_ref = self.out_buf.borrow(); let ob = ob_ref.as_ref().unwrap();
+        write_f32(xb, x)?;
+        autoreleasepool(|| {
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            self.encode_mv2_i8(enc, wb0, wb1, sb0, sb1, xb, ob, ob, v, v, h);
+            enc.end_encoding(); cb.commit(); cb.wait_until_completed();
+        });
+        unsafe {
+            let ptr = ob.contents() as *const f32;
+            o0.copy_from_slice(std::slice::from_raw_parts(ptr, v));
+            o1.copy_from_slice(std::slice::from_raw_parts(ptr.add(v), v));
+        }
+        Ok(())
+    }
+
+    pub fn encode_mv2_i8(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w0: &metal::BufferRef,
+        w1: &metal::BufferRef,
+        s0: &metal::BufferRef,
+        s1: &metal::BufferRef,
+        x: &metal::BufferRef,
+        o0: &metal::BufferRef,
+        o1: &metal::BufferRef,
+        r0: usize,
+        r1: usize,
+        c: usize,
+    ) {
+        let r0_32 = r0 as u32; let r1_32 = r1 as u32; let c_32 = c as u32;
+        enc.set_compute_pipeline_state(&self.pso_mv2_i8);
+        enc.set_buffer(0, Some(w0), 0); enc.set_buffer(1, Some(w1), 0);
+        enc.set_buffer(2, Some(s0), 0); enc.set_buffer(3, Some(s1), 0);
+        enc.set_buffer(4, Some(x), 0); enc.set_buffer(5, Some(o0), 0); enc.set_buffer(6, Some(o1), 0);
+        enc.set_bytes(7, 4, (&r0_32 as *const u32).cast());
+        enc.set_bytes(8, 4, (&r1_32 as *const u32).cast());
+        enc.set_bytes(9, 4, (&c_32 as *const u32).cast());
+        let threads = (r0 + r1) as u64;
+        let w = self.pso_mv2_i8.thread_execution_width() as u64;
+        let tg = metal::MTLSize { width: w.min(threads), height: 1, depth: 1 };
+        let grid = metal::MTLSize { width: threads, height: 1, depth: 1 };
+        enc.dispatch_threads(grid, tg);
     }
 
     pub fn encode_rms_norm_f16w(
@@ -1307,6 +1415,9 @@ impl MetalOps {
         anyhow::bail!("Metal not available")
     }
     pub fn logits_i8(&mut self, _: &[f32], _: &[i8], _: &[u16], _: usize, _: usize, _: &str, _: &mut [f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Metal not available")
+    }
+    pub fn logits_qkv_f16(&mut self, _: &[f32], _: &[u16], _: &[u16], _: &[u16], _: usize, _: usize, _: usize, _: usize, _: &str, _: &str, _: &str, _: &mut [f32], _: &mut [f32], _: &mut [f32]) -> anyhow::Result<()> {
         anyhow::bail!("Metal not available")
     }
 }

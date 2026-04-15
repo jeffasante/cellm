@@ -709,6 +709,7 @@ impl DeviceKvStorage for CpuKvStorage {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        soft_cap: Option<f32>,
         out: &mut [f32],
     ) -> Result<(), CoreError> {
         if q.len() != n_heads.saturating_mul(head_dim) {
@@ -759,7 +760,11 @@ impl DeviceKvStorage for CpuKvStorage {
                 for i in 0..head_dim {
                     dot += qh[i] * kt[i].to_f32();
                 }
-                scores[t] = dot * scale;
+                let mut s = dot * scale;
+                if let Some(cap) = soft_cap {
+                    s = (s / cap).tanh() * cap;
+                }
+                scores[t] = s;
             }
             softmax_f32_inplace_cpu_local(&mut scores);
 
@@ -797,18 +802,28 @@ impl DeviceKvStorage for CpuTurboQuantKvStorage {
                 v_src.len()
             )));
         }
-        let tok = self.token_index(base, len)?;
+        if len > self.kv_dim {
+            return Err(CoreError::Backend(format!(
+                "kv cache cpu turboquant: token len mismatch {} exceeds {}",
+                len, self.kv_dim
+            )));
+        }
+        let tok = self.token_index(base, self.kv_dim)?;
         let row_bytes = self.row_bytes;
         let k_dst = Self::row_slice_mut(&mut self.k_q, tok, row_bytes)?;
         let v_dst = Self::row_slice_mut(&mut self.v_q, tok, row_bytes)?;
-        let k_res = &mut self.k_res_sign[base..base + len];
-        let v_res = &mut self.v_res_sign[base..base + len];
+        let k_res = &mut self.k_res_sign[base..base + self.kv_dim];
+        let v_res = &mut self.v_res_sign[base..base + self.kv_dim];
+        let mut k_row = vec![f16::from_f32(0.0); self.kv_dim];
+        let mut v_row = vec![f16::from_f32(0.0); self.kv_dim];
+        k_row[..len].copy_from_slice(k_src);
+        v_row[..len].copy_from_slice(v_src);
         let mut k_scale = 1.0f32;
         let mut v_scale = 1.0f32;
         let mut k_res_scale = 0.0f32;
         let mut v_res_scale = 0.0f32;
         turboquant_compress_row_f16(
-            k_src,
+            &k_row,
             k_dst,
             k_res,
             &mut k_scale,
@@ -818,7 +833,7 @@ impl DeviceKvStorage for CpuTurboQuantKvStorage {
             &self.tq,
         );
         turboquant_compress_row_f16(
-            v_src,
+            &v_row,
             v_dst,
             v_res,
             &mut v_scale,
@@ -848,18 +863,28 @@ impl DeviceKvStorage for CpuTurboQuantKvStorage {
                 v_src.len()
             )));
         }
-        let tok = self.token_index(base, len)?;
+        if len > self.kv_dim {
+            return Err(CoreError::Backend(format!(
+                "kv cache cpu turboquant: token len mismatch {} exceeds {}",
+                len, self.kv_dim
+            )));
+        }
+        let tok = self.token_index(base, self.kv_dim)?;
         let row_bytes = self.row_bytes;
         let k_dst = Self::row_slice_mut(&mut self.k_q, tok, row_bytes)?;
         let v_dst = Self::row_slice_mut(&mut self.v_q, tok, row_bytes)?;
-        let k_res = &mut self.k_res_sign[base..base + len];
-        let v_res = &mut self.v_res_sign[base..base + len];
+        let k_res = &mut self.k_res_sign[base..base + self.kv_dim];
+        let v_res = &mut self.v_res_sign[base..base + self.kv_dim];
+        let mut k_row = vec![0.0f32; self.kv_dim];
+        let mut v_row = vec![0.0f32; self.kv_dim];
+        k_row[..len].copy_from_slice(k_src);
+        v_row[..len].copy_from_slice(v_src);
         let mut k_scale = 1.0f32;
         let mut v_scale = 1.0f32;
         let mut k_res_scale = 0.0f32;
         let mut v_res_scale = 0.0f32;
         turboquant_compress_row_f32(
-            k_src,
+            &k_row,
             k_dst,
             k_res,
             &mut k_scale,
@@ -869,7 +894,7 @@ impl DeviceKvStorage for CpuTurboQuantKvStorage {
             &self.tq,
         );
         turboquant_compress_row_f32(
-            v_src,
+            &v_row,
             v_dst,
             v_res,
             &mut v_scale,
@@ -1011,6 +1036,7 @@ impl DeviceKvStorage for CpuTurboQuantKvStorage {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        soft_cap: Option<f32>,
         out: &mut [f32],
     ) -> Result<(), CoreError> {
         if q.len() != n_heads.saturating_mul(head_dim) {
@@ -1133,7 +1159,11 @@ impl DeviceKvStorage for CpuTurboQuantKvStorage {
                     }
                     dot += (k_res_scales[t] / head_dim as f32) * corr;
                 }
-                scores[t] = dot * scale;
+                let mut s = dot * scale;
+                if let Some(cap) = soft_cap {
+                    s = (s / cap).tanh() * cap;
+                }
+                scores[t] = s;
             }
             softmax_f32_inplace_cpu_local(&mut scores);
 
@@ -1348,48 +1378,77 @@ impl MetalKvStorage {
             constant uint& n_kv_heads [[buffer(7)]],
             constant uint& head_dim [[buffer(8)]],
             constant float& scale [[buffer(9)]],
-            uint h [[thread_position_in_grid]]
+            constant float& soft_cap [[buffer(10)]],
+            uint gid [[thread_position_in_grid]],
+            uint tid [[thread_position_in_threadgroup]],
+            uint head_idx [[threadgroup_position_in_grid]]
         ) {
-            if (h >= n_heads) return;
+            // New dispatch strategy:
+            // Threads per threadgroup: 32 or 64 (matches or divides head_dim)
+            // Threadgroups in grid: n_heads
+            
+            if (head_idx >= n_heads) return;
+            
             uint group_size = max((uint)1, n_heads / max((uint)1, n_kv_heads));
-            uint kv_h = min(h / group_size, max((uint)0, n_kv_heads - 1));
-            const device float* qh = q + h * head_dim;
-
+            uint kv_h = min(head_idx / group_size, max((uint)0, n_kv_heads - 1));
+            const device float* qh = q + head_idx * head_dim;
+            
+            // Shared memory for broadcasting the reduced dot product
+            threadgroup float shared_dot;
+            threadgroup float shared_max;
+            threadgroup float shared_denom;
+            
+            // We'll store the accumulated weighted sum of V in thread-local variables if possible,
+            // but we need to write back head_dim elements. 
+            // Since seq can be large, we'll keep the running weighted sum in some way.
+            // For head_dim=64 and 32 threads, each thread handles 2 elements.
+            
             float max_score = -INFINITY;
-            for (uint t = 0; t < seq; ++t) {
-                uint base = bases[t] + kv_h * head_dim;
-                float dot = 0.0f;
-                for (uint i = 0; i < head_dim; ++i) {
-                    dot += qh[i] * float(k_cache[base + i]);
-                }
-                float s = dot * scale;
-                if (s > max_score) max_score = s;
-            }
-
             float denom = 0.0f;
+            
+            // Buffer to store the weighted sum across threads.
+            // Each thread handles a subset of indices i where (i % 32 == tid)
+            float v_acc[4]; // Support up to head_dim = 128 with 32 threads
+            for (int j = 0; j < 4; ++j) v_acc[j] = 0.0f;
+            
             for (uint t = 0; t < seq; ++t) {
                 uint base = bases[t] + kv_h * head_dim;
-                float dot = 0.0f;
-                for (uint i = 0; i < head_dim; ++i) {
-                    dot += qh[i] * float(k_cache[base + i]);
+                
+                // 1. Parallel Dot Product
+                float partial_dot = 0.0f;
+                for (uint i = tid; i < head_dim; i += 32) {
+                    partial_dot += qh[i] * float(k_cache[base + i]);
                 }
-                denom += exp(dot * scale - max_score);
+                
+                // 2. Reduce partial_dot within simdgroup
+                float dot = simd_sum(partial_dot);
+                
+                // 3. Broadcast to all threads in threadgroup (thread 0 of each simdgroup does this)
+                if (tid == 0) shared_dot = dot;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                dot = shared_dot;
+                
+                // 4. Online Softmax update
+                float s = dot * scale;
+                if (soft_cap > 0.0f) s = tanh(s / soft_cap) * soft_cap;
+                
+                float max_prev = max_score;
+                max_score = max(max_score, s);
+                
+                float exp_diff = exp(max_prev - max_score);
+                float exp_curr = exp(s - max_score);
+                
+                denom = denom * exp_diff + exp_curr;
+                
+                // 5. Update weighted sum of V
+                for (uint i = tid, j = 0; i < head_dim; i += 32, ++j) {
+                    v_acc[j] = v_acc[j] * exp_diff + exp_curr * float(v_cache[base + i]);
+                }
             }
-            denom = max(denom, 1e-12f);
-
-            for (uint i = 0; i < head_dim; ++i) {
-                out[h * head_dim + i] = 0.0f;
-            }
-            for (uint t = 0; t < seq; ++t) {
-                uint base = bases[t] + kv_h * head_dim;
-                float dot = 0.0f;
-                for (uint i = 0; i < head_dim; ++i) {
-                    dot += qh[i] * float(k_cache[base + i]);
-                }
-                float w = exp(dot * scale - max_score) / denom;
-                for (uint i = 0; i < head_dim; ++i) {
-                    out[h * head_dim + i] += w * float(v_cache[base + i]);
-                }
+            
+            // Final Scale and Write Back
+            for (uint i = tid, j = 0; i < head_dim; i += 32, ++j) {
+                out[head_idx * head_dim + i] = v_acc[j] / denom;
             }
         }
 
@@ -1407,6 +1466,7 @@ impl MetalKvStorage {
             constant uint& head_dim [[buffer(10)]],
             constant uint& kv_dim [[buffer(11)]],
             constant float& scale [[buffer(12)]],
+            constant float& soft_cap [[buffer(13)]],
             uint h [[thread_position_in_grid]]
         ) {
             if (h >= n_heads) return;
@@ -1425,6 +1485,7 @@ impl MetalKvStorage {
                     dot += qh[i] * (float(k_q[base + i]) * ks);
                 }
                 float s = dot * scale;
+                if (soft_cap > 0.0f) s = tanh(s / soft_cap) * soft_cap;
                 if (s > max_score) max_score = s;
             }
 
@@ -1438,7 +1499,9 @@ impl MetalKvStorage {
                 for (uint i = 0; i < head_dim; ++i) {
                     dot += qh[i] * (float(k_q[base + i]) * ks);
                 }
-                denom += exp(dot * scale - max_score);
+                float s = dot * scale;
+                if (soft_cap > 0.0f) s = tanh(s / soft_cap) * soft_cap;
+                denom += exp(s - max_score);
             }
             denom = max(denom, 1e-12f);
 
@@ -1455,7 +1518,9 @@ impl MetalKvStorage {
                 for (uint i = 0; i < head_dim; ++i) {
                     dot += qh[i] * (float(k_q[base + i]) * ks);
                 }
-                float w = exp(dot * scale - max_score) / denom;
+                float s = dot * scale;
+                if (soft_cap > 0.0f) s = tanh(s / soft_cap) * soft_cap;
+                float w = exp(s - max_score) / denom;
                 for (uint i = 0; i < head_dim; ++i) {
                     out[h * head_dim + i] += w * (float(v_q[base + i]) * vs);
                 }
@@ -1632,10 +1697,10 @@ impl DeviceKvStorage for MetalKvStorage {
                     v_src.len()
                 )));
             }
-            self.check_range(base, k_src.len())?;
-            if base % self.kv_dim != 0 || k_src.len() != self.kv_dim {
+            self.check_range(base, self.kv_dim)?;
+            if base % self.kv_dim != 0 || k_src.len() > self.kv_dim {
                 return Err(CoreError::Backend(format!(
-                    "kv cache metal turboquant: write must be token-aligned (base={base}, len={}, kv_dim={})",
+                    "kv cache metal turboquant: write must be token-aligned and no wider than a token (base={base}, len={}, kv_dim={})",
                     k_src.len(),
                     self.kv_dim
                 )));
@@ -1672,14 +1737,18 @@ impl DeviceKvStorage for MetalKvStorage {
             }
             let k_dst = unsafe { std::slice::from_raw_parts_mut(k_ptr.add(row_off), self.row_bytes) };
             let v_dst = unsafe { std::slice::from_raw_parts_mut(v_ptr.add(row_off), self.row_bytes) };
-            let k_res_dst = unsafe { std::slice::from_raw_parts_mut(krs_ptr.add(base), k_src.len()) };
-            let v_res_dst = unsafe { std::slice::from_raw_parts_mut(vrs_ptr.add(base), v_src.len()) };
+            let k_res_dst = unsafe { std::slice::from_raw_parts_mut(krs_ptr.add(base), self.kv_dim) };
+            let v_res_dst = unsafe { std::slice::from_raw_parts_mut(vrs_ptr.add(base), self.kv_dim) };
+            let mut k_row = vec![f16::from_f32(0.0); self.kv_dim];
+            let mut v_row = vec![f16::from_f32(0.0); self.kv_dim];
+            k_row[..k_src.len()].copy_from_slice(k_src);
+            v_row[..v_src.len()].copy_from_slice(v_src);
             let mut k_scale = 1.0f32;
             let mut v_scale = 1.0f32;
             let mut k_residual_scale = 0.0f32;
             let mut v_residual_scale = 0.0f32;
             turboquant_compress_row_f16(
-                k_src,
+                &k_row,
                 k_dst,
                 k_res_dst,
                 &mut k_scale,
@@ -1689,7 +1758,7 @@ impl DeviceKvStorage for MetalKvStorage {
                 tq,
             );
             turboquant_compress_row_f16(
-                v_src,
+                &v_row,
                 v_dst,
                 v_res_dst,
                 &mut v_scale,
@@ -1760,10 +1829,10 @@ impl DeviceKvStorage for MetalKvStorage {
                     v_src.len()
                 )));
             }
-            self.check_range(base, k_src.len())?;
-            if base % self.kv_dim != 0 || k_src.len() != self.kv_dim {
+            self.check_range(base, self.kv_dim)?;
+            if base % self.kv_dim != 0 || k_src.len() > self.kv_dim {
                 return Err(CoreError::Backend(format!(
-                    "kv cache metal turboquant: write must be token-aligned (base={base}, len={}, kv_dim={})",
+                    "kv cache metal turboquant: write must be token-aligned and no wider than a token (base={base}, len={}, kv_dim={})",
                     k_src.len(),
                     self.kv_dim
                 )));
@@ -1800,14 +1869,18 @@ impl DeviceKvStorage for MetalKvStorage {
             }
             let k_dst = unsafe { std::slice::from_raw_parts_mut(k_ptr.add(row_off), self.row_bytes) };
             let v_dst = unsafe { std::slice::from_raw_parts_mut(v_ptr.add(row_off), self.row_bytes) };
-            let k_res_dst = unsafe { std::slice::from_raw_parts_mut(krs_ptr.add(base), k_src.len()) };
-            let v_res_dst = unsafe { std::slice::from_raw_parts_mut(vrs_ptr.add(base), v_src.len()) };
+            let k_res_dst = unsafe { std::slice::from_raw_parts_mut(krs_ptr.add(base), self.kv_dim) };
+            let v_res_dst = unsafe { std::slice::from_raw_parts_mut(vrs_ptr.add(base), self.kv_dim) };
+            let mut k_row = vec![0.0f32; self.kv_dim];
+            let mut v_row = vec![0.0f32; self.kv_dim];
+            k_row[..k_src.len()].copy_from_slice(k_src);
+            v_row[..v_src.len()].copy_from_slice(v_src);
             let mut k_scale = 1.0f32;
             let mut v_scale = 1.0f32;
             let mut k_residual_scale = 0.0f32;
             let mut v_residual_scale = 0.0f32;
             turboquant_compress_row_f32(
-                k_src,
+                &k_row,
                 k_dst,
                 k_res_dst,
                 &mut k_scale,
@@ -1817,7 +1890,7 @@ impl DeviceKvStorage for MetalKvStorage {
                 tq,
             );
             turboquant_compress_row_f32(
-                v_src,
+                &v_row,
                 v_dst,
                 v_res_dst,
                 &mut v_scale,
@@ -2213,6 +2286,7 @@ impl DeviceKvStorage for MetalKvStorage {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        soft_cap: Option<f32>,
         out: &mut [f32],
     ) -> Result<(), CoreError> {
         if q.len() != n_heads.saturating_mul(head_dim) {
@@ -2395,7 +2469,11 @@ impl DeviceKvStorage for MetalKvStorage {
                         }
                         dot += (k_res_scales[t] / head_dim as f32) * corr;
                     }
-                    scores[t] = dot * scale;
+                    let mut s = dot * scale;
+                    if let Some(cap) = soft_cap {
+                        s = (s / cap).tanh() * cap;
+                    }
+                    scores[t] = s;
                 }
                 softmax_f32_inplace_cpu_local(&mut scores);
                 let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
@@ -2424,19 +2502,40 @@ impl DeviceKvStorage for MetalKvStorage {
                 out_h.copy_from_slice(&v_acc_rot);
             }
         } else {
-            dispatch_1d(&self.queue, &self.pso_attn_single_gqa_f32, n_heads as u64, |enc| {
-                enc.set_buffer(0, Some(&self.k), 0);
-                enc.set_buffer(1, Some(&self.v), 0);
-                enc.set_buffer(2, Some(&bases_buf), 0);
-                enc.set_buffer(3, Some(&q_buf), 0);
-                enc.set_buffer(4, Some(&out_buf), 0);
-                enc.set_bytes(5, std::mem::size_of::<u32>() as u64, seq_ptr);
-                enc.set_bytes(6, std::mem::size_of::<u32>() as u64, n_heads_ptr);
-                enc.set_bytes(7, std::mem::size_of::<u32>() as u64, n_kv_heads_ptr);
-                enc.set_bytes(8, std::mem::size_of::<u32>() as u64, head_dim_ptr);
-                enc.set_bytes(9, std::mem::size_of::<f32>() as u64, scale_ptr);
-            })
-            .map_err(|e| CoreError::Backend(format!("kv cache metal attn gqa failed: {e}")))?;
+            let soft_cap_val = soft_cap.unwrap_or(0.0f32);
+            let soft_cap_ptr = (&soft_cap_val as *const f32).cast();
+            
+            let cmd = self.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.pso_attn_single_gqa_f32);
+            
+            enc.set_buffer(0, Some(&self.k), 0);
+            enc.set_buffer(1, Some(&self.v), 0);
+            enc.set_buffer(2, Some(&bases_buf), 0);
+            enc.set_buffer(3, Some(&q_buf), 0);
+            enc.set_buffer(4, Some(&out_buf), 0);
+            enc.set_bytes(5, 4, seq_ptr);
+            enc.set_bytes(6, 4, n_heads_ptr);
+            enc.set_bytes(7, 4, n_kv_heads_ptr);
+            enc.set_bytes(8, 4, head_dim_ptr);
+            enc.set_bytes(9, 4, scale_ptr);
+            enc.set_bytes(10, 4, soft_cap_ptr);
+
+            let threads_per_group = 32;
+            let grid_size = metal::MTLSize {
+                width: (n_heads * threads_per_group) as u64,
+                height: 1,
+                depth: 1,
+            };
+            let group_size = metal::MTLSize {
+                width: threads_per_group as u64,
+                height: 1,
+                depth: 1,
+            };
+            enc.dispatch_threads(grid_size, group_size);
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
         }
 
         if self.encoding != KvEncodingKind::TurboQuant {
@@ -2766,9 +2865,13 @@ impl MetalKvStorage {
         n_heads: u32,
         n_kv_heads: u32,
         head_dim: u32,
+        soft_cap: Option<f32>,
     ) {
         if self.encoding == KvEncodingKind::TurboQuant {
-            panic!("Llama fused graph + kv-encoding=turboquant is not implemented yet (graph-side quantized write path missing)");
+            // TurboQuant + fused Metal graph is not yet implemented;
+            // the graph-side quantised write path is missing. Skip silently.
+            eprintln!("[cellm-cache] encode_attention: TurboQuant+fused-graph unimplemented – skipping GPU kernel");
+            return;
         }
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let seq_ptr = (&seq as *const u32).cast();
@@ -2776,6 +2879,8 @@ impl MetalKvStorage {
         let n_kv_heads_ptr = (&n_kv_heads as *const u32).cast();
         let head_dim_ptr = (&head_dim as *const u32).cast();
         let scale_ptr = (&scale as *const f32).cast();
+        let soft_cap_val = soft_cap.unwrap_or(0.0f32);
+        let soft_cap_ptr = (&soft_cap_val as *const f32).cast();
 
         enc.set_compute_pipeline_state(&self.pso_attn_single_gqa_f32);
         enc.set_buffer(0, Some(&self.k), 0);
@@ -2788,6 +2893,7 @@ impl MetalKvStorage {
         enc.set_bytes(7, std::mem::size_of::<u32>() as u64, n_kv_heads_ptr);
         enc.set_bytes(8, std::mem::size_of::<u32>() as u64, head_dim_ptr);
         enc.set_bytes(9, std::mem::size_of::<f32>() as u64, scale_ptr);
+        enc.set_bytes(10, std::mem::size_of::<f32>() as u64, soft_cap_ptr);
 
         let threads = n_heads as u64;
         let w = self.pso_attn_single_gqa_f32.thread_execution_width() as u64;

@@ -39,7 +39,7 @@ Note: backend selection is strict in this build. If `Metal` is requested and una
    - use the document picker manually.
 
    Manual picker flow:
-   - the model file (example: `qwen3.5-0.8b.cellm` for best quality, or `qwen3.5-0.8b-int4-textonly.cellm` for compact experimental)
+   - the model file (example: `qwen2.5-0.5b-int8-v1.cellm` or `gemma-4-E2B-it-int4-aggr-v5.cellmd`)
    - the tokenizer file (example: `tokenizer.json`)
    - backend (`Metal` recommended on iPhone/iPad with Apple GPU)
 
@@ -64,13 +64,13 @@ Note: backend selection is strict in this build. If `Metal` is requested and una
 
 ## Sample hosted assets used by the app
 
-- `https://github.com/jeffasante/cellm/blob/main/models/qwen3.5-0.8b.cellm` (stable quality)
-- `https://github.com/jeffasante/cellm/blob/main/models/qwen3.5-0.8b-int4-textonly.cellm` (compact/experimental)
+- `https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen2.5-0.5b-int8-v1/qwen2.5-0.5b-int8-v1.cellm?download=true`
+- `https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen2.5-0.5b-int8-v1/tokenizer.json?download=true`
+- `https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen2.5-0.5b-int8-v1/tokenizer_config.json?download=true`
 - `https://github.com/jeffasante/cellm/blob/main/models/smollm2-135m-int8.cellm`
-- `https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-3-1b-it-int8-v1/gemma-3-1b-it-int8-v1.cellm?download=true`
-- `https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/tokenizer.json`
-- `https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-3-1b-it-int8-v1/tokenizer.json?download=true`
-- `https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-3-1b-it-int8-v1/tokenizer_config.json?download=true`
+- `https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-E2B-it-int4-aggr-v5/gemma-4-E2B-it-int4-aggr-v5.cellmd?download=true`
+- `https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-E2B-it-int4-aggr-v5/tokenizer.json?download=true`
+- `https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-E2B-it-int4-aggr-v5/tokenizer_config.json?download=true`
 - `https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/main/tokenizer.json`
 - `https://github.com/jeffasante/cellm/blob/main/models/smolvlm-256m-int8.cellm`
 - `https://github.com/jeffasante/cellm/blob/main/models/test_images/rococo_1.jpg`

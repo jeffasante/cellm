@@ -203,7 +203,7 @@ impl LlamaGraphState {
             kv_store.encode_write_token_f32(enc, target_base, &self.k_buf, &self.v_buf, kv_dim);
             
             let bases_offset = (layer * seq * 4) as u64;
-            kv_store.encode_attention(enc, bases_ref, bases_offset, &self.q_buf, &self.attn_out_buf, seq as u32, n_heads as u32, n_kv_heads as u32, head_dim as u32);
+            kv_store.encode_attention(enc, bases_ref, bases_offset, &self.q_buf, &self.attn_out_buf, seq as u32, n_heads as u32, n_kv_heads as u32, head_dim as u32, None);
 
             let w_o = self.get_weight(&format!("model.layers.{layer}.self_attn.o_proj.weight"), None);
             self.ops.encode_mv_f16(enc, w_o, &self.attn_out_buf, &self.mlp_in_buf, hidden, hidden);

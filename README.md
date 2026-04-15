@@ -147,7 +147,7 @@ If you want the exact artifacts we added in this repo, use these commands:
 
 SmolLM2 360M (INT8):
 ```bash
-cd /Users/jeff/Desktop/cellm
+cd cellm
 CELLM_LLAMA_ROPE_INTERLEAVED=0 ./target/release/infer \
   --model models/smollm2-360m-int8-v1.cellm \
   --tokenizer models/hf/smollm2-360m/tokenizer.json \
@@ -162,7 +162,7 @@ CELLM_LLAMA_ROPE_INTERLEAVED=0 ./target/release/infer \
 
 Qwen2.5 0.5B (INT8):
 ```bash
-cd /Users/jeff/Desktop/cellm
+cd cellm
 ./target/release/infer \
   --model models/qwen2.5-0.5b-int8-v1.cellm \
   --tokenizer models/qwen2.5-0.5b-bnb4/tokenizer.json \
@@ -176,7 +176,7 @@ cd /Users/jeff/Desktop/cellm
 
 Gemma-3 1B mixed INT4 (recommended Gemma-3 quality/size tradeoff):
 ```bash
-cd /Users/jeff/Desktop/cellm
+cd cellm
 ./target/release/infer \
   --model models/gemma-3-1b-it-mixed-int4-v1.cellm \
   --tokenizer models/hf/gemma-3-1b-it-full/tokenizer.json \
@@ -191,7 +191,7 @@ cd /Users/jeff/Desktop/cellm
 
 Gemma-3 1B pure INT4 (smallest Gemma-3):
 ```bash
-cd /Users/jeff/Desktop/cellm
+cd cellm
 ./target/release/infer \
   --model models/gemma-3-1b-it-int4-v1.cellm \
   --tokenizer models/hf/gemma-3-1b-it-full/tokenizer.json \
@@ -206,7 +206,7 @@ cd /Users/jeff/Desktop/cellm
 
 Gemma-3 1B INT8 (most stable):
 ```bash
-cd /Users/jeff/Desktop/cellm
+cd cellm
 ./target/release/infer \
   --model models/gemma-3-1b-it-int8-v1.cellm \
   --tokenizer models/hf/gemma-3-1b-it-full/tokenizer.json \

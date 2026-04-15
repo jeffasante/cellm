@@ -742,38 +742,35 @@ struct ChatView: View {
     }
 
     private func selectGemma4E4BPreset() {
-        // Kept for compatibility with older UI hooks; maps to stable Gemma3 preset.
+        // Kept for compatibility with older UI hooks; maps to the native Gemma 4 preset.
         selectGemmaPreset()
     }
 
     private func selectGemmaPreset(silentOnMissing: Bool = false) {
-        let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3FileName)
-            ?? RemoteAssets.existingDocumentsFile(fileName: "gemma-3-1b-it-int8-v1.cellm")
-            ?? RemoteAssets.existingDocumentsFile(fileName: "gemma-3-1b-it-int8.cellmd")
-        let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma3TokenizerFileName)
-            ?? RemoteAssets.existingDocumentsFile(fileName: "tokenizer-gemma-3-1b-it.json")
+        let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma4E2BFileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "gemma-4-E2B-it-int4-aggr-v5.cellmd")
+        let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.gemma4E2BTokenizerFileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "tokenizer.json")
         if let model, let tok {
+
             llmModelURL = model
             llmTokenizerURL = tok
-            selectedSampleLabel = "Gemma3-1B-IT (int8)"
+            selectedSampleLabel = "Gemma-4-E2B-IT (int4 aggr v5)"
             errorText = nil
         } else if !silentOnMissing {
-            errorText = "Gemma3 files not found in Documents/samples. Download Gemma3 model + tokenizer from LLM tab."
+            errorText = "Gemma 4 files not found in Documents/samples. Download Gemma 4 model + tokenizer from LLM tab."
         }
     }
 
     private func selectQwenPreset(silentOnMissing: Bool = false) {
-        let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35StableFileName)
-            ?? RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35CompactFileName)
-            ?? RemoteAssets.existingDocumentsFile(fileName: "qwen3.5-0.8b.cellm")
-            ?? RemoteAssets.existingDocumentsFile(fileName: "qwen3.5-0.8b-int8.cellm")
-            ?? RemoteAssets.existingDocumentsFile(fileName: "qwen3.5-0.8b-int4-textonly.cellm")
-        let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen35TokenizerFileName)
-            ?? RemoteAssets.existingDocumentsFile(fileName: "tokenizer-qwen3.5-0.8b.json")
+        let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen25FileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "qwen2.5-0.5b-int8-v1.cellm")
+        let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.qwen25TokenizerFileName)
+            ?? RemoteAssets.existingDocumentsFile(fileName: "tokenizer.json")
         if let model, let tok {
             llmModelURL = model
             llmTokenizerURL = tok
-            selectedSampleLabel = "Qwen3.5"
+            selectedSampleLabel = "Qwen2.5-0.5B (int8 v1)"
             errorText = nil
         } else if !silentOnMissing {
             errorText = "Qwen files not found in Documents/samples."

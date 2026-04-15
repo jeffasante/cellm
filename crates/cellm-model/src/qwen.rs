@@ -256,8 +256,9 @@ impl QwenRunner {
             if use_metal_norm {
                 let w = self.tensor_f16(&format!("language_model.model.layers.{layer}.input_layernorm.weight"))?.to_vec();
                 let add_one = self.rmsnorm_weight_is_offset;
-                self.metal_ops.as_mut().unwrap()
-                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &mut x_norm)
+                let ck = format!("qwen.layer.{layer}.attn_norm");
+                self.metal_ops.as_ref().unwrap()
+                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &ck, &mut x_norm)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
             } else {
                 self.rmsnorm_weight(
@@ -378,17 +379,17 @@ impl QwenRunner {
                         let qw = self.tensor_f16(&q_norm_name)?.to_vec();
                         let kw = self.tensor_f16(&k_norm_name)?.to_vec();
                         let add_one = self.rmsnorm_weight_is_offset;
-                        let ops = self.metal_ops.as_mut().unwrap();
+                        let ops = self.metal_ops.as_ref().unwrap();
                         for h in 0..n_heads {
                             let seg = &mut q[h * head_dim..(h + 1) * head_dim];
                             let inp = seg.to_vec();
-                            ops.rms_norm_f16w(&inp, &qw, cfg.rms_norm_eps, add_one, seg)
+                            ops.rms_norm_f16w(&inp, &qw, cfg.rms_norm_eps, add_one, "qwen.win_q", seg)
                                 .map_err(|e| CoreError::Backend(e.to_string()))?;
                         }
                         for h in 0..n_kv_heads {
                             let seg = &mut k[h * head_dim..(h + 1) * head_dim];
                             let inp = seg.to_vec();
-                            ops.rms_norm_f16w(&inp, &kw, cfg.rms_norm_eps, add_one, seg)
+                            ops.rms_norm_f16w(&inp, &kw, cfg.rms_norm_eps, add_one, "qwen.win_k", seg)
                                 .map_err(|e| CoreError::Backend(e.to_string()))?;
                         }
                     } else {
@@ -424,7 +425,7 @@ impl QwenRunner {
                 }
                 if rotary_dim > 0 {
                     if use_metal_rope {
-                        let ops = self.metal_ops.as_mut().unwrap();
+                        let ops = self.metal_ops.as_ref().unwrap();
                         ops.rope_half_f32(&mut q, n_heads, head_dim, rotary_dim, pos, cfg.rope_theta)
                             .map_err(|e| CoreError::Backend(e.to_string()))?;
                         ops.rope_half_f32(&mut k, n_kv_heads, head_dim, rotary_dim, pos, cfg.rope_theta)
@@ -469,6 +470,7 @@ impl QwenRunner {
                     n_heads,
                     n_kv_heads,
                     head_dim,
+                    None, // soft_cap
                     &mut attn_out,
                 )?;
 
@@ -570,8 +572,9 @@ impl QwenRunner {
             if use_metal_norm {
                 let w = self.tensor_f16(&format!("language_model.model.layers.{layer}.post_attention_layernorm.weight"))?.to_vec();
                 let add_one = self.rmsnorm_weight_is_offset;
-                self.metal_ops.as_mut().unwrap()
-                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &mut mlp_in)
+                let ck = format!("qwen.layer.{layer}.mlp_norm");
+                self.metal_ops.as_ref().unwrap()
+                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &ck, &mut mlp_in)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
             } else {
                 self.rmsnorm_weight(
@@ -601,10 +604,11 @@ impl QwenRunner {
             )?;
 
             // silu(gate) in-place: x * sigmoid(x)
-            for g in gate.iter_mut() {
+            use rayon::prelude::*;
+            gate.par_iter_mut().for_each(|g| {
                 let s = 1.0 / (1.0 + (-*g).exp());
                 *g = *g * s;
-            }
+            });
             for i in 0..gate.len() {
                 gate[i] *= up[i];
             }
@@ -636,8 +640,8 @@ impl QwenRunner {
         if use_metal_norm {
             let w = self.tensor_f16("language_model.model.norm.weight")?.to_vec();
             let add_one = self.rmsnorm_weight_is_offset;
-            self.metal_ops.as_mut().unwrap()
-                .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &mut x_final)
+            self.metal_ops.as_ref().unwrap()
+                .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, "qwen.final_norm", &mut x_final)
                 .map_err(|e| CoreError::Backend(e.to_string()))?;
         } else {
             let mut norm_w = vec![0.0f32; hidden];
@@ -686,14 +690,14 @@ impl QwenRunner {
             match dtype.as_str() {
                 "f16" => {
                     let w = self.tensor_f16(weight_name)?.to_vec();
-                    self.metal_ops.as_mut().unwrap()
+                    self.metal_ops.as_ref().unwrap()
                         .logits_f16(&x_final, &w, vocab, hidden, weight_name, &mut buf)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                 }
                 "i8" => {
                     let w = self.tensor_i8(weight_name)?.to_vec();
                     let s = self.tensor_f16(&format!("{weight_name}.qscale"))?.to_vec();
-                    self.metal_ops.as_mut().unwrap()
+                    self.metal_ops.as_ref().unwrap()
                         .logits_i8(&x_final, &w, &s, vocab, hidden, weight_name, &mut buf)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                 }
@@ -991,199 +995,135 @@ impl QwenRunner {
             }
         }
 
-        if let QwenLinearBackend::Metal { ctx } = &self.linear_backend {
-            let chunk_cols = (QWEN_METAL_LINEAR_MAX_ELEMS / in_dim.max(1)).max(1).min(out_dim);
-            let mut weight_t_chunk = vec![0.0f32; in_dim * chunk_cols];
-            let mut out_chunk = vec![0.0f32; chunk_cols];
-            let mut metal_ok = true;
-            match dtype.as_str() {
-                "f16" => {
-                    let w = self.tensor_f16(weight_name)?;
-                    if w.len() != out_dim * in_dim {
-                        return Err(CoreError::Backend(format!(
-                            "weight {weight_name} len mismatch: {} expected {}",
-                            w.len(),
-                            out_dim * in_dim
-                        )));
-                    }
-                    let mut row_start = 0usize;
-                    while row_start < out_dim {
-                        let cols_n = (out_dim - row_start).min(chunk_cols);
-                        for i in 0..in_dim {
-                            for c in 0..cols_n {
-                                let row_idx = row_start + c;
-                                weight_t_chunk[i * cols_n + c] =
-                                    f16::from_bits(w[row_idx * in_dim + i]).to_f32();
-                            }
-                        }
-                        let out_slice = &mut out_chunk[..cols_n];
-                        if ctx
-                            .matmul_row_major_f32(
-                                x,
-                                1,
-                                in_dim,
-                                &weight_t_chunk[..in_dim * cols_n],
-                                cols_n,
-                                out_slice,
-                            )
-                            .is_err()
-                        {
-                            metal_ok = false;
-                            break;
-                        }
-                        out[row_start..row_start + cols_n].copy_from_slice(out_slice);
-                        row_start += cols_n;
-                    }
-                }
-                "i8" => {
-                    let w = self.tensor_i8(weight_name)?;
-                    let scales = self.tensor_f16(&format!("{weight_name}.qscale"))?;
-                    if w.len() != out_dim * in_dim || scales.len() != out_dim {
-                        return Err(CoreError::Backend(format!(
-                            "weight {weight_name} i8/qscale len mismatch: w={} scales={} expected w={} scales={}",
-                            w.len(),
-                            scales.len(),
-                            out_dim * in_dim,
-                            out_dim
-                        )));
-                    }
-                    let mut row_start = 0usize;
-                    while row_start < out_dim {
-                        let cols_n = (out_dim - row_start).min(chunk_cols);
-                        for i in 0..in_dim {
-                            for c in 0..cols_n {
-                                let row_idx = row_start + c;
-                                let scale = f16::from_bits(scales[row_idx]).to_f32();
-                                weight_t_chunk[i * cols_n + c] =
-                                    (w[row_idx * in_dim + i] as f32) * scale;
-                            }
-                        }
-                        let out_slice = &mut out_chunk[..cols_n];
-                        if ctx
-                            .matmul_row_major_f32(
-                                x,
-                                1,
-                                in_dim,
-                                &weight_t_chunk[..in_dim * cols_n],
-                                cols_n,
-                                out_slice,
-                            )
-                            .is_err()
-                        {
-                            metal_ok = false;
-                            break;
-                        }
-                        out[row_start..row_start + cols_n].copy_from_slice(out_slice);
-                        row_start += cols_n;
-                    }
-                }
-                "i4" => {
-                    let w = self.tensor_u8(weight_name)?;
-                    let scales = self.tensor_f16(&format!("{weight_name}.qscale"))?;
-                    let row_stride = in_dim.div_ceil(2);
-                    if w.len() != out_dim * row_stride || scales.len() != out_dim {
-                        return Err(CoreError::Backend(format!(
-                            "weight {weight_name} i4/qscale len mismatch: w={} scales={} expected w={} scales={}",
-                            w.len(),
-                            scales.len(),
-                            out_dim * row_stride,
-                            out_dim
-                        )));
-                    }
-                    let mut row_start = 0usize;
-                    while row_start < out_dim {
-                        let cols_n = (out_dim - row_start).min(chunk_cols);
-                        for i in 0..in_dim {
-                            for c in 0..cols_n {
-                                let row_idx = row_start + c;
-                                let row = &w[row_idx * row_stride..(row_idx + 1) * row_stride];
-                                let scale = f16::from_bits(scales[row_idx]).to_f32();
-                                weight_t_chunk[i * cols_n + c] = unpack_i4(row, i) * scale;
-                            }
-                        }
-                        let out_slice = &mut out_chunk[..cols_n];
-                        if ctx
-                            .matmul_row_major_f32(
-                                x,
-                                1,
-                                in_dim,
-                                &weight_t_chunk[..in_dim * cols_n],
-                                cols_n,
-                                out_slice,
-                            )
-                            .is_err()
-                        {
-                            metal_ok = false;
-                            break;
-                        }
-                        out[row_start..row_start + cols_n].copy_from_slice(out_slice);
-                        row_start += cols_n;
-                    }
-                }
-                _ => {
-                    metal_ok = false;
-                }
-            }
-            if metal_ok {
-                return Ok(());
-            }
-            if self.metal_strict {
-                return Err(CoreError::Backend(format!(
-                    "qwen full-metal: linear kernel failed for {weight_name}; CPU fallback disabled"
-                )));
-            }
-        }
 
+        // Fallback: CPU loop via optimized kernels.
         match dtype.as_str() {
             "f16" => {
                 let w = self.tensor_f16(weight_name)?;
-                for j in 0..out_dim {
-                    let row = &w[j * in_dim..(j + 1) * in_dim];
-                    let mut acc = 0.0f32;
-                    for i in 0..in_dim {
-                        acc += x[i] * f16::from_bits(row[i]).to_f32();
-                    }
-                    out[j] = acc;
-                }
+                cellm_kernels::cpu_kernels::matmul_f16_f32(&w, out_dim, in_dim, x, out);
             }
             "i8" => {
                 let w = self.tensor_i8(weight_name)?;
-                let scales_name = format!("{weight_name}.qscale");
-                let scales = self.tensor_f16(&scales_name)?;
-                for j in 0..out_dim {
-                    let row = &w[j * in_dim..(j + 1) * in_dim];
-                    let scale = f16::from_bits(scales[j]).to_f32();
-                    let mut acc = 0.0f32;
-                    for i in 0..in_dim {
-                        acc += x[i] * (row[i] as f32) * scale;
-                    }
-                    out[j] = acc;
-                }
+                let s = self.tensor_f16(&format!("{weight_name}.qscale"))?;
+                cellm_kernels::cpu_kernels::matmul_i8_f32(&w, s, out_dim, in_dim, x, out);
             }
             "i4" => {
                 let w = self.tensor_u8(weight_name)?;
-                let row_stride = in_dim.div_ceil(2);
-                let scales_name = format!("{weight_name}.qscale");
-                let scales = self.tensor_f16(&scales_name)?;
-                for j in 0..out_dim {
-                    let row = &w[j * row_stride..(j + 1) * row_stride];
-                    let scale = f16::from_bits(scales[j]).to_f32();
-                    let mut acc = 0.0f32;
-                    for i in 0..in_dim {
-                        acc += x[i] * unpack_i4(row, i) * scale;
-                    }
-                    out[j] = acc;
-                }
+                let s = self.tensor_f16(&format!("{weight_name}.qscale"))?;
+                cellm_kernels::cpu_kernels::matmul_i4_f32(&w, s, out_dim, in_dim, x, out);
             }
-            other => {
+            _ => {
                 return Err(CoreError::Backend(format!(
-                    "unsupported weight dtype for {weight_name}: {other}"
+                    "qwen: CPU linear fallback unsupported dtype {dtype} for {weight_name}"
                 )));
             }
         }
         Ok(())
     }
 
+    pub fn test_linear_parity(
+        &mut self,
+        weight_name: &str,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<(f32, f32), CoreError> {
+        let mut x = vec![0.0f32; in_dim];
+        for i in 0..in_dim {
+            x[i] = (i as f32) / 100.0;
+        }
+
+        // 1. CPU
+        let mut cpu_out = vec![0.0f32; out_dim];
+        let old_mo = self.metal_ops.take(); // Force CPU fallback
+        self.linear_f16_out_in(&x, weight_name, out_dim, in_dim, &mut cpu_out)?;
+        self.metal_ops = old_mo;
+
+        // 2. Metal
+        let mut metal_out = vec![0.0f32; out_dim];
+        if self.metal_ops.is_none() {
+            self.enable_metal_full_backend();
+        }
+        self.linear_f16_out_in(&x, weight_name, out_dim, in_dim, &mut metal_out)?;
+
+        let mut max_diff = 0.0f32;
+        let mut sum_diff = 0.0f32;
+        for i in 0..out_dim {
+            let diff = (cpu_out[i] - metal_out[i]).abs();
+            if diff > max_diff { max_diff = diff; }
+            sum_diff += diff;
+        }
+        Ok((max_diff, sum_diff / out_dim as f32))
+    }
+
+    pub fn test_rmsnorm_parity(
+        &mut self,
+        weight_name: &str,
+        eps: f32,
+        add_one: bool,
+    ) -> Result<(f32, f32), CoreError> {
+        let n = 896;
+        let mut x = vec![0.0f32; n];
+        for i in 0..n { x[i] = (i as f32) / 100.0; }
+        let w = self.tensor_f16(weight_name)?.to_vec();
+        let wf32: Vec<f32> = w.iter().map(|&v| f16::from_bits(v).to_f32()).collect();
+
+        // 1. CPU
+        let mut cpu_out = vec![0.0f32; n];
+        cpu_out.copy_from_slice(&x);
+        if add_one {
+            for v in cpu_out.iter_mut() { *v += 1.0; }
+        }
+        rms_norm_inplace_f32(&mut cpu_out, &wf32, eps);
+
+        // 2. Metal
+        let mut metal_out = vec![0.0f32; n];
+        if self.metal_ops.is_none() { self.enable_metal_full_backend(); }
+        self.metal_ops.as_mut().unwrap()
+            .rms_norm_f16w(&x, &w, eps, add_one, "test_norm", &mut metal_out)
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+
+        let mut max_diff = 0.0f32;
+        let mut sum_diff = 0.0f32;
+        for i in 0..n {
+            let diff = (cpu_out[i] - metal_out[i]).abs();
+            if diff > max_diff { max_diff = diff; }
+            sum_diff += diff;
+        }
+        Ok((max_diff, sum_diff / n as f32))
+    }
+
+    pub fn test_rope_parity(
+        &mut self,
+        n_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        pos: usize,
+        theta: f32,
+    ) -> Result<(f32, f32), CoreError> {
+        let n = n_heads * head_dim;
+        let mut x = vec![0.0f32; n];
+        for i in 0..n { x[i] = (i as f32) / 100.0; }
+
+        // 1. CPU
+        let mut cpu_out = x.clone();
+        rope_inplace_f32_partial(&mut cpu_out, n_heads, head_dim, rotary_dim, pos, theta);
+
+        // 2. Metal
+        let mut metal_out = x.clone();
+        if self.metal_ops.is_none() { self.enable_metal_full_backend(); }
+        self.metal_ops.as_mut().unwrap()
+            .rope_half_f32(&mut metal_out, n_heads, head_dim, rotary_dim, pos, theta)
+            .map_err(|e| CoreError::Backend(e.to_string()))?;
+
+        let mut max_diff = 0.0f32;
+        let mut sum_diff = 0.0f32;
+        for i in 0..n {
+            let diff = (cpu_out[i] - metal_out[i]).abs();
+            if diff > max_diff { max_diff = diff; }
+            sum_diff += diff;
+        }
+        Ok((max_diff, sum_diff / n as f32))
+    }
     fn linear_qkv_f16_out_in(
         &mut self,
         x: &[f32],

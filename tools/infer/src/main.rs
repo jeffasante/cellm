@@ -214,7 +214,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                 if r.enable_metal_full_backend() {
                     println!("LLM backend: metal (Gemma full acceleration)");
                 } else {
-                    anyhow::bail!("LLM backend: metal requested, but Gemma full-metal init failed");
+                    println!("LLM backend: metal requested, but Gemma is using the stable CPU math path");
                 }
             }
             Runner::Llama(r) => {
@@ -356,6 +356,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         num_kv_heads: cfg.num_key_value_heads,
         head_dim,
     };
+    drop(file);
     let kind = if args.backend == BackendKind::Metal {
         cellm_cache::KvStorageKind::Metal
     } else {

@@ -1,6 +1,5 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-#[cfg(not(target_os = "ios"))]
 // use std::process::Command; // Removed as LiteRtProxy (which used it) is gone.
 
 use cellm_cache::{KVCache, KvEncodingKind, KvStorageKind, PageTable};
@@ -71,6 +70,16 @@ enum Runner {
     Llama(LlamaRunner),
     Gemma(GemmaRunner),
     Qwen(QwenRunner),
+}
+
+impl Runner {
+    fn embed(&self, token: u32) -> anyhow::Result<Vec<f32>> {
+        match self {
+            Runner::Llama(r) => r.embed(token).map_err(|e: cellm_core::CoreError| anyhow::anyhow!(e.to_string())),
+            Runner::Gemma(r) => r.embed(token).map_err(|e: cellm_core::CoreError| anyhow::anyhow!(e.to_string())),
+            Runner::Qwen(r) => r.embed(token).map_err(|e: cellm_core::CoreError| anyhow::anyhow!(e.to_string())),
+        }
+    }
 }
 
 /// cellm public API engine.
@@ -296,37 +305,59 @@ impl Engine {
 
         let mut next = 0u32;
         s.pending_out.clear();
-        for (i, &tok) in tokens.iter().enumerate() {
-            let pos = s.next_pos + i;
-            let mut cand = match &mut self.runner {
-                Runner::Llama(r) => {
-                    r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
+        let (tokens_prefill, last_tok) = if tokens.len() > 1 {
+            (&tokens[..tokens.len() - 1], tokens[tokens.len() - 1])
+        } else {
+            (&[][..], tokens[0])
+        };
+
+        for &tok in tokens_prefill {
+            let pos = s.next_pos;
+            match &mut self.runner {
+                Runner::Llama(r) => { 
+                    r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, 0)?; 
                 }
                 Runner::Gemma(r) => {
-                    let top_k = if r.is_gemma3_text() { self.top_k.max(8) } else { self.top_k };
-                    r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, top_k)?
+                    r.step_inner(&r.embed(tok).map_err(|e| anyhow::anyhow!(e.to_string()))?, None, pos, &mut s.page_table, &mut self.kv_cache)?;
                 }
                 Runner::Qwen(r) => {
-                    r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
-                }
-            };
-            if let Runner::Gemma(r) = &self.runner {
-                if r.is_gemma3_text() {
-                    apply_gemma3_stability_candidate_filter(&mut cand, &s.recent, self.backend);
+                    r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, 0)?;
                 }
             }
-            next = select_next_with_params(
-                temperature,
-                repeat_penalty,
-                repeat_window,
-                &cand,
-                &s.recent,
-                &mut s.rng,
-            )?;
             s.recent.push(tok);
+            s.next_pos += 1;
         }
 
-        s.next_pos += tokens.len();
+        let pos = s.next_pos;
+        let tok = last_tok;
+        let mut cand = match &mut self.runner {
+            Runner::Llama(r) => {
+                r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
+            }
+            Runner::Gemma(r) => {
+                let top_k = if r.is_gemma3_text() { self.top_k.max(8) } else { self.top_k };
+                r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, top_k)?
+            }
+            Runner::Qwen(r) => {
+                r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, self.top_k)?
+            }
+        };
+        if let Runner::Gemma(r) = &self.runner {
+            if r.is_gemma3_text() {
+                apply_gemma3_stability_candidate_filter(&mut cand, &s.recent, self.backend);
+            }
+        }
+        next = select_next_with_params(
+            temperature,
+            repeat_penalty,
+            repeat_window,
+            &cand,
+            &s.recent,
+            &mut s.rng,
+        )?;
+        s.recent.push(tok);
+        s.next_pos += 1;
+
         s.last_token = Some(next);
         s.cached_prompt = tokens.to_vec();
         s.cached_next_pos = s.next_pos;

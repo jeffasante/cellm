@@ -146,6 +146,9 @@ pub fn describe_image_with_cellm_timed(
         && file
             .tensor_index("model.embed_vision.embedding_projection.weight")
             .is_some();
+    if !is_gemma4_vision {
+        anyhow::bail!("This model does not support image input");
+    }
     let model_type = effective_text_model_type(&file.header);
     let gemma4_mode = std::env::var("CELLM_VLM_GEMMA4_MODE").unwrap_or_else(|_| "placeholder".to_string());
     let gemma4_prefix_image = is_gemma4_vision && model_type.starts_with("gemma4")

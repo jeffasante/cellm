@@ -60,7 +60,7 @@ Output: `models/qwen2.5-0.5b-int8-v1.cellm`
 ## Working Inference Command
 
 ```bash
-cd /Users/jeff/Desktop/cellm
+cd cellm
 ./target/release/infer \
   --model models/qwen2.5-0.5b-int8-v1.cellm \
   --tokenizer models/hf/Qwen2.5-0.5B-Instruct-full/tokenizer.json \

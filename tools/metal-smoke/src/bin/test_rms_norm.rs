@@ -16,7 +16,7 @@ fn main() {
         cpu_out[i] = v * inv_rms * (0.0 + 1.0);
     }
     
-    ops.rms_norm_f16w(&x, &w, eps, true, &mut out).unwrap();
+    ops.rms_norm_f16w(&x, &w, eps, true, "test_rms_norm", &mut out).unwrap();
     
     println!("CPU[0..5]: {:?}", &cpu_out[0..5]);
     println!("GPU[0..5]: {:?}", &out[0..5]);
@@ -26,7 +26,7 @@ fn main() {
     let mut x2 = vec![2.0f32; n2];
     let w2 = vec![0u16; n2];
     let mut out2 = vec![0.0f32; n2];
-    ops.rms_norm_f16w(&x2, &w2, eps, false, &mut out2).unwrap();
+    ops.rms_norm_f16w(&x2, &w2, eps, false, "test_rms_norm_2", &mut out2).unwrap();
     
     let ss2: f32 = x2.iter().map(|v| v*v).sum::<f32>() / n2 as f32 + eps;
     let inv_rms2 = 1.0 / ss2.sqrt();

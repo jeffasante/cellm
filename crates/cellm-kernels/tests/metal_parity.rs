@@ -66,8 +66,7 @@ fn metal_rms_norm_f16w_matches_cpu() {
         w_effective[i] = f16::from_bits(w_f16[i]).to_f32() + 1.0;
     }
     cpu_kernels::rms_norm_f32(&x, &w_effective, eps, &mut cpu_out);
-    metal
-        .rms_norm_f16w(&x, &w_f16, eps, w_add_one, &mut metal_out)
+    metal.rms_norm_f16w(&x, &w_f16, eps, w_add_one, "test_rms_norm", &mut metal_out)
         .expect("metal rms_norm_f16w");
 
     assert_close(&cpu_out, &metal_out, 2e-3, 4e-4, "rms_norm_f16w");
@@ -86,7 +85,7 @@ fn metal_rope_adj_matches_cpu() {
     let mut cpu_x = lcg_fill(n_heads * head_dim, 0x1234_5678, 0.5);
     let mut metal_x = cpu_x.clone();
 
-    cpu_kernels::rope_inplace_f32(&mut cpu_x, n_heads, head_dim, pos, theta);
+    cpu_kernels::rope_interleaved_inplace_f32(&mut cpu_x, n_heads, head_dim, pos, theta);
     metal
         .rope_adj_f32(&mut metal_x, n_heads, head_dim, pos, theta)
         .expect("metal rope_adj_f32");

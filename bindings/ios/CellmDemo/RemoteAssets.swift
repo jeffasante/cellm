@@ -1,15 +1,13 @@
 import Foundation
 
 enum DemoAssetLinks {
-    static let qwen35Stable = "https://github.com/jeffasante/cellm/blob/main/models/qwen3.5-0.8b.cellm"
-    static let qwen35CompactInt4TextOnly = "https://github.com/jeffasante/cellm/blob/main/models/qwen3.5-0.8b-int4-textonly.cellm"
-    static let qwen35Tokenizer = "https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/tokenizer.json"
-    static let qwen35TokenizerConfig = "https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/tokenizer_config.json"
-    static let qwen35Dir = "samples/qwen3.5-0.8b"
-    static let qwen35StableFileName = "\(qwen35Dir)/qwen3.5-0.8b.cellm"
-    static let qwen35CompactFileName = "\(qwen35Dir)/qwen3.5-0.8b-int4-textonly.cellm"
-    static let qwen35TokenizerFileName = "\(qwen35Dir)/tokenizer-qwen3.5-0.8b.json"
-    static let qwen35TokenizerConfigFileName = "\(qwen35Dir)/tokenizer_config.json"
+    static let qwen25Int8 = "https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen2.5-0.5b-int8-v1/qwen2.5-0.5b-int8-v1.cellm?download=true"
+    static let qwen25Tokenizer = "https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen2.5-0.5b-int8-v1/tokenizer.json?download=true"
+    static let qwen25TokenizerConfig = "https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen2.5-0.5b-int8-v1/tokenizer_config.json?download=true"
+    static let qwen25Dir = "samples/qwen2.5-0.5b-int8-v1"
+    static let qwen25FileName = "\(qwen25Dir)/qwen2.5-0.5b-int8-v1.cellm"
+    static let qwen25TokenizerFileName = "\(qwen25Dir)/tokenizer.json"
+    static let qwen25TokenizerConfigFileName = "\(qwen25Dir)/tokenizer_config.json"
 
     static let smollm2Int8 = "https://github.com/jeffasante/cellm/blob/main/models/smollm2-135m-int8.cellm"
     static let smolvlmInt8 = "https://github.com/jeffasante/cellm/blob/main/models/smolvlm-256m-int8.cellm"
@@ -24,13 +22,13 @@ enum DemoAssetLinks {
     static let smollm2TokenizerFileName = "\(smollm2Dir)/tokenizer-smollm2-135m.json"
     static let smollm2TokenizerConfigFileName = "\(smollm2Dir)/tokenizer_config.json"
 
-    static let gemma3Int8 = "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-3-1b-it-int8-v1/gemma-3-1b-it-int8-v1.cellm?download=true"
-    static let gemma3Tokenizer = "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-3-1b-it-int8-v1/tokenizer.json?download=true"
-    static let gemma3TokenizerConfig = "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-3-1b-it-int8-v1/tokenizer_config.json?download=true"
-    static let gemma3Dir = "samples/gemma-3-1b-it"
-    static let gemma3FileName = "\(gemma3Dir)/gemma-3-1b-it-int8-v1.cellm"
-    static let gemma3TokenizerFileName = "\(gemma3Dir)/tokenizer-gemma-3-1b-it.json"
-    static let gemma3TokenizerConfigFileName = "\(gemma3Dir)/tokenizer_config.json"
+    static let gemma4E2B = "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-E2B-it-int4-aggr-v5/gemma-4-E2B-it-int4-aggr-v5.cellmd?download=true"
+    static let gemma4E2BTokenizer = "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-E2B-it-int4-aggr-v5/tokenizer.json?download=true"
+    static let gemma4E2BTokenizerConfig = "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-E2B-it-int4-aggr-v5/tokenizer_config.json?download=true"
+    static let gemma4E2BDir = "samples/gemma-4-E2B-it-int4-aggr-v5"
+    static let gemma4E2BFileName = "\(gemma4E2BDir)/gemma-4-E2B-it-int4-aggr-v5.cellmd"
+    static let gemma4E2BTokenizerFileName = "\(gemma4E2BDir)/tokenizer.json"
+    static let gemma4E2BTokenizerConfigFileName = "\(gemma4E2BDir)/tokenizer_config.json"
 
     static let gemma42p3bLiteRt = "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-2p3b-it-litert/gemma-4-2p3b-it-litert.cellm"
     static let gemma42p3bTokenizer = "https://huggingface.co/jeffasante/cellm-models/resolve/main/gemma-4-2p3b-it-litert/tokenizer.json"

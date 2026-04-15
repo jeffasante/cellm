@@ -3,7 +3,7 @@ use std::path::Path;
 use bytemuck::cast_slice;
 use cellm_cache::{KVCache, PageTable};
 use cellm_core::CoreError;
-use cellm_kernels::cpu_kernels::{rms_norm_f32, rope_inplace_f32, rope_non_interleaved_inplace_f32};
+use cellm_kernels::cpu_kernels::{rms_norm_f32, rope_interleaved_inplace_f32, rope_non_interleaved_inplace_f32};
 use cellm_kernels::metal::MetalMatmul;
 use cellm_kernels::{MetalKernels, MetalOps};
 use half::f16;
@@ -303,8 +303,9 @@ impl LlamaRunner {
                 let w_ptr = w.as_ptr();
                 let w_len = w.len();
                 let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
-                self.metal_ops.as_mut().unwrap()
-                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, false, &mut x_norm)
+                let ck = format!("llama.layer.{layer}.attn_norm");
+                self.metal_ops.as_ref().unwrap()
+                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, false, &ck, &mut x_norm)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
             } else {
                 self.rmsnorm_weight(
@@ -338,17 +339,17 @@ impl LlamaRunner {
             }
 
             if use_metal_rope {
-                let ops = self.metal_ops.as_mut().unwrap();
+                let ops = self.metal_ops.as_ref().unwrap();
                 ops.rope_adj_f32(&mut q, n_heads, head_dim, pos, cfg.rope_theta)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
                 ops.rope_adj_f32(&mut k, n_kv_heads, head_dim, pos, cfg.rope_theta)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
             } else if self.rope_interleaved {
-                rope_inplace_f32(&mut q, n_heads, head_dim, pos, cfg.rope_theta);
-                rope_inplace_f32(&mut k, n_kv_heads, head_dim, pos, cfg.rope_theta);
+                rope_interleaved_inplace_f32(&mut q, n_heads, head_dim, pos, cfg.rope_theta);
+                rope_interleaved_inplace_f32(&mut k, n_kv_heads, head_dim, pos, cfg.rope_theta);
             } else {
-                rope_non_interleaved_inplace_f32(&mut q, n_heads, head_dim, pos, cfg.rope_theta);
-                rope_non_interleaved_inplace_f32(&mut k, n_kv_heads, head_dim, pos, cfg.rope_theta);
+                rope_non_interleaved_inplace_f32(&mut q, n_heads, head_dim, head_dim, pos, cfg.rope_theta);
+                rope_non_interleaved_inplace_f32(&mut k, n_kv_heads, head_dim, head_dim, pos, cfg.rope_theta);
             }
 
             // Write new token K/V into paged cache.
@@ -376,7 +377,7 @@ impl LlamaRunner {
                 &q,
                 n_heads,
                 n_kv_heads,
-                head_dim,
+                head_dim, None,
                 &mut attn_out,
             )?;
 
@@ -399,8 +400,9 @@ impl LlamaRunner {
                 let w_ptr = w.as_ptr();
                 let w_len = w.len();
                 let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
-                self.metal_ops.as_mut().unwrap()
-                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, false, &mut mlp_in)
+                let ck = format!("llama.layer.{layer}.mlp_norm");
+                self.metal_ops.as_ref().unwrap()
+                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, false, &ck, &mut mlp_in)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
             } else {
                 self.rmsnorm_weight(
@@ -456,8 +458,8 @@ impl LlamaRunner {
             let w_ptr = w.as_ptr();
             let w_len = w.len();
             let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
-            self.metal_ops.as_mut().unwrap()
-                .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, false, &mut x_final)
+            self.metal_ops.as_ref().unwrap()
+                .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, false, "llama.norm", &mut x_final)
                 .map_err(|e| CoreError::Backend(e.to_string()))?;
         } else {
             let mut norm_w = vec![0.0f32; hidden];
@@ -492,7 +494,7 @@ impl LlamaRunner {
                     let w_ptr = w.as_ptr();
                     let w_len = w.len();
                     let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
-                    self.metal_ops.as_mut().unwrap()
+                    self.metal_ops.as_ref().unwrap()
                         .logits_f16(&x_final, &w, vocab, hidden, &lm_src_resolved, &mut buf)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                 }
@@ -505,7 +507,7 @@ impl LlamaRunner {
                     let s_len = s.len();
                     let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
                     let s = unsafe { std::slice::from_raw_parts(s_ptr, s_len) };
-                    self.metal_ops.as_mut().unwrap()
+                    self.metal_ops.as_ref().unwrap()
                         .logits_i8(&x_final, &w, &s, vocab, hidden, &lm_src_resolved, &mut buf)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                 }

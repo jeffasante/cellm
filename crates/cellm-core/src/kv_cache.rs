@@ -118,6 +118,7 @@ pub trait DeviceKvStorage: Send + Sync + std::fmt::Debug {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        soft_cap: Option<f32>,
         out: &mut [f32],
     ) -> Result<(), CoreError> {
         let seq = bases.len();
@@ -151,6 +152,7 @@ pub trait DeviceKvStorage: Send + Sync + std::fmt::Debug {
             n_heads,
             n_kv_heads,
             head_dim,
+            soft_cap,
             out,
         )
     }
@@ -171,9 +173,9 @@ impl<'a> KvCacheView<'a> {
         v_src: &[f16],
     ) -> Result<(), CoreError> {
         let kv_dim = self.layout.kv_dim();
-        if k_src.len() != kv_dim || v_src.len() != kv_dim {
+        if k_src.len() > kv_dim || v_src.len() > kv_dim {
             return Err(CoreError::Backend(format!(
-                "kv cache: expected k/v len {kv_dim}, got {}/{}",
+                "kv cache: expected k/v len <= {kv_dim}, got {}/{}",
                 k_src.len(),
                 v_src.len()
             )));
@@ -192,9 +194,9 @@ impl<'a> KvCacheView<'a> {
         v_src: &[f32],
     ) -> Result<(), CoreError> {
         let kv_dim = self.layout.kv_dim();
-        if k_src.len() != kv_dim || v_src.len() != kv_dim {
+        if k_src.len() > kv_dim || v_src.len() > kv_dim {
             return Err(CoreError::Backend(format!(
-                "kv cache: expected k/v len {kv_dim}, got {}/{}",
+                "kv cache: expected k/v len <= {kv_dim}, got {}/{}",
                 k_src.len(),
                 v_src.len()
             )));
@@ -337,6 +339,7 @@ impl<'a> KvCacheReadView<'a> {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        soft_cap: Option<f32>,
         out: &mut [f32],
     ) -> Result<(), CoreError> {
         self.storage.attention_single_token_gqa_f32(
@@ -345,6 +348,7 @@ impl<'a> KvCacheReadView<'a> {
             n_heads,
             n_kv_heads,
             head_dim,
+            soft_cap,
             out,
         )
     }
@@ -380,6 +384,7 @@ fn attention_single_token_f32_gqa_local(
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    soft_cap: Option<f32>,
     out: &mut [f32],
 ) -> Result<(), CoreError> {
     if q.len() != n_heads.saturating_mul(head_dim) {
@@ -399,10 +404,11 @@ fn attention_single_token_f32_gqa_local(
         return Ok(());
     }
     let scale = 1.0f32 / (head_dim as f32).sqrt();
+    use rayon::prelude::*;
     let group_size = (n_heads / n_kv_heads).max(1);
-    let mut scores = vec![0.0f32; seq];
 
-    for h in 0..n_heads {
+    out.par_chunks_mut(head_dim).enumerate().for_each(|(h, out_h)| {
+        let mut scores = vec![0.0f32; seq];
         let kv_h = (h / group_size).min(n_kv_heads.saturating_sub(1));
         let qh = &q[h * head_dim..(h + 1) * head_dim];
         for t in 0..seq {
@@ -412,11 +418,14 @@ fn attention_single_token_f32_gqa_local(
             for i in 0..head_dim {
                 dot += qh[i] * kt[i];
             }
-            scores[t] = dot * scale;
+            let mut s = dot * scale;
+            if let Some(cap) = soft_cap {
+                s = (s / cap).tanh() * cap;
+            }
+            scores[t] = s;
         }
         softmax_f32_inplace_local(&mut scores);
 
-        let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
         for t in 0..seq {
             let vt_base = (t * n_kv_heads + kv_h) * head_dim;
             let vt = &v[vt_base..vt_base + head_dim];
@@ -425,6 +434,6 @@ fn attention_single_token_f32_gqa_local(
                 out_h[i] += w * vt[i];
             }
         }
-    }
+    });
     Ok(())
 }

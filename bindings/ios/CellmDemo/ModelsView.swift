@@ -8,6 +8,8 @@ struct ModelAssetCard: Identifiable, Hashable {
     let url: String
     let tokenizerName: String?
     let tokenizerUrl: String?
+    let tokenizerConfigName: String?
+    let tokenizerConfigUrl: String?
 }
 
 struct ModelsView: View {
@@ -23,23 +25,29 @@ struct ModelsView: View {
             fileName: DemoAssetLinks.gemma42p3bFileName,
             url: DemoAssetLinks.gemma42p3bLiteRt,
             tokenizerName: DemoAssetLinks.gemma42p3bTokenizerFileName,
-            tokenizerUrl: DemoAssetLinks.gemma42p3bTokenizer
+            tokenizerUrl: DemoAssetLinks.gemma42p3bTokenizer,
+            tokenizerConfigName: DemoAssetLinks.gemma42p3bTokenizerConfigFileName,
+            tokenizerConfigUrl: DemoAssetLinks.gemma42p3bTokenizerConfig
         ),
         ModelAssetCard(
-            name: "Gemma 3 (1B)",
-            description: "Highly capable 1B model running natively.",
-            fileName: DemoAssetLinks.gemma3FileName,
-            url: DemoAssetLinks.gemma3Int8,
-            tokenizerName: DemoAssetLinks.gemma3TokenizerFileName,
-            tokenizerUrl: DemoAssetLinks.gemma3Tokenizer
+            name: "Gemma 4 E2B (int4 aggr v5)",
+            description: "Native Gemma 4 `.cellmd` build with matching tokenizer assets.",
+            fileName: DemoAssetLinks.gemma4E2BFileName,
+            url: DemoAssetLinks.gemma4E2B,
+            tokenizerName: DemoAssetLinks.gemma4E2BTokenizerFileName,
+            tokenizerUrl: DemoAssetLinks.gemma4E2BTokenizer,
+            tokenizerConfigName: DemoAssetLinks.gemma4E2BTokenizerConfigFileName,
+            tokenizerConfigUrl: DemoAssetLinks.gemma4E2BTokenizerConfig
         ),
         ModelAssetCard(
-            name: "Qwen 3.5 (0.8B)",
-            description: "Compact and powerful 800M model.",
-            fileName: DemoAssetLinks.qwen35StableFileName,
-            url: DemoAssetLinks.qwen35Stable,
-            tokenizerName: DemoAssetLinks.qwen35TokenizerFileName,
-            tokenizerUrl: DemoAssetLinks.qwen35Tokenizer
+            name: "Qwen 2.5 (0.5B int8 v1)",
+            description: "Compact native Qwen preset using the matching Hugging Face tokenizer assets.",
+            fileName: DemoAssetLinks.qwen25FileName,
+            url: DemoAssetLinks.qwen25Int8,
+            tokenizerName: DemoAssetLinks.qwen25TokenizerFileName,
+            tokenizerUrl: DemoAssetLinks.qwen25Tokenizer,
+            tokenizerConfigName: DemoAssetLinks.qwen25TokenizerConfigFileName,
+            tokenizerConfigUrl: DemoAssetLinks.qwen25TokenizerConfig
         ),
         ModelAssetCard(
             name: "SmolLM2 (135M)",
@@ -47,7 +55,9 @@ struct ModelsView: View {
             fileName: DemoAssetLinks.smollm2FileName,
             url: DemoAssetLinks.smollm2Int8,
             tokenizerName: DemoAssetLinks.smollm2TokenizerFileName,
-            tokenizerUrl: DemoAssetLinks.smollm2Tokenizer
+            tokenizerUrl: DemoAssetLinks.smollm2Tokenizer,
+            tokenizerConfigName: DemoAssetLinks.smollm2TokenizerConfigFileName,
+            tokenizerConfigUrl: DemoAssetLinks.smollm2TokenizerConfig
         ),
         ModelAssetCard(
             name: "SmolVLM (256M)",
@@ -55,7 +65,9 @@ struct ModelsView: View {
             fileName: DemoAssetLinks.smolvlmFileName,
             url: DemoAssetLinks.smolvlmInt8,
             tokenizerName: DemoAssetLinks.smolvlmTokenizerFileName,
-            tokenizerUrl: DemoAssetLinks.smolvlmTokenizer
+            tokenizerUrl: DemoAssetLinks.smolvlmTokenizer,
+            tokenizerConfigName: nil,
+            tokenizerConfigUrl: nil
         )
     ]
     
@@ -125,6 +137,9 @@ struct ModelsView: View {
         if let t = model.tokenizerName {
             RemoteAssets.removeDocumentsFile(fileName: t)
         }
+        if let t = model.tokenizerConfigName {
+            RemoteAssets.removeDocumentsFile(fileName: t)
+        }
         refreshSizes()
     }
     
@@ -142,6 +157,9 @@ struct ModelsView: View {
             
             if let tUrl = model.tokenizerUrl, let tName = model.tokenizerName {
                 _ = try await RemoteAssets.downloadToDocuments(from: tUrl, fileName: tName)
+            }
+            if let cfgUrl = model.tokenizerConfigUrl, let cfgName = model.tokenizerConfigName {
+                _ = try await RemoteAssets.downloadToDocuments(from: cfgUrl, fileName: cfgName)
             }
             
         } catch {

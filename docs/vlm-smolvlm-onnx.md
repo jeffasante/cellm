@@ -155,7 +155,7 @@ Native `.cellm` vision + decoder (experimental, slower):
 
 
 
-cd /Users/jeff/Desktop/cellm
+cd cellm
 ./target/release/infer \
   --model models/gemma-4-E2B-it-f16.cellmd \
   --tokenizer models/gemma-4-E2B-it/tokenizer.json \
@@ -165,7 +165,7 @@ cd /Users/jeff/Desktop/cellm
   --backend cpu --kv-encoding f16
 
 
-cd /Users/jeff/Desktop/cellm
+cd cellm
 ./target/release/infer \
   --model models/gemma-4-E2B-it-f16.cellmd \
   --tokenizer models/gemma-4-E2B-it/tokenizer.json \
@@ -175,7 +175,7 @@ cd /Users/jeff/Desktop/cellm
   --backend metal --kv-encoding f16
 
 
-  cd /Users/jeff/Desktop/cellm
+  cd cellm
 ./target/release/infer \
   --model models/gemma-4-E2B-it-f16.cellmd \
   --tokenizer models/gemma-4-E2B-it/tokenizer.json \

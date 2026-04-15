@@ -53,6 +53,9 @@ struct ChatView: View {
     @State private var infoText: String = ""
     @State private var selectedSampleLabel: String = ""
     @State private var runDiagnostics: String = ""
+    @State private var showSettings = false
+    @State private var temperature: Double = 0.2
+    @State private var maxNewTokens: Int = 200
     @State private var isInitializing = false
     @FocusState private var isComposerFocused: Bool
     @Environment(\.colorScheme) private var colorScheme
@@ -166,11 +169,17 @@ struct ChatView: View {
                 
                 HStack(spacing: 16) {
                     Button {
-                        // Settings action
+                        showSettings = true
                     } label: {
                         Image(systemName: "slider.horizontal.3")
                             .font(.title3)
                             .foregroundStyle(.secondary)
+                    }
+                    .sheet(isPresented: $showSettings) {
+                        GenerationSettingsSheet(
+                            temperature: $temperature,
+                            maxNewTokens: $maxNewTokens
+                        )
                     }
                     Button {
                         // New Chat action
@@ -519,11 +528,14 @@ struct ChatView: View {
                 let tok = try CellmTokenizer(tokenizerURL: llmTokenizerURL)
                 let initTokenizerMs = Date().timeIntervalSince(initTokenizerStart) * 1000.0
                 
+                let capturedTemp = await MainActor.run { temperature }
+                let capturedMaxToks = await MainActor.run { maxNewTokens }
+                let topK: UInt32 = capturedTemp < 0.05 ? 1 : 40
                 let eng = try CellmEngine(
                     modelURL: llmModelURL,
                     tokenizer: tok,
-                    topK: 1,
-                    temperature: 0.0,
+                    topK: topK,
+                    temperature: Float(capturedTemp),
                     repeatPenalty: 1.12,
                     repeatWindow: 96,
                     backend: backend
@@ -560,7 +572,7 @@ struct ChatView: View {
 
                 let reply = try eng.generate(
                     prompt: textPrompt,
-                    maxNewTokens: 80,
+                    maxNewTokens: capturedMaxToks,
                     thermalLevel: .nominal,
                     exerciseSuspendResume: false,
                     onToken: { piece in

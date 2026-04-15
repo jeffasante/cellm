@@ -779,14 +779,7 @@ impl LlamaRunner {
                         out_dim * in_dim
                     )));
                 }
-                for j in 0..out_dim {
-                    let row = &w[j * in_dim..(j + 1) * in_dim];
-                    let mut acc = 0.0f32;
-                    for i in 0..in_dim {
-                        acc += x[i] * f16::from_bits(row[i]).to_f32();
-                    }
-                    out[j] = acc;
-                }
+                cellm_kernels::cpu_kernels::matmul_f16_f32(w, out_dim, in_dim, x, out);
             }
             "i8" => {
                 let w = self.tensor_i8_by_exact_name(&resolved)?;
@@ -797,23 +790,15 @@ impl LlamaRunner {
                         out_dim * in_dim
                     )));
                 }
-                let scales = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
-                if scales.len() != out_dim {
+                let s = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
+                if s.len() != out_dim {
                     return Err(CoreError::Backend(format!(
                         "weight {weight_name} qscale len mismatch: {} expected {}",
-                        scales.len(),
+                        s.len(),
                         out_dim
                     )));
                 }
-                for j in 0..out_dim {
-                    let row = &w[j * in_dim..(j + 1) * in_dim];
-                    let scale = f16::from_bits(scales[j]).to_f32();
-                    let mut acc = 0.0f32;
-                    for i in 0..in_dim {
-                        acc += x[i] * ((row[i] as f32) * scale);
-                    }
-                    out[j] = acc;
-                }
+                cellm_kernels::cpu_kernels::matmul_i8_f32(w, s, out_dim, in_dim, x, out);
             }
             other => {
                 return Err(CoreError::Backend(format!(

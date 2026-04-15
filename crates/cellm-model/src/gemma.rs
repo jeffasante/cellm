@@ -1276,25 +1276,7 @@ impl GemmaRunner {
                         out_dim * in_dim
                     )));
                 }
-                if should_parallel_linear_cpu(out_dim, in_dim) {
-                    out.par_iter_mut().enumerate().for_each(|(j, out_j)| {
-                        let row = &w[j * in_dim..(j + 1) * in_dim];
-                        let mut acc = 0.0f32;
-                        for i in 0..in_dim {
-                            acc += x[i] * f16::from_bits(row[i]).to_f32();
-                        }
-                        *out_j = acc;
-                    });
-                } else {
-                    for j in 0..out_dim {
-                        let row = &w[j * in_dim..(j + 1) * in_dim];
-                        let mut acc = 0.0f32;
-                        for i in 0..in_dim {
-                            acc += x[i] * f16::from_bits(row[i]).to_f32();
-                        }
-                        out[j] = acc;
-                    }
-                }
+                cellm_kernels::cpu_kernels::matmul_f16_f32(w, out_dim, in_dim, x, out);
             }
             "i8" => {
                 let w = self.tensor_i8_by_exact_name(&resolved)?;
@@ -1305,54 +1287,35 @@ impl GemmaRunner {
                         out_dim * in_dim
                     )));
                 }
-                let scales = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
-                if scales.len() != out_dim {
+                let s = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
+                if s.len() != out_dim {
                     return Err(CoreError::Backend(format!(
                         "weight {weight_name} qscale len mismatch: {} expected {}",
-                        scales.len(),
+                        s.len(),
                         out_dim
                     )));
                 }
-                if should_parallel_linear_cpu(out_dim, in_dim) {
-                    out.par_iter_mut().enumerate().for_each(|(j, out_j)| {
-                        let row = &w[j * in_dim..(j + 1) * in_dim];
-                        let scale = f16::from_bits(scales[j]).to_f32();
-                        let mut acc = 0.0f32;
-                        for i in 0..in_dim {
-                            acc += x[i] * ((row[i] as f32) * scale);
-                        }
-                        *out_j = acc;
-                    });
-                } else {
-                    for j in 0..out_dim {
-                        let row = &w[j * in_dim..(j + 1) * in_dim];
-                        let scale = f16::from_bits(scales[j]).to_f32();
-                        let mut acc = 0.0f32;
-                        for i in 0..in_dim {
-                            acc += x[i] * ((row[i] as f32) * scale);
-                        }
-                        out[j] = acc;
-                    }
-                }
+                cellm_kernels::cpu_kernels::matmul_i8_f32(w, s, out_dim, in_dim, x, out);
             }
             "i4" => {
                 let w = self.tensor_u8_by_exact_name(&resolved)?;
-                let scales = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
-                let row_stride = in_dim.div_ceil(2);
-                if should_parallel_linear_cpu(out_dim, in_dim) {
-                    out.par_iter_mut().enumerate().for_each(|(j, out_j)| {
-                        let row = &w[j * row_stride..(j + 1) * row_stride];
-                        let scale = f16::from_bits(scales[j]).to_f32();
-                        *out_j = dot_i4_scaled_row(row, x, scale);
-                    });
-                } else {
-                    for j in 0..out_dim {
-                        let row = &w[j * row_stride..(j + 1) * row_stride];
-                        let scale = f16::from_bits(scales[j]).to_f32();
-                        let acc = dot_i4_scaled_row(row, x, scale);
-                        out[j] = acc;
-                    }
+                let row_stride = (in_dim + 1) / 2;
+                if w.len() != out_dim * row_stride {
+                    return Err(CoreError::Backend(format!(
+                        "weight {weight_name} len mismatch: {} expected {}",
+                        w.len(),
+                        out_dim * row_stride
+                    )));
                 }
+                let s = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
+                if s.len() != out_dim {
+                    return Err(CoreError::Backend(format!(
+                        "weight {weight_name} qscale len mismatch: {} expected {}",
+                        s.len(),
+                        out_dim
+                    )));
+                }
+                cellm_kernels::cpu_kernels::matmul_i4_f32(w, s, out_dim, in_dim, x, out);
             }
             "i2" => {
                 let w = self.tensor_u8_by_exact_name(&resolved)?;

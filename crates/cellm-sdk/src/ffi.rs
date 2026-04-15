@@ -253,7 +253,7 @@ pub extern "C" fn cellm_tokenizer_decode(
         let ids = unsafe { std::slice::from_raw_parts(tokens, token_count) };
         let text = handle
             .tok
-            .decode(ids, true)
+            .decode(ids, false)
             .map_err(|e| format!("decode failed: {e}"))?;
         let bytes = text.as_bytes();
 

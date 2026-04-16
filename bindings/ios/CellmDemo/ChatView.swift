@@ -178,7 +178,8 @@ struct ChatView: View {
                     .sheet(isPresented: $showSettings) {
                         GenerationSettingsSheet(
                             temperature: $temperature,
-                            maxNewTokens: $maxNewTokens
+                            maxNewTokens: $maxNewTokens,
+                            selectedBackend: $selectedBackend
                         )
                     }
                     Button {
@@ -219,6 +220,24 @@ struct ChatView: View {
                 .foregroundStyle(.primary)
                 .clipShape(Capsule())
                 .overlay(Capsule().stroke(Color(.separator).opacity(0.35), lineWidth: 0.5))
+            }
+            
+            // Backend Badge
+            if !activeBackend.isEmpty {
+                HStack(spacing: 4) {
+                    Image(systemName: activeBackend == "metal" ? "bolt.fill" : "cpu")
+                        .font(.caption2)
+                    Text(activeBackend.uppercased())
+                        .font(.caption2.bold())
+                }
+                .foregroundStyle(activeBackend == "metal" ? .green : .secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(
+                    (activeBackend == "metal" ? Color.green : Color.gray)
+                        .opacity(0.12)
+                )
+                .clipShape(Capsule())
             }
             
             // Initializing Status Pill
@@ -854,11 +873,25 @@ struct ChatView: View {
 struct GenerationSettingsSheet: View {
     @Binding var temperature: Double
     @Binding var maxNewTokens: Int
+    @Binding var selectedBackend: CellmBackend
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    Picker("Backend", selection: $selectedBackend) {
+                        ForEach(CellmBackend.allCases) { b in
+                            Text(b.label).tag(b)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                } header: {
+                    Text("Inference Backend")
+                } footer: {
+                    Text("Metal uses the GPU for faster inference. CPU is a fallback.")
+                }
+
                 Section {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
@@ -911,6 +944,7 @@ struct GenerationSettingsSheet: View {
                         withAnimation {
                             temperature = 0.2
                             maxNewTokens = 200
+                            selectedBackend = .metal
                         }
                     }
                     .foregroundStyle(.red)

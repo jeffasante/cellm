@@ -63,6 +63,12 @@ struct ChatView: View {
     @State private var generationTask: Task<Void, Never>?
     @State private var initTask: Task<Void, Never>?
 
+    // Persistent engine + tokenizer to avoid reloading model weights on every message.
+    @State private var cachedEngine: CellmEngine?
+    @State private var cachedTokenizer: CellmTokenizer?
+    @State private var cachedEngineModelURL: URL?
+    @State private var cachedEngineBackend: CellmBackend?
+
     var body: some View {
         ZStack {
             Color(.systemBackground).ignoresSafeArea()
@@ -116,7 +122,11 @@ struct ChatView: View {
         }
         .onChange(of: llmModelURL) { _ in 
             persistSharedSelection()
+            invalidateCachedEngine()
             initializeEngine()
+        }
+        .onChange(of: selectedBackend) { _ in
+            invalidateCachedEngine()
         }
         .onChange(of: llmTokenizerURL) { _ in persistSharedSelection() }
         .onChange(of: scenePhase) { phase in
@@ -520,7 +530,6 @@ struct ChatView: View {
         pendingAudioURL = nil
 
         isRunning = true
-        isInitializing = true
         messages.append(ChatMessage(role: "Assistant", text: "", imageData: nil, audioFileName: nil))
         let assistantIndex = messages.count - 1
 
@@ -543,29 +552,45 @@ struct ChatView: View {
                       let llmTokenizerURL = currentLLMTokenizerURL else {
                     throw CellmError.message("Pick LLM model + tokenizer for chat.")
                 }
-                let initTokenizerStart = Date()
-                let tok = try CellmTokenizer(tokenizerURL: llmTokenizerURL)
-                let initTokenizerMs = Date().timeIntervalSince(initTokenizerStart) * 1000.0
-                
-                let capturedTemp = await MainActor.run { temperature }
-                let capturedMaxToks = await MainActor.run { maxNewTokens }
-                let topK: UInt32 = capturedTemp < 0.05 ? 1 : 40
-                let eng = try CellmEngine(
-                    modelURL: llmModelURL,
-                    tokenizer: tok,
-                    topK: topK,
-                    temperature: Float(capturedTemp),
-                    repeatPenalty: 1.12,
-                    repeatWindow: 96,
-                    backend: backend
-                )
-                let initEngineMs = Date().timeIntervalSince(initTokenizerStart) * 1000.0
-                await MainActor.run {
-                    isInitializing = false
+
+                // Reuse cached engine if model and backend haven't changed.
+                let eng: CellmEngine
+                let engineWasCached: Bool
+                if let cached = await MainActor.run(body: { cachedEngine }),
+                   await MainActor.run(body: { cachedEngineModelURL }) == llmModelURL,
+                   await MainActor.run(body: { cachedEngineBackend }) == backend {
+                    eng = cached
+                    engineWasCached = true
+                    try eng.resetSession()
+                    diag.append("engine=cached (reused)")
+                } else {
+                    await MainActor.run { isInitializing = true }
+                    let tok = try CellmTokenizer(tokenizerURL: llmTokenizerURL)
+                    let capturedTemp = await MainActor.run { temperature }
+                    let topK: UInt32 = capturedTemp < 0.05 ? 1 : 40
+                    let newEng = try CellmEngine(
+                        modelURL: llmModelURL,
+                        tokenizer: tok,
+                        topK: topK,
+                        temperature: Float(capturedTemp),
+                        repeatPenalty: 1.12,
+                        repeatWindow: 96,
+                        backend: backend
+                    )
+                    eng = newEng
+                    engineWasCached = false
+                    await MainActor.run {
+                        cachedEngine = newEng
+                        cachedTokenizer = tok
+                        cachedEngineModelURL = llmModelURL
+                        cachedEngineBackend = backend
+                        isInitializing = false
+                    }
+                    let initMs = Date().timeIntervalSince(initStart) * 1000.0
+                    diag.append(String(format: "engine=fresh init=%.1fms", initMs))
                 }
-                let initTotalMs = Date().timeIntervalSince(initStart) * 1000.0
-                diag.append(String(format: "init_tokenizer=%.1fms init_engine=%.1fms init_total=%.1fms", initTokenizerMs, initEngineMs, initTotalMs))
-                diag.append("requested_backend=\(backend.label.lowercased()) active_backend=\(eng.activeBackend)")
+                let capturedMaxToks = await MainActor.run { maxNewTokens }
+                diag.append("requested_backend=\(backend.label.lowercased()) active_backend=\(eng.activeBackend) cached=\(engineWasCached)")
 
                 if let imageBytes = attachedImage {
                     guard let vlmModelURL = currentVLMModelURL else {
@@ -595,7 +620,9 @@ struct ChatView: View {
                     thermalLevel: .nominal,
                     exerciseSuspendResume: false,
                     onToken: { piece in
+                        // Coalesce rapid token updates to avoid CoreGraphics NaN from excessive relayout.
                         Task { @MainActor in
+                            guard assistantIndex < messages.count else { return }
                             let existing = messages[assistantIndex].text
                             messages[assistantIndex] = ChatMessage(role: "Assistant", text: existing + piece, imageData: nil, audioFileName: nil)
                         }
@@ -844,17 +871,31 @@ struct ChatView: View {
     private func initializeEngine() {
         guard let modelURL = llmModelURL, let tokURL = llmTokenizerURL else { return }
 
+        // Skip if we already have a cached engine for this model + backend.
+        if cachedEngine != nil,
+           cachedEngineModelURL == modelURL,
+           cachedEngineBackend == selectedBackend {
+            return
+        }
+
         initTask?.cancel()
         initTask = Task {
             await MainActor.run { isInitializing = true }
             do {
+                let backend = await MainActor.run { scenePhase == .active ? selectedBackend : .cpu }
                 let tok = try CellmTokenizer(tokenizerURL: tokURL)
-                _ = try CellmEngine(
+                let eng = try CellmEngine(
                     modelURL: modelURL,
                     tokenizer: tok,
-                    backend: scenePhase == .active ? selectedBackend : .cpu
+                    backend: backend
                 )
-                await MainActor.run { errorText = nil }
+                await MainActor.run {
+                    cachedEngine = eng
+                    cachedTokenizer = tok
+                    cachedEngineModelURL = modelURL
+                    cachedEngineBackend = backend
+                    errorText = nil
+                }
             } catch {
                 await MainActor.run {
                     errorText = "Model init failed: \(String(describing: error))"
@@ -865,6 +906,13 @@ struct ChatView: View {
                 initTask = nil
             }
         }
+    }
+
+    private func invalidateCachedEngine() {
+        cachedEngine = nil
+        cachedTokenizer = nil
+        cachedEngineModelURL = nil
+        cachedEngineBackend = nil
     }
 }
 

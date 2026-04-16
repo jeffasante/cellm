@@ -1,5 +1,5 @@
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-use metal::{Buffer, CommandQueue, ComputePipelineState, Device, Library, MTLResourceOptions, MTLSize};
+use metal::*;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use objc::rc::autoreleasepool;
 use std::sync::Mutex;
@@ -236,8 +236,8 @@ kernel void silu_mul_f32_inplace(
 }
 
 kernel void rms_norm_f16w(
-    device const float*  x         [[buffer(0)]],
-    device const ushort* w         [[buffer(1)]],
+    device const float*  x         [[buffer(10)]],
+    device const half*   w         [[buffer(1)]],
     device       float*  out       [[buffer(2)]],
     constant     uint&   n         [[buffer(3)]],
     constant     float&  eps       [[buffer(4)]],
@@ -246,23 +246,36 @@ kernel void rms_norm_f16w(
     uint tgsize[[threads_per_threadgroup]],
     threadgroup float* shared[[threadgroup(0)]]
 ) {
-    float local_sq = 0.0f;
+    // Phase 1: each thread computes partial sum of squares
+    float partial = 0.0f;
     for (uint i = tid; i < n; i += tgsize) {
         float v = x[i];
-        local_sq += v * v;
+        partial += v * v;
     }
-    float inv_n = 1.0f / float(n);
-    shared[tid] = (tid < tgsize) ? (local_sq * inv_n) : 0.0f;
+    shared[tid] = partial;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = tgsize >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) shared[tid] += shared[tid + stride];
+
+    // Phase 2: tree reduction in shared memory
+    for (uint s = tgsize / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared[tid] += shared[tid + s];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float inv_rms = rsqrt(shared[0] + eps);
+
+    // Phase 3: thread 0 computes inv_rms
+    if (tid == 0) {
+        float mean_sq = shared[0] / float(n);
+        shared[0] = rsqrt(mean_sq + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = shared[0];
+
+    // Phase 4: apply normalization with weight
     for (uint i = tid; i < n; i += tgsize) {
-        float wf = float(as_type<half>(w[i]));
-        if (w_add_one) wf += 1.0f;
-        out[i] = x[i] * inv_rms * wf;
+        float wi = float(w[i]);
+        if (w_add_one) wi += 1.0f;
+        out[i] = x[i] * inv_rms * wi;
     }
 }
 
@@ -337,10 +350,11 @@ kernel void mv_i8(
     constant     uint&   rows    [[buffer(5)]],
     constant     uint&   cols    [[buffer(6)]],
     constant     uint&   has_bias [[buffer(7)]],
+    constant     uint&   per_channel [[buffer(8)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= rows) return;
-    float scale = float(as_type<half>(scl[gid]));
+    float scale = float(as_type<half>(scl[per_channel ? gid : 0]));
     device const char* row_ptr = A + gid * cols;
     float acc = 0.0f;
     for (uint i = 0; i < cols; ++i) acc += x[i] * float(row_ptr[i]);
@@ -367,12 +381,13 @@ kernel void mv_qkv_i8(
     constant     uint&   rows_kv  [[buffer(14)]],
     constant     uint&   cols     [[buffer(15)]],
     constant     uint&   has_bias [[buffer(16)]],
+    constant     uint*   per_chan [[buffer(17)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint total = rows_q + rows_kv + rows_kv;
     if (gid >= total) return;
     if (gid < rows_q) {
-        float scale = float(as_type<half>(s_q[gid]));
+        float scale = float(as_type<half>(s_q[per_chan[0] ? gid : 0]));
         device const char* row_ptr = w_q + gid * cols;
         float acc = 0.0f;
         for (uint i = 0; i < cols; ++i) acc += x[i] * float(row_ptr[i]);
@@ -383,7 +398,7 @@ kernel void mv_qkv_i8(
     }
     uint off = gid - rows_q;
     if (off < rows_kv) {
-        float scale = float(as_type<half>(s_k[off]));
+        float scale = float(as_type<half>(s_k[per_chan[1] ? off : 0]));
         device const char* row_ptr = w_k + off * cols;
         float acc = 0.0f;
         for (uint i = 0; i < cols; ++i) acc += x[i] * float(row_ptr[i]);
@@ -393,7 +408,7 @@ kernel void mv_qkv_i8(
         return;
     }
     off -= rows_kv;
-    float scale = float(as_type<half>(s_v[off]));
+    float scale = float(as_type<half>(s_v[per_chan[2] ? off : 0]));
     device const char* row_ptr = w_v + off * cols;
     float acc = 0.0f;
     for (uint i = 0; i < cols; ++i) acc += x[i] * float(row_ptr[i]);
@@ -608,7 +623,7 @@ impl MetalOps {
     pub fn encode_rms_norm_f16w(&self, enc: &metal::ComputeCommandEncoderRef, x: &Buffer, w: &Buffer, out: &Buffer, n: usize, eps: f32, w_add_one: bool) {
         let n32 = n as u32; let add = w_add_one as u32;
         enc.set_compute_pipeline_state(&self.pso_rms_norm);
-        enc.set_buffer(0, Some(x), 0); enc.set_buffer(1, Some(w), 0); enc.set_buffer(2, Some(out), 0);
+        enc.set_buffer(10, Some(x), 0); enc.set_buffer(1, Some(w), 0); enc.set_buffer(2, Some(out), 0);
         enc.set_bytes(3, 4, (&n32 as *const u32).cast());
         enc.set_bytes(4, 4, (&eps as *const f32).cast());
         enc.set_bytes(5, 4, (&add as *const u32).cast());
@@ -687,11 +702,13 @@ impl MetalOps {
         let r = rs as u32; let c = cs as u32; let hb = b.is_some() as u32;
         enc.set_compute_pipeline_state(&self.pso_mv_i8);
         enc.set_buffer(0, Some(w), 0); enc.set_buffer(1, Some(s), 0); enc.set_buffer(2, Some(x), 0);
-        if let Some(bb) = b { enc.set_buffer(3, Some(bb), 0); }
+        enc.set_buffer(3, Some(b.unwrap_or(x)), 0);
         enc.set_buffer(4, Some(out), 0);
         enc.set_bytes(5, 4, (&r as *const u32).cast());
         enc.set_bytes(6, 4, (&c as *const u32).cast());
         enc.set_bytes(7, 4, (&hb as *const u32).cast());
+        let pc = (s.length() >= (rs * 2) as u64) as u32;
+        enc.set_bytes(8, 4, (&pc as *const u32).cast());
         let ww = self.pso_mv_i8.thread_execution_width() as u64;
         enc.dispatch_threads(MTLSize { width: rs as u64, height: 1, depth: 1 }, MTLSize { width: ww.min(rs as u64), height: 1, depth: 1 });
     }
@@ -700,9 +717,9 @@ impl MetalOps {
         let rq32 = rq as u32; let rkv32 = rkv as u32; let c32 = c as u32; let hb = bq.is_some() as u32;
         enc.set_compute_pipeline_state(&self.pso_mv_qkv_f16);
         enc.set_buffer(0, Some(wq), 0); enc.set_buffer(1, Some(wk), 0); enc.set_buffer(2, Some(wv), 0); enc.set_buffer(3, Some(x), 0);
-        if let Some(b) = bq { enc.set_buffer(4, Some(b), 0); }
-        if let Some(b) = bk { enc.set_buffer(5, Some(b), 0); }
-        if let Some(b) = bv { enc.set_buffer(6, Some(b), 0); }
+        enc.set_buffer(4, Some(bq.unwrap_or(x)), 0);
+        enc.set_buffer(5, Some(bk.unwrap_or(x)), 0);
+        enc.set_buffer(6, Some(bv.unwrap_or(x)), 0);
         enc.set_buffer(7, Some(qo), 0); enc.set_buffer(8, Some(ko), 0); enc.set_buffer(9, Some(vo), 0);
         enc.set_bytes(10, 4, (&rq32 as *const u32).cast());
         enc.set_bytes(11, 4, (&rkv32 as *const u32).cast());
@@ -720,14 +737,18 @@ impl MetalOps {
         enc.set_buffer(2, Some(wk), 0); enc.set_buffer(3, Some(sk), 0);
         enc.set_buffer(4, Some(wv), 0); enc.set_buffer(5, Some(sv), 0);
         enc.set_buffer(6, Some(x), 0);
-        if let Some(b) = bq { enc.set_buffer(7, Some(b), 0); }
-        if let Some(b) = bk { enc.set_buffer(8, Some(b), 0); }
-        if let Some(b) = bv { enc.set_buffer(9, Some(b), 0); }
+        enc.set_buffer(7, Some(bq.unwrap_or(x)), 0);
+        enc.set_buffer(8, Some(bk.unwrap_or(x)), 0);
+        enc.set_buffer(9, Some(bv.unwrap_or(x)), 0);
         enc.set_buffer(10, Some(qo), 0); enc.set_buffer(11, Some(ko), 0); enc.set_buffer(12, Some(vo), 0);
         enc.set_bytes(13, 4, (&rq32 as *const u32).cast());
         enc.set_bytes(14, 4, (&rkv32 as *const u32).cast());
         enc.set_bytes(15, 4, (&c32 as *const u32).cast());
         enc.set_bytes(16, 4, (&hb as *const u32).cast());
+        let pc_q = (sq.length() >= (rq * 2) as u64) as u32;
+        let pc_k = (sk.length() >= (rkv * 2) as u64) as u32;
+        let pc_v = (sv.length() >= (rkv * 2) as u64) as u32;
+        enc.set_bytes(17, 16, [pc_q, pc_k, pc_v, 0u32].as_ptr() as *const _);
         let threads = (rq + rkv + rkv) as u64;
         let w = self.pso_mv_qkv_i8.thread_execution_width() as u64;
         enc.dispatch_threads(MTLSize { width: threads, height: 1, depth: 1 }, MTLSize { width: w.min(threads), height: 1, depth: 1 });

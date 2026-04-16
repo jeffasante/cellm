@@ -1315,8 +1315,8 @@ impl MetalKvStorage {
         ) {
             if (gid >= len) return;
             uint idx = base + gid;
-            k_cache[idx] = half(k_in[gid]);
-            v_cache[idx] = half(v_in[gid]);
+            k_cache[idx] = half(clamp(k_in[gid], -65504.0f, 65504.0f));
+            v_cache[idx] = half(clamp(v_in[gid], -65504.0f, 65504.0f));
         }
 
         kernel void kv_read_f16(
@@ -1373,80 +1373,56 @@ impl MetalKvStorage {
             device const uint* bases [[buffer(2)]],
             device const float* q [[buffer(3)]],
             device float* out [[buffer(4)]],
-            constant uint& seq [[buffer(5)]],
-            constant uint& n_heads [[buffer(6)]],
-            constant uint& n_kv_heads [[buffer(7)]],
-            constant uint& head_dim [[buffer(8)]],
+            constant uint& n_heads [[buffer(5)]],
+            constant uint& n_kv_heads [[buffer(6)]],
+            constant uint& head_dim [[buffer(7)]],
+            constant uint& seq [[buffer(8)]],
             constant float& scale [[buffer(9)]],
             constant float& soft_cap [[buffer(10)]],
             uint gid [[thread_position_in_grid]],
             uint tid [[thread_position_in_threadgroup]],
             uint head_idx [[threadgroup_position_in_grid]]
         ) {
-            // New dispatch strategy:
-            // Threads per threadgroup: 32 or 64 (matches or divides head_dim)
-            // Threadgroups in grid: n_heads
-            
             if (head_idx >= n_heads) return;
-            
-            uint group_size = max((uint)1, n_heads / max((uint)1, n_kv_heads));
-            uint kv_h = min(head_idx / group_size, max((uint)0, n_kv_heads - 1));
+            uint group_size = n_heads / n_kv_heads;
+            uint kv_h = head_idx / group_size;
             const device float* qh = q + head_idx * head_dim;
-            
-            // Shared memory for broadcasting the reduced dot product
-            threadgroup float shared_dot;
-            threadgroup float shared_max;
-            threadgroup float shared_denom;
-            
-            // We'll store the accumulated weighted sum of V in thread-local variables if possible,
-            // but we need to write back head_dim elements. 
-            // Since seq can be large, we'll keep the running weighted sum in some way.
-            // For head_dim=64 and 32 threads, each thread handles 2 elements.
-            
+
             float max_score = -INFINITY;
             float denom = 0.0f;
-            
-            // Buffer to store the weighted sum across threads.
-            // Each thread handles a subset of indices i where (i % 32 == tid)
-            float v_acc[4]; // Support up to head_dim = 128 with 32 threads
-            for (int j = 0; j < 4; ++j) v_acc[j] = 0.0f;
-            
+            float v_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+            threadgroup float dots[32];
+            threadgroup float shared_score;
+
             for (uint t = 0; t < seq; ++t) {
                 uint base = bases[t] + kv_h * head_dim;
-                
-                // 1. Parallel Dot Product
-                float partial_dot = 0.0f;
-                for (uint i = tid; i < head_dim; i += 32) {
-                    partial_dot += qh[i] * float(k_cache[base + i]);
-                }
-                
-                // 2. Reduce partial_dot within simdgroup
-                float dot = simd_sum(partial_dot);
-                
-                // 3. Broadcast to all threads in threadgroup (thread 0 of each simdgroup does this)
-                if (tid == 0) shared_dot = dot;
+                float pdot = 0.0f;
+                for (uint i = tid; i < head_dim; i += 32) pdot += qh[i] * float(k_cache[base + i]);
+                dots[tid] = pdot;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                dot = shared_dot;
+
+                if (tid == 0) {
+                    float dot = 0.0f;
+                    for (int k = 0; k < 32; ++k) dot += dots[k];
+                    float s = dot * scale;
+                    if (soft_cap > 0.0f) s = tanh(s / soft_cap) * soft_cap;
+                    shared_score = s;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
                 
-                // 4. Online Softmax update
-                float s = dot * scale;
-                if (soft_cap > 0.0f) s = tanh(s / soft_cap) * soft_cap;
+                float score = shared_score;
+                float old_max = max_score;
+                max_score = max(max_score, score);
+                float exp_prev = (old_max == -INFINITY) ? 0.0f : exp(old_max - max_score);
+                float exp_curr = exp(score - max_score);
                 
-                float max_prev = max_score;
-                max_score = max(max_score, s);
-                
-                float exp_diff = exp(max_prev - max_score);
-                float exp_curr = exp(s - max_score);
-                
-                denom = denom * exp_diff + exp_curr;
-                
-                // 5. Update weighted sum of V
+                denom = denom * exp_prev + exp_curr;
                 for (uint i = tid, j = 0; i < head_dim; i += 32, ++j) {
-                    v_acc[j] = v_acc[j] * exp_diff + exp_curr * float(v_cache[base + i]);
+                    v_acc[j] = v_acc[j] * exp_prev + exp_curr * float(v_cache[base + i]);
                 }
             }
-            
-            // Final Scale and Write Back
+
             for (uint i = tid, j = 0; i < head_dim; i += 32, ++j) {
                 out[head_idx * head_dim + i] = v_acc[j] / denom;
             }
@@ -2853,6 +2829,9 @@ impl KVCache {
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 impl MetalKvStorage {
+    pub fn k_buffer(&self) -> &metal::BufferRef { &self.k }
+    pub fn v_buffer(&self) -> &metal::BufferRef { &self.v }
+
     /// Appends the single-token GQA kernel to an active command encoder (NO syncing).
     pub fn encode_attention(
         &self,
@@ -2868,9 +2847,7 @@ impl MetalKvStorage {
         soft_cap: Option<f32>,
     ) {
         if self.encoding == KvEncodingKind::TurboQuant {
-            // TurboQuant + fused Metal graph is not yet implemented;
-            // the graph-side quantised write path is missing. Skip silently.
-            eprintln!("[cellm-cache] encode_attention: TurboQuant+fused-graph unimplemented – skipping GPU kernel");
+            eprintln!("[cellm-cache] WARNING: TurboQuant KV cache is not yet supported in the Metal fused graph path. Falling back to non-fused execution (this is much slower). Please use --kv-encoding f16 for maximum GPU performance.");
             return;
         }
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -2888,18 +2865,17 @@ impl MetalKvStorage {
         enc.set_buffer(2, Some(bases_buf), bases_offset);
         enc.set_buffer(3, Some(q_buf), 0);
         enc.set_buffer(4, Some(out_buf), 0);
-        enc.set_bytes(5, std::mem::size_of::<u32>() as u64, seq_ptr);
-        enc.set_bytes(6, std::mem::size_of::<u32>() as u64, n_heads_ptr);
-        enc.set_bytes(7, std::mem::size_of::<u32>() as u64, n_kv_heads_ptr);
-        enc.set_bytes(8, std::mem::size_of::<u32>() as u64, head_dim_ptr);
+        enc.set_bytes(5, std::mem::size_of::<u32>() as u64, n_heads_ptr);
+        enc.set_bytes(6, std::mem::size_of::<u32>() as u64, n_kv_heads_ptr);
+        enc.set_bytes(7, std::mem::size_of::<u32>() as u64, head_dim_ptr);
+        enc.set_bytes(8, std::mem::size_of::<u32>() as u64, seq_ptr);
         enc.set_bytes(9, std::mem::size_of::<f32>() as u64, scale_ptr);
         enc.set_bytes(10, std::mem::size_of::<f32>() as u64, soft_cap_ptr);
 
-        let threads = n_heads as u64;
-        let w = self.pso_attn_single_gqa_f32.thread_execution_width() as u64;
-        let tg = metal::MTLSize { width: w.min(threads), height: 1, depth: 1 };
-        let grid = metal::MTLSize { width: threads, height: 1, depth: 1 };
-        enc.dispatch_threads(grid, tg);
+        let threads_per_tg = 32;
+        let tg = metal::MTLSize { width: threads_per_tg, height: 1, depth: 1 };
+        let grid = metal::MTLSize { width: n_heads as u64, height: 1, depth: 1 };
+        enc.dispatch_thread_groups(grid, tg);
     }
     
     pub fn encode_write_token_f32(

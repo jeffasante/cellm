@@ -241,30 +241,34 @@ impl LlamaRunner {
         {
             let mut disable_graph = false;
             if let Some(gs) = &mut self.graph_state {
-                // Ensure pagetable covers this token position.
-                if pos == page_table.token_count() {
-                    page_table.append_token(kv_cache.allocator_mut()).map_err(|e| {
-                        CoreError::Backend(format!("llama step: page_table append_token failed: {e}"))
+                if kv_cache.encoding() == cellm_cache::KvEncodingKind::TurboQuant {
+                    // Fallback for TurboQuant
+                } else {
+                    // Ensure pagetable covers this token position.
+                    if pos == page_table.token_count() {
+                        page_table.append_token(kv_cache.allocator_mut()).map_err(|e| {
+                            CoreError::Backend(format!("llama step: page_table append_token failed: {e}"))
+                        })?;
+                    }
+                    let block_id = page_table.block_for_token(pos).map_err(|e| {
+                        CoreError::Backend(format!("llama step: page_table block_for_token failed: {e}"))
                     })?;
-                }
-                let block_id = page_table.block_for_token(pos).map_err(|e| {
-                    CoreError::Backend(format!("llama step: page_table block_for_token failed: {e}"))
-                })?;
-                let token_off = page_table.offset_in_block(pos).map_err(|e| {
-                    CoreError::Backend(format!("llama step: page_table offset_in_block failed: {e}"))
-                })?;
+                    let token_off = page_table.offset_in_block(pos).map_err(|e| {
+                        CoreError::Backend(format!("llama step: page_table offset_in_block failed: {e}"))
+                    })?;
 
-                if let Ok(maybe_logits) = gs.step_fused(x0, &self.cfg, &self.tensor_prefix, kv_cache, page_table, pos, token_off, block_id as u32, return_logits) {
-                    if let Some(logits) = maybe_logits {
-                        let has_non_finite = logits.iter().any(|v| !v.is_finite());
-                        if has_non_finite {
-                            eprintln!("llama fused graph: non-finite logits detected; disabling fused graph and continuing with non-fused Metal path");
-                            disable_graph = true;
+                    if let Ok(maybe_logits) = gs.step_fused(x0, &self.cfg, &self.tensor_prefix, kv_cache, page_table, pos, token_off, block_id as u32, return_logits) {
+                        if let Some(logits) = maybe_logits {
+                            let has_non_finite = logits.iter().any(|v| !v.is_finite());
+                            if has_non_finite {
+                                eprintln!("llama fused graph: non-finite logits detected; disabling fused graph and continuing with non-fused Metal path");
+                                disable_graph = true;
+                            } else {
+                                return Ok(logits);
+                            }
                         } else {
-                            return Ok(logits);
+                            return Ok(vec![]);
                         }
-                    } else {
-                        return Ok(vec![]);
                     }
                 }
             }

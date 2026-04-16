@@ -614,20 +614,27 @@ struct ChatView: View {
                     return
                 }
 
+                // Throttle UI updates to avoid CoreGraphics NaN from rapid SwiftUI relayout.
+                // Accumulate tokens and flush to the view at most every ~80ms.
+                let streamBuffer = StreamBuffer()
                 let reply = try eng.generate(
                     prompt: textPrompt,
                     maxNewTokens: capturedMaxToks,
                     thermalLevel: .nominal,
                     exerciseSuspendResume: false,
                     onToken: { piece in
-                        // Coalesce rapid token updates to avoid CoreGraphics NaN from excessive relayout.
+                        streamBuffer.append(piece)
+                        let pending = streamBuffer.flushIfReady()
+                        guard let pending, !pending.isEmpty else { return }
                         Task { @MainActor in
                             guard assistantIndex < messages.count else { return }
                             let existing = messages[assistantIndex].text
-                            messages[assistantIndex] = ChatMessage(role: "Assistant", text: existing + piece, imageData: nil, audioFileName: nil)
+                            messages[assistantIndex] = ChatMessage(role: "Assistant", text: existing + pending, imageData: nil, audioFileName: nil)
                         }
                     }
                 )
+                // Flush any remaining buffered tokens after generation completes.
+                let remaining = streamBuffer.flushAll()
                 await MainActor.run {
                     activeBackend = eng.activeBackend
                     if let stats = eng.lastGenerationStats {
@@ -1018,5 +1025,46 @@ struct GenerationSettingsSheet: View {
         case 0.8..<1.2:  return "Creative — more variety"
         default:         return "Very creative — may produce unexpected output"
         }
+    }
+}
+
+// MARK: - Stream Buffer (throttles UI updates)
+
+/// Accumulates streaming token pieces and flushes them to the UI at most
+/// once per `interval` seconds. This prevents the rapid-fire SwiftUI state
+/// mutations that cause CoreGraphics NaN layout errors on iPhone.
+private final class StreamBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var buffer: String = ""
+    private var lastFlush: Date = .distantPast
+    private let interval: TimeInterval = 0.08 // 80ms
+
+    func append(_ piece: String) {
+        lock.lock()
+        buffer += piece
+        lock.unlock()
+    }
+
+    /// Returns accumulated text if enough time has passed since the last flush.
+    /// Returns nil if the throttle window hasn't elapsed yet.
+    func flushIfReady() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        let now = Date()
+        guard now.timeIntervalSince(lastFlush) >= interval else { return nil }
+        let result = buffer
+        buffer = ""
+        lastFlush = now
+        return result
+    }
+
+    /// Returns any remaining buffered text (call at end of generation).
+    func flushAll() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        let result = buffer
+        buffer = ""
+        lastFlush = Date()
+        return result
     }
 }

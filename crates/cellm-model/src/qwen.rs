@@ -126,6 +126,37 @@ impl QwenRunner {
         self.eos_token_id
     }
 
+    fn top_k_logits(&self, logits: &[f32], top_k: usize) -> Vec<(u32, f32)> {
+        let vocab = self.cfg.vocab_size;
+        let k = top_k.max(1).min(vocab);
+        let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
+        let mut min_idx = 0usize;
+        let mut min_val = f32::INFINITY;
+
+        for vid in 0..vocab {
+            let val = logits[vid];
+            if top.len() < k {
+                top.push((vid as u32, val));
+                if val < min_val {
+                    min_val = val;
+                    min_idx = top.len() - 1;
+                }
+            } else if val > min_val {
+                top[min_idx] = (vid as u32, val);
+                min_val = top[0].1;
+                min_idx = 0;
+                for (i, &(_, v)) in top.iter().enumerate().skip(1) {
+                    if v < min_val {
+                        min_val = v;
+                        min_idx = i;
+                    }
+                }
+            }
+        }
+        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        top
+    }
+
     pub fn enable_metal_linear_backend(&mut self) -> bool {
         match MetalKernels::create_matmul() {
             Ok(ctx) => {
@@ -140,6 +171,22 @@ impl QwenRunner {
                 false
             }
         }
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        self.cfg.hidden_size
+    }
+
+    pub fn embed_token_hidden(&self, token: u32, out: &mut [f32]) -> Result<(), CoreError> {
+        self.embed_token(token, out)
+    }
+
+    pub fn debug_partial_rotary_factor(&self) -> f32 {
+        self.partial_rotary_factor
+    }
+
+    pub fn debug_rmsnorm_weight_is_offset(&self) -> bool {
+        self.rmsnorm_weight_is_offset
     }
 
     pub fn enable_metal_full_backend(&mut self) -> bool {
@@ -174,10 +221,67 @@ impl QwenRunner {
         kv_cache: &mut KVCache,
         top_k: usize,
     ) -> Result<Vec<(u32, f32)>, CoreError> {
+        let mut x = vec![0.0f32; self.cfg.hidden_size];
+        self.embed_token(token, &mut x)?;
+        let logits = self.step_inner(&x, pos, page_table, kv_cache, true)?;
+        Ok(self.top_k_logits(&logits, top_k))
+    }
+
+    pub fn prefill(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        page_table: &mut PageTable,
+        kv_cache: &mut KVCache,
+    ) -> Result<(), CoreError> {
+        let hidden = self.cfg.hidden_size;
+        for (i, &tok) in tokens.iter().enumerate() {
+            let pos = start_pos + i;
+            let mut x = vec![0.0f32; hidden];
+            self.embed_token(tok, &mut x)?;
+            self.step_inner(&x, pos, page_table, kv_cache, false)?;
+        }
+        Ok(())
+    }
+
+    fn step_inner(
+        &mut self,
+        x0: &[f32],
+        pos: usize,
+        page_table: &mut PageTable,
+        kv_cache: &mut KVCache,
+        return_logits: bool,
+    ) -> Result<Vec<f32>, CoreError> {
         let cfg = self.cfg.clone();
         let hidden = cfg.hidden_size;
+        let n_heads = cfg.num_attention_heads;
         let n_kv_heads = cfg.num_key_value_heads;
+        let head_dim = hidden / n_heads;
+        let rotary_dim = ((head_dim as f32) * self.partial_rotary_factor) as usize;
+
+        // Lazy session state init.
         let session_id = page_table.session_id();
+        let sess = self.sessions
+            .entry(session_id)
+            .or_insert_with(|| QwenSessionState {
+                linear: vec![],
+                graph_state: None,
+            });
+
+        if false && sess.graph_state.is_none() && self.metal_ops.is_some() && self.metal_strict {
+            let mut gs = QwenGraphState::new(
+                hidden,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.vocab_size,
+                cfg.intermediate_size,
+                self.metal_ops.clone().unwrap(),
+            )?;
+            for (name, bytes) in self.file.all_tensors() {
+                gs.preload_weight(name.clone(), bytes);
+            }
+            sess.graph_state = Some(gs);
+        }
 
         // Ensure pagetable covers this token position.
         if pos == page_table.token_count() {
@@ -193,417 +297,143 @@ impl QwenRunner {
 
         let block_id = page_table.block_for_token(pos).map_err(|e| {
             CoreError::Backend(format!("qwen step: page_table block_for_token failed: {e}"))
-        })?;
+        })? as u32;
         let token_off = page_table.offset_in_block(pos).map_err(|e| {
             CoreError::Backend(format!("qwen step: page_table offset_in_block failed: {e}"))
         })?;
 
-        // Lazy session state init (for linear-attention layers).
-        if let Some(spec) = &self.linear_spec {
-            self.sessions
-                .entry(session_id)
-                .or_insert_with(|| QwenSessionState::new(self.cfg.num_hidden_layers, &self.layer_kinds, spec));
-        }
-
         // x = embedding(token)
-        let mut x = vec![0.0f32; hidden];
-        self.embed_token(token, &mut x)?;
+        let mut x = x0.to_vec();
 
-        // Per-layer scratch.
-        let mut in_norm_w = vec![0.0f32; hidden];
         let mut x_norm = vec![0.0f32; hidden];
-
-        let mut post_norm_w = vec![0.0f32; hidden];
+        let mut q = vec![0.0f32; hidden];
+        let mut k = vec![0.0f32; n_kv_heads * head_dim];
+        let mut v = vec![0.0f32; n_kv_heads * head_dim];
+        let mut attn_out = vec![0.0f32; hidden];
+        let mut attn_proj = vec![0.0f32; hidden];
         let mut mlp_in = vec![0.0f32; hidden];
         let mut gate = vec![0.0f32; cfg.intermediate_size];
         let mut up = vec![0.0f32; cfg.intermediate_size];
         let mut down = vec![0.0f32; hidden];
+        let mut gather_bases = Vec::new();
 
-        // Attention buffers (sized per layer when needed).
-        let mut q_raw: Vec<f32> = Vec::new();
-        let mut q: Vec<f32> = Vec::new();
-        let mut q_gate: Vec<f32> = Vec::new();
-        let mut k: Vec<f32> = Vec::new();
-        let mut v: Vec<f32> = Vec::new();
-        let mut attn_out: Vec<f32> = Vec::new();
-        let mut attn_proj: Vec<f32> = vec![0.0f32; hidden];
-        let mut q_head_norm_w: Vec<f32> = Vec::new();
-        let mut k_head_norm_w: Vec<f32> = Vec::new();
+        let prefix = if has_tensor_file(&self.file, "language_model.model.embed_tokens.weight") {
+            "language_model."
+        } else {
+            ""
+        };
 
-        // Linear-attention (Gated DeltaNet) scratch (allocated lazily if used).
-        let mut lin_qkv: Vec<f32> = Vec::new();
-        let mut lin_z: Vec<f32> = Vec::new();
-        let mut lin_a: Vec<f32> = Vec::new();
-        let mut lin_b: Vec<f32> = Vec::new();
-        let mut lin_mixed_qkv: Vec<f32> = Vec::new();
-        let mut lin_conv_out: Vec<f32> = Vec::new();
-        let mut lin_q_rep: Vec<f32> = Vec::new();
-        let mut lin_k_rep: Vec<f32> = Vec::new();
-        let mut lin_v: Vec<f32> = Vec::new();
-        let mut lin_core_out: Vec<f32> = Vec::new();
-        let mut lin_normed: Vec<f32> = Vec::new();
-        let mut lin_tmp_kv: Vec<f32> = Vec::new();
-        let mut lin_tmp_delta: Vec<f32> = Vec::new();
+        if false {
+            if let Some(graph_state) = &mut sess.graph_state {
+                let res = graph_state.step_fused(
+                    &x,
+                    &cfg,
+                    prefix,
+                    kv_cache,
+                    page_table,
+                    pos,
+                    token_off,
+                    block_id,
+                    self.partial_rotary_factor,
+                    self.rmsnorm_weight_is_offset,
+                    return_logits,
+                )?;
+                return Ok(res.unwrap_or_else(Vec::new));
+            }
+        }
 
-        let mut gather_bases: Vec<usize> = Vec::new();
+        let use_metal_norm = self.metal_ops.is_some();
+        let use_metal_rope = self.metal_ops.is_some() && !self.disable_full_attention;
 
         for layer in 0..self.max_layers {
-            let use_metal_norm = self.metal_ops.is_some();
-            let use_metal_rope = self.metal_ops.is_some();
-
-            let layer_in_norm = l2norm_value(&x);
-            // Norm before attention / linear-attn.
+            // Input norm
             if use_metal_norm {
-                let w = self.tensor_f16(&format!("language_model.model.layers.{layer}.input_layernorm.weight"))?.to_vec();
+                let name = format!("{prefix}model.layers.{layer}.input_layernorm.weight");
+                let w = self.tensor_f16(&name)?.to_vec();
                 let add_one = self.rmsnorm_weight_is_offset;
-                let ck = format!("qwen.layer.{layer}.attn_norm");
                 self.metal_ops.as_ref().unwrap()
-                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &ck, &mut x_norm)
+                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &name, &mut x_norm)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
             } else {
-                self.rmsnorm_weight(
-                    &format!("language_model.model.layers.{layer}.input_layernorm.weight"),
-                    &mut in_norm_w,
-                )?;
+                let mut in_norm_w = vec![0.0f32; hidden];
+                self.rmsnorm_weight(&format!("{prefix}model.layers.{layer}.input_layernorm.weight"), &mut in_norm_w)?;
                 if self.rmsnorm_weight_is_offset {
                     add_one_inplace(&mut in_norm_w);
                 }
                 rms_norm_f32(&x, &in_norm_w, cfg.rms_norm_eps, &mut x_norm);
             }
 
-            match self.layer_kinds.get(layer).copied().unwrap_or(LayerKind::FullAttention) {
+            match self.layer_kinds[layer] {
                 LayerKind::FullAttention => {
-                if self.disable_full_attention {
-                    continue;
-                }
-                // Read shapes to infer head geometry.
-                let k_shape = self.tensor_shape(&format!(
-                    "language_model.model.layers.{layer}.self_attn.k_proj.weight"
-                ))?;
-                let o_shape = self.tensor_shape(&format!(
-                    "language_model.model.layers.{layer}.self_attn.o_proj.weight"
-                ))?;
-                if k_shape.len() != 2 || o_shape.len() != 2 {
-                    return Err(CoreError::Backend(format!(
-                        "qwen: expected 2D k/o proj weights at layer {layer}"
-                    )));
-                }
-                let kv_dim = k_shape[0];
-                if kv_dim % n_kv_heads != 0 {
-                    return Err(CoreError::Backend(format!(
-                        "qwen: kv_dim {kv_dim} not divisible by n_kv_heads={n_kv_heads} at layer {layer}"
-                    )));
-                }
-                let head_dim = kv_dim / n_kv_heads;
-                let attn_in = o_shape[1];
-                if attn_in % head_dim != 0 {
-                    return Err(CoreError::Backend(format!(
-                        "qwen: o_proj in_dim {attn_in} not divisible by head_dim={head_dim} at layer {layer}"
-                    )));
-                }
-                let n_heads = attn_in / head_dim;
-
-                // Projections.
-                let q_shape = self.tensor_shape(&format!(
-                    "language_model.model.layers.{layer}.self_attn.q_proj.weight"
-                ))?;
-                if q_shape.len() != 2 || q_shape[1] != hidden {
-                    return Err(CoreError::Backend(format!(
-                        "qwen: unexpected q_proj.weight shape {:?} at layer {layer}",
-                        q_shape
-                    )));
-                }
-                q_raw.resize(q_shape[0], 0.0);
-                k.resize(kv_dim, 0.0);
-                v.resize(kv_dim, 0.0);
-                let q_name = format!("language_model.model.layers.{layer}.self_attn.q_proj.weight");
-                let k_name = format!("language_model.model.layers.{layer}.self_attn.k_proj.weight");
-                let v_name = format!("language_model.model.layers.{layer}.self_attn.v_proj.weight");
-                let fused_qkv = self.linear_qkv_f16_out_in(
-                    &x_norm,
-                    &q_name,
-                    q_raw.len(),
-                    &k_name,
-                    kv_dim,
-                    &v_name,
-                    kv_dim,
-                    hidden,
-                    &mut q_raw,
-                    &mut k,
-                    &mut v,
-                )?;
-                if !fused_qkv {
-                    self.linear_f16_out_in(&x_norm, &q_name, q_raw.len(), hidden, &mut q_raw)?;
-                    self.linear_f16_out_in(&x_norm, &k_name, kv_dim, hidden, &mut k)?;
-                    self.linear_f16_out_in(&x_norm, &v_name, kv_dim, hidden, &mut v)?;
-                }
-                self.add_projection_bias_if_present(&q_name, &mut q_raw)?;
-                self.add_projection_bias_if_present(&k_name, &mut k)?;
-                self.add_projection_bias_if_present(&v_name, &mut v)?;
-
-                // q and optional gate.
-                let q_main_dim = n_heads * head_dim;
-                if q_raw.len() == q_main_dim * 2 {
-                    q.resize(q_main_dim, 0.0);
-                    q_gate.resize(q_main_dim, 0.0);
-                    // Qwen3.5 full-attn uses per-head packed q_proj output:
-                    // [head0_q, head0_gate, head1_q, head1_gate, ...].
-                    for h in 0..n_heads {
-                        let src = h * (2 * head_dim);
-                        let dst = h * head_dim;
-                        q[dst..dst + head_dim].copy_from_slice(&q_raw[src..src + head_dim]);
-                        q_gate[dst..dst + head_dim]
-                            .copy_from_slice(&q_raw[src + head_dim..src + 2 * head_dim]);
+                    let (q_name, k_name, v_name) = self.resolve_qkv_names(layer, prefix);
+                    let fused_qkv = self.linear_qkv_f16_out_in(&x_norm, &q_name, hidden, &k_name, n_kv_heads * head_dim, &v_name, n_kv_heads * head_dim, hidden, &mut q, &mut k, &mut v)?;
+                    if !fused_qkv {
+                        self.linear_f16_out_in(&x_norm, &q_name, hidden, hidden, &mut q)?;
+                        self.linear_f16_out_in(&x_norm, &k_name, n_kv_heads * head_dim, hidden, &mut k)?;
+                        self.linear_f16_out_in(&x_norm, &v_name, n_kv_heads * head_dim, hidden, &mut v)?;
                     }
-                } else if q_raw.len() == q_main_dim {
-                    q.clear();
-                    q.extend_from_slice(&q_raw);
-                    q_gate.clear();
-                } else {
-                    return Err(CoreError::Backend(format!(
-                        "qwen: unexpected q_proj out_dim {} at layer {layer} (expected {q_main_dim} or {})",
-                        q_raw.len(),
-                        q_main_dim * 2
-                    )));
-                }
+                    self.add_projection_bias_if_present(&q_name, &mut q)?;
+                    self.add_projection_bias_if_present(&k_name, &mut k)?;
+                    self.add_projection_bias_if_present(&v_name, &mut v)?;
 
-                // Qwen-style per-head Q/K RMSNorm is present in some variants
-                // (e.g. Qwen3.5), but absent in others (e.g. Qwen2.5).
-                // Only apply when both norm tensors exist.
-                let q_norm_name = format!("language_model.model.layers.{layer}.self_attn.q_norm.weight");
-                let k_norm_name = format!("language_model.model.layers.{layer}.self_attn.k_norm.weight");
-                let has_qk_norm =
-                    has_tensor_file(&self.file, &q_norm_name) && has_tensor_file(&self.file, &k_norm_name);
-                if has_qk_norm {
-                    if use_metal_norm {
-                        let qw = self.tensor_f16(&q_norm_name)?.to_vec();
-                        let kw = self.tensor_f16(&k_norm_name)?.to_vec();
-                        let add_one = self.rmsnorm_weight_is_offset;
-                        let ops = self.metal_ops.as_ref().unwrap();
-                        for h in 0..n_heads {
-                            let seg = &mut q[h * head_dim..(h + 1) * head_dim];
-                            let inp = seg.to_vec();
-                            ops.rms_norm_f16w(&inp, &qw, cfg.rms_norm_eps, add_one, "qwen.win_q", seg)
-                                .map_err(|e| CoreError::Backend(e.to_string()))?;
-                        }
-                        for h in 0..n_kv_heads {
-                            let seg = &mut k[h * head_dim..(h + 1) * head_dim];
-                            let inp = seg.to_vec();
-                            ops.rms_norm_f16w(&inp, &kw, cfg.rms_norm_eps, add_one, "qwen.win_k", seg)
-                                .map_err(|e| CoreError::Backend(e.to_string()))?;
-                        }
-                    } else {
-                        q_head_norm_w.resize(head_dim, 0.0);
-                        k_head_norm_w.resize(head_dim, 0.0);
-                        self.rmsnorm_weight(&q_norm_name, &mut q_head_norm_w)?;
-                        self.rmsnorm_weight(&k_norm_name, &mut k_head_norm_w)?;
-                        if self.rmsnorm_weight_is_offset {
-                            add_one_inplace(&mut q_head_norm_w);
-                            add_one_inplace(&mut k_head_norm_w);
-                        }
-                        for h in 0..n_heads {
-                            rms_norm_inplace_f32(
-                                &mut q[h * head_dim..(h + 1) * head_dim],
-                                &q_head_norm_w,
-                                cfg.rms_norm_eps,
-                            );
-                        }
-                        for h in 0..n_kv_heads {
-                            rms_norm_inplace_f32(
-                                &mut k[h * head_dim..(h + 1) * head_dim],
-                                &k_head_norm_w,
-                                cfg.rms_norm_eps,
-                            );
+                    if rotary_dim > 0 {
+                        if use_metal_rope {
+                            let ops = self.metal_ops.as_ref().unwrap();
+                            ops.rope_half_f32(&mut q, n_heads, head_dim, rotary_dim, pos, cfg.rope_theta).map_err(|e| CoreError::Backend(e.to_string()))?;
+                            ops.rope_half_f32(&mut k, n_kv_heads, head_dim, rotary_dim, pos, cfg.rope_theta).map_err(|e| CoreError::Backend(e.to_string()))?;
+                        } else {
+                            rope_inplace_f32_partial(&mut q, n_heads, head_dim, rotary_dim, pos, cfg.rope_theta);
+                            rope_inplace_f32_partial(&mut k, n_kv_heads, head_dim, rotary_dim, pos, cfg.rope_theta);
                         }
                     }
-                }
 
-                let mut rotary_dim = ((head_dim as f32) * self.partial_rotary_factor) as usize;
-                rotary_dim = rotary_dim.min(head_dim);
-                if rotary_dim % 2 != 0 {
-                    rotary_dim -= 1;
-                }
-                if rotary_dim > 0 {
-                    if use_metal_rope {
-                        let ops = self.metal_ops.as_ref().unwrap();
-                        ops.rope_half_f32(&mut q, n_heads, head_dim, rotary_dim, pos, cfg.rope_theta)
-                            .map_err(|e| CoreError::Backend(e.to_string()))?;
-                        ops.rope_half_f32(&mut k, n_kv_heads, head_dim, rotary_dim, pos, cfg.rope_theta)
-                            .map_err(|e| CoreError::Backend(e.to_string()))?;
-                    } else {
-                        rope_inplace_f32_partial(&mut q, n_heads, head_dim, rotary_dim, pos, cfg.rope_theta);
-                        rope_inplace_f32_partial(
-                            &mut k,
-                            n_kv_heads,
-                            head_dim,
-                            rotary_dim,
-                            pos,
-                            cfg.rope_theta,
-                        );
-                    }
-                }
-
-                // Write new token K/V into paged cache.
-                {
-                    let mut cv = kv_cache.view_mut();
-                    cv.write_token(block_id, layer, token_off, &k, &v)?;
-                }
-
-                // Gather historical token bases and run attention for this token.
-                let seq = page_table.token_count();
-                let cr = kv_cache.view();
-                gather_bases.clear();
-                gather_bases.reserve(seq);
-                for tpos in 0..seq {
-                    let b = page_table.block_for_token(tpos).map_err(|e| {
-                        CoreError::Backend(format!("qwen: block_for_token failed: {e}"))
-                    })?;
-                    let o = page_table.offset_in_block(tpos).map_err(|e| {
-                        CoreError::Backend(format!("qwen: offset_in_block failed: {e}"))
-                    })?;
-                    gather_bases.push(cr.layout.token_base_elem(b, layer, o)?);
-                }
-                attn_out.resize(q_main_dim, 0.0);
-                cr.attention_single_token_gqa_from_bases(
-                    &gather_bases,
-                    &q,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    None, // soft_cap
-                    &mut attn_out,
-                )?;
-
-                // Optional output gate.
-                if !q_gate.is_empty() && !self.disable_full_attn_gate {
-                    for i in 0..attn_out.len() {
-                        let g = 1.0 / (1.0 + (-q_gate[i]).exp());
-                        attn_out[i] *= g;
-                    }
-                }
-
-                // o_proj: hidden <- attn_in
-                self.linear_f16_out_in(
-                    &attn_out,
-                    &format!("language_model.model.layers.{layer}.self_attn.o_proj.weight"),
-                    hidden,
-                    attn_in,
-                    &mut attn_proj,
-                )?;
-                self.add_projection_bias_if_present(
-                    &format!("language_model.model.layers.{layer}.self_attn.o_proj.weight"),
-                    &mut attn_proj,
-                )?;
-
-                for i in 0..hidden {
-                    x[i] += attn_proj[i];
-                }
-                }
-                LayerKind::LinearAttention => {
-                    if self.disable_linear_attention {
-                        continue;
-                    }
-                    let Some(spec) = &self.linear_spec else {
-                        return Err(CoreError::Backend(
-                            "qwen: layer marked linear_attention but no linear_spec".into(),
-                        ));
-                    };
-                    let s = self
-                        .sessions
-                        .get_mut(&session_id)
-                        .expect("session state exists when linear_spec exists");
-                    let layer_state = s.linear[layer].as_mut().ok_or_else(|| {
-                        CoreError::Backend(format!(
-                            "qwen: missing linear-attn state for layer {layer} (session={session_id})"
-                        ))
-                    })?;
-
-                    // Allocate scratch once.
-                    if lin_qkv.is_empty() {
-                        let key_dim = spec.num_k_heads * spec.head_k_dim;
-                        let value_dim = spec.num_v_heads * spec.head_v_dim;
-                        let conv_dim = key_dim * 2 + value_dim;
-                        lin_qkv.resize(conv_dim, 0.0);
-                        lin_z.resize(value_dim, 0.0);
-                        lin_a.resize(spec.num_v_heads, 0.0);
-                        lin_b.resize(spec.num_v_heads, 0.0);
-                        lin_mixed_qkv.resize(conv_dim, 0.0);
-                        lin_conv_out.resize(conv_dim, 0.0);
-                        lin_q_rep.resize(spec.num_v_heads * spec.head_k_dim, 0.0);
-                        lin_k_rep.resize(spec.num_v_heads * spec.head_k_dim, 0.0);
-                        lin_v.resize(value_dim, 0.0);
-                        lin_core_out.resize(value_dim, 0.0);
-                        lin_normed.resize(value_dim, 0.0);
-                        lin_tmp_kv.resize(spec.head_v_dim, 0.0);
-                        lin_tmp_delta.resize(spec.head_v_dim, 0.0);
+                    {
+                        let mut cv = kv_cache.view_mut();
+                        cv.write_token(block_id, layer, token_off, &k, &v)?;
                     }
 
-                    linear_attn_step(
-                        &self.file,
-                        layer,
-                        hidden,
-                        &x_norm,
-                        layer_state,
-                        spec,
-                        cfg.rms_norm_eps,
-                        &mut lin_qkv,
-                        &mut lin_z,
-                        &mut lin_a,
-                        &mut lin_b,
-                        &mut lin_mixed_qkv,
-                        &mut lin_conv_out,
-                        &mut lin_q_rep,
-                        &mut lin_k_rep,
-                        &mut lin_v,
-                        &mut lin_core_out,
-                        &mut lin_normed,
-                        &mut lin_tmp_kv,
-                        &mut lin_tmp_delta,
-                        &mut attn_proj,
-                    )?;
+                    let seq = page_table.token_count();
+                    let cr = kv_cache.view();
+                    gather_bases.clear();
+                    for tpos in 0..seq {
+                        let b = page_table.block_for_token(tpos).map_err(|e| CoreError::Backend(e.to_string()))?;
+                        let o = page_table.offset_in_block(tpos).map_err(|e| CoreError::Backend(e.to_string()))?;
+                        gather_bases.push(cr.layout.token_base_elem(b, layer, o)?);
+                    }
+                    cr.attention_single_token_gqa_from_bases(&gather_bases, &q, n_heads, n_kv_heads, head_dim, None, &mut attn_out)?;
+
+                    self.linear_f16_out_in(&attn_out, &format!("{prefix}model.layers.{layer}.self_attn.o_proj.weight"), hidden, hidden, &mut attn_proj)?;
+                    self.add_projection_bias_if_present(&format!("{prefix}model.layers.{layer}.self_attn.o_proj.weight"), &mut attn_proj)?;
+
                     for i in 0..hidden {
                         x[i] += attn_proj[i];
                     }
                 }
+                LayerKind::LinearAttention => {
+                }
             }
-            let layer_post_mixer_norm = l2norm_value(&x);
 
-            // Post-attn norm (run regardless; even if attention was skipped).
+            // Post-attn norm
             if use_metal_norm {
-                let w = self.tensor_f16(&format!("language_model.model.layers.{layer}.post_attention_layernorm.weight"))?.to_vec();
+                let name = format!("{prefix}model.layers.{layer}.post_attention_layernorm.weight");
+                let w = self.tensor_f16(&name)?.to_vec();
                 let add_one = self.rmsnorm_weight_is_offset;
-                let ck = format!("qwen.layer.{layer}.mlp_norm");
                 self.metal_ops.as_ref().unwrap()
-                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &ck, &mut mlp_in)
+                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &name, &mut mlp_in)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
             } else {
-                self.rmsnorm_weight(
-                    &format!("language_model.model.layers.{layer}.post_attention_layernorm.weight"),
-                    &mut post_norm_w,
-                )?;
+                let mut post_norm_w = vec![0.0f32; hidden];
+                self.rmsnorm_weight(&format!("{prefix}model.layers.{layer}.post_attention_layernorm.weight"), &mut post_norm_w)?;
                 if self.rmsnorm_weight_is_offset {
                     add_one_inplace(&mut post_norm_w);
                 }
                 rms_norm_f32(&x, &post_norm_w, cfg.rms_norm_eps, &mut mlp_in);
             }
 
-            // MLP: gate_proj + up_proj -> silu(gate)*up -> down_proj
-            self.linear_f16_out_in(
-                &mlp_in,
-                &format!("language_model.model.layers.{layer}.mlp.gate_proj.weight"),
-                cfg.intermediate_size,
-                hidden,
-                &mut gate,
-            )?;
-            self.linear_f16_out_in(
-                &mlp_in,
-                &format!("language_model.model.layers.{layer}.mlp.up_proj.weight"),
-                cfg.intermediate_size,
-                hidden,
-                &mut up,
-            )?;
+            // MLP
+            self.linear_f16_out_in(&mlp_in, &format!("{prefix}model.layers.{layer}.mlp.gate_proj.weight"), cfg.intermediate_size, hidden, &mut gate)?;
+            self.linear_f16_out_in(&mlp_in, &format!("{prefix}model.layers.{layer}.mlp.up_proj.weight"), cfg.intermediate_size, hidden, &mut up)?;
 
-            // silu(gate) in-place: x * sigmoid(x)
             use rayon::prelude::*;
             gate.par_iter_mut().for_each(|g| {
                 let s = 1.0 / (1.0 + (-*g).exp());
@@ -613,142 +443,128 @@ impl QwenRunner {
                 gate[i] *= up[i];
             }
 
-            self.linear_f16_out_in(
-                &gate,
-                &format!("language_model.model.layers.{layer}.mlp.down_proj.weight"),
-                hidden,
-                cfg.intermediate_size,
-                &mut down,
-            )?;
+            self.linear_f16_out_in(&gate, &format!("{prefix}model.layers.{layer}.mlp.down_proj.weight"), hidden, cfg.intermediate_size, &mut down)?;
+
             for i in 0..hidden {
                 x[i] += down[i];
             }
-            let layer_out_norm = l2norm_value(&x);
-            if self.debug_pos == Some(pos) {
-                let kind = self.layer_kinds.get(layer).copied().unwrap_or(LayerKind::FullAttention);
-                eprintln!(
-                    "[qwen-debug] pos={pos} layer={layer} kind={kind:?} in={:.6} post_mixer={:.6} out={:.6}",
-                    layer_in_norm, layer_post_mixer_norm, layer_out_norm
-                );
-            }
         }
 
-        // Final norm.
-        let use_metal_norm = self.metal_ops.is_some();
-        let use_metal_logits = self.metal_ops.is_some();
+        // Final norm
         let mut x_final = vec![0.0f32; hidden];
         if use_metal_norm {
-            let w = self.tensor_f16("language_model.model.norm.weight")?.to_vec();
+            let name = format!("{prefix}model.norm.weight");
+            let w = self.tensor_f16(&name)?.to_vec();
             let add_one = self.rmsnorm_weight_is_offset;
             self.metal_ops.as_ref().unwrap()
-                .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, "qwen.final_norm", &mut x_final)
+                .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &name, &mut x_final)
                 .map_err(|e| CoreError::Backend(e.to_string()))?;
         } else {
             let mut norm_w = vec![0.0f32; hidden];
-            self.rmsnorm_weight("language_model.model.norm.weight", &mut norm_w)?;
+            self.rmsnorm_weight(&format!("{prefix}model.norm.weight"), &mut norm_w)?;
             if self.rmsnorm_weight_is_offset {
                 add_one_inplace(&mut norm_w);
             }
             rms_norm_f32(&x, &norm_w, cfg.rms_norm_eps, &mut x_final);
         }
-        if self.debug_pos == Some(pos) {
-            eprintln!(
-                "[qwen-debug] pos={pos} final pre_norm={:.6} final={:.6}",
-                l2norm_value(&x),
-                l2norm_value(&x_final)
-            );
+
+        if !return_logits {
+            return Ok(vec![]);
         }
 
-        // Logits via lm_head when present, otherwise tied embeddings.
+        // Logits
         let embed_name = self.resolve_tensor_name("language_model.model.embed_tokens.weight");
-        let lm_head_name = if self.file.tensor_index("lm_head.weight").is_some() {
+        let lm_head_name = if has_tensor_file(&self.file, "lm_head.weight") {
             Some(self.resolve_tensor_name("lm_head.weight"))
         } else {
             None
         };
+        let weight_name = lm_head_name.as_deref().unwrap_or(&embed_name);
         let vocab = cfg.vocab_size;
-        let k = top_k.max(1).min(vocab);
-        let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
-        let mut min_idx = 0usize;
-        let mut min_val = f32::INFINITY;
 
-        let weight_name = if let Some(name) = lm_head_name.as_deref() {
-            name
-        } else {
-            embed_name.as_str()
-        };
-
+        let use_metal_logits = self.metal_ops.is_some();
+        let mut logits = vec![0.0f32; vocab];
         if use_metal_logits {
-            let resolved = self.resolve_tensor_name(weight_name);
-            let dtype = self
-                .file
-                .tensor_index(&resolved)
-                .ok_or_else(|| CoreError::Backend(format!("unknown tensor {weight_name}")))?
-                .dtype
-                .clone();
-            let mut buf = vec![0.0f32; vocab];
+            let dtype = self.file.tensor_index(weight_name).unwrap().dtype.clone();
             match dtype.as_str() {
                 "f16" => {
                     let w = self.tensor_f16(weight_name)?.to_vec();
-                    self.metal_ops.as_ref().unwrap()
-                        .logits_f16(&x_final, &w, vocab, hidden, weight_name, &mut buf)
-                        .map_err(|e| CoreError::Backend(e.to_string()))?;
+                    self.metal_ops.as_ref().unwrap().logits_f16(&x_final, &w, vocab, hidden, weight_name, &mut logits).map_err(|e| CoreError::Backend(e.to_string()))?;
                 }
                 "i8" => {
                     let w = self.tensor_i8(weight_name)?.to_vec();
                     let s = self.tensor_f16(&format!("{weight_name}.qscale"))?.to_vec();
-                    self.metal_ops.as_ref().unwrap()
-                        .logits_i8(&x_final, &w, &s, vocab, hidden, weight_name, &mut buf)
-                        .map_err(|e| CoreError::Backend(e.to_string()))?;
+                    self.metal_ops.as_ref().unwrap().logits_i8(&x_final, &w, &s, vocab, hidden, weight_name, &mut logits).map_err(|e| CoreError::Backend(e.to_string()))?;
                 }
-                other => return Err(CoreError::Backend(format!("unsupported lm dtype {other} for {weight_name}"))),
-            }
-            for vid in 0..vocab {
-                let dot = buf[vid];
-                if top.len() < k {
-                    top.push((vid as u32, dot));
-                    if dot < min_val {
-                        min_val = dot;
-                        min_idx = top.len() - 1;
-                    }
-                } else if dot > min_val {
-                    top[min_idx] = (vid as u32, dot);
-                    min_val = top[0].1;
-                    min_idx = 0;
-                    for (i, &(_, s)) in top.iter().enumerate().skip(1) {
-                        if s < min_val {
-                            min_val = s;
-                            min_idx = i;
-                        }
-                    }
-                }
+                _ => return Err(CoreError::Backend("unsupported lm_head dtype".into())),
             }
         } else {
             for vid in 0..vocab {
-                let dot = self.dot_row(weight_name, vid, hidden, &x_final)?;
-
-                if top.len() < k {
-                    top.push((vid as u32, dot));
-                    if dot < min_val {
-                        min_val = dot;
-                        min_idx = top.len() - 1;
-                    }
-                } else if dot > min_val {
-                    top[min_idx] = (vid as u32, dot);
-                    min_val = top[0].1;
-                    min_idx = 0;
-                    for (i, &(_, s)) in top.iter().enumerate().skip(1) {
-                        if s < min_val {
-                            min_val = s;
-                            min_idx = i;
-                        }
-                    }
-                }
+                logits[vid] = self.dot_row(weight_name, vid, hidden, &x_final)?;
             }
         }
 
-        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        Ok(top)
+        Ok(logits)
+    }
+
+    fn embed_token(&self, token: u32, out: &mut [f32]) -> Result<(), CoreError> {
+        let prefix = if has_tensor_file(&self.file, "language_model.model.embed_tokens.weight") {
+            "language_model."
+        } else {
+            ""
+        };
+        let weight_name = format!("{prefix}model.embed_tokens.weight");
+        let hidden = out.len();
+        let resolved = self.resolve_tensor_name(&weight_name);
+        let dtype = self
+            .file
+            .tensor_index(&resolved)
+            .ok_or_else(|| CoreError::Backend(format!("unknown tensor {weight_name}")))?
+            .dtype
+            .clone();
+        let vocab = self.cfg.vocab_size;
+        let t = (token as usize) % vocab;
+        match dtype.as_str() {
+            "f16" => {
+                let embed = self.tensor_f16(&weight_name)?;
+                let row = &embed[t * hidden..(t + 1) * hidden];
+                for i in 0..hidden {
+                    out[i] = f16::from_bits(row[i]).to_f32();
+                }
+            }
+            "i8" => {
+                let embed = self.tensor_i8(&weight_name)?;
+                let scales = self.tensor_f16(&format!("{weight_name}.qscale"))?;
+                let scale = f16::from_bits(scales[t]).to_f32();
+                let row = &embed[t * hidden..(t + 1) * hidden];
+                for i in 0..hidden {
+                    out[i] = (row[i] as f32) * scale;
+                }
+            }
+            "i4" => {
+                let embed = self.tensor_u8(&weight_name)?;
+                let scales = self.tensor_f16(&format!("{weight_name}.qscale"))?;
+                let scale = f16::from_bits(scales[t]).to_f32();
+                let row_stride = hidden.div_ceil(2);
+                let row = &embed[t * row_stride..(t + 1) * row_stride];
+                for i in 0..hidden {
+                    out[i] = unpack_i4(row, i) * scale;
+                }
+            }
+            other => {
+                return Err(CoreError::Backend(format!(
+                    "unsupported embed dtype for {weight_name}: {other}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_qkv_names(&self, layer: usize, prefix: &str) -> (String, String, String) {
+        let q_name = format!("{prefix}model.layers.{layer}.self_attn.q_proj.weight");
+        let k_name = format!("{prefix}model.layers.{layer}.self_attn.k_proj.weight");
+        let v_name = format!("{prefix}model.layers.{layer}.self_attn.v_proj.weight");
+        (q_name, k_name, v_name)
     }
 
     fn tensor_f16(&self, name: &str) -> Result<&[u16], CoreError> {
@@ -784,61 +600,6 @@ impl QwenRunner {
 
     fn resolve_tensor_name(&self, name: &str) -> String {
         resolve_tensor_name_file(&self.file, name)
-    }
-
-    fn embed_token(&self, token: u32, out: &mut [f32]) -> Result<(), CoreError> {
-        let hidden = out.len();
-        let weight_name = "language_model.model.embed_tokens.weight";
-        let shape = self.tensor_shape(weight_name)?;
-        if shape.len() != 2 || shape[1] != hidden {
-            return Err(CoreError::Backend(format!(
-                "embed weight shape mismatch: {:?}, expected [vocab,{hidden}]",
-                shape
-            )));
-        }
-        let resolved = self.resolve_tensor_name(weight_name);
-        let dtype = self
-            .file
-            .tensor_index(&resolved)
-            .ok_or_else(|| CoreError::Backend(format!("unknown tensor {weight_name}")))?
-            .dtype
-            .clone();
-        let vocab = self.cfg.vocab_size;
-        let t = (token as usize) % vocab;
-        match dtype.as_str() {
-            "f16" => {
-                let embed = self.tensor_f16(weight_name)?;
-                let row = &embed[t * hidden..(t + 1) * hidden];
-                for i in 0..hidden {
-                    out[i] = f16::from_bits(row[i]).to_f32();
-                }
-            }
-            "i8" => {
-                let embed = self.tensor_i8(weight_name)?;
-                let scales = self.tensor_f16(&format!("{weight_name}.qscale"))?;
-                let scale = f16::from_bits(scales[t]).to_f32();
-                let row = &embed[t * hidden..(t + 1) * hidden];
-                for i in 0..hidden {
-                    out[i] = (row[i] as f32) * scale;
-                }
-            }
-            "i4" => {
-                let embed = self.tensor_u8(weight_name)?;
-                let scales = self.tensor_f16(&format!("{weight_name}.qscale"))?;
-                let scale = f16::from_bits(scales[t]).to_f32();
-                let row_stride = hidden.div_ceil(2);
-                let row = &embed[t * row_stride..(t + 1) * row_stride];
-                for i in 0..hidden {
-                    out[i] = unpack_i4(row, i) * scale;
-                }
-            }
-            other => {
-                return Err(CoreError::Backend(format!(
-                    "unsupported embed dtype for {weight_name}: {other}"
-                )));
-            }
-        }
-        Ok(())
     }
 
     fn dot_row(
@@ -901,9 +662,11 @@ impl QwenRunner {
                 }
                 Ok(acc)
             }
-            other => Err(CoreError::Backend(format!(
-                "unsupported weight dtype for {weight_name}: {other}"
-            ))),
+            other => {
+                return Err(CoreError::Backend(format!(
+                    "unsupported embed dtype for {weight_name}: {other}"
+                )));
+            }
         }
     }
 
@@ -1021,109 +784,6 @@ impl QwenRunner {
         Ok(())
     }
 
-    pub fn test_linear_parity(
-        &mut self,
-        weight_name: &str,
-        out_dim: usize,
-        in_dim: usize,
-    ) -> Result<(f32, f32), CoreError> {
-        let mut x = vec![0.0f32; in_dim];
-        for i in 0..in_dim {
-            x[i] = (i as f32) / 100.0;
-        }
-
-        // 1. CPU
-        let mut cpu_out = vec![0.0f32; out_dim];
-        let old_mo = self.metal_ops.take(); // Force CPU fallback
-        self.linear_f16_out_in(&x, weight_name, out_dim, in_dim, &mut cpu_out)?;
-        self.metal_ops = old_mo;
-
-        // 2. Metal
-        let mut metal_out = vec![0.0f32; out_dim];
-        if self.metal_ops.is_none() {
-            self.enable_metal_full_backend();
-        }
-        self.linear_f16_out_in(&x, weight_name, out_dim, in_dim, &mut metal_out)?;
-
-        let mut max_diff = 0.0f32;
-        let mut sum_diff = 0.0f32;
-        for i in 0..out_dim {
-            let diff = (cpu_out[i] - metal_out[i]).abs();
-            if diff > max_diff { max_diff = diff; }
-            sum_diff += diff;
-        }
-        Ok((max_diff, sum_diff / out_dim as f32))
-    }
-
-    pub fn test_rmsnorm_parity(
-        &mut self,
-        weight_name: &str,
-        eps: f32,
-        add_one: bool,
-    ) -> Result<(f32, f32), CoreError> {
-        let n = 896;
-        let mut x = vec![0.0f32; n];
-        for i in 0..n { x[i] = (i as f32) / 100.0; }
-        let w = self.tensor_f16(weight_name)?.to_vec();
-        let wf32: Vec<f32> = w.iter().map(|&v| f16::from_bits(v).to_f32()).collect();
-
-        // 1. CPU
-        let mut cpu_out = vec![0.0f32; n];
-        cpu_out.copy_from_slice(&x);
-        if add_one {
-            for v in cpu_out.iter_mut() { *v += 1.0; }
-        }
-        rms_norm_inplace_f32(&mut cpu_out, &wf32, eps);
-
-        // 2. Metal
-        let mut metal_out = vec![0.0f32; n];
-        if self.metal_ops.is_none() { self.enable_metal_full_backend(); }
-        self.metal_ops.as_mut().unwrap()
-            .rms_norm_f16w(&x, &w, eps, add_one, "test_norm", &mut metal_out)
-            .map_err(|e| CoreError::Backend(e.to_string()))?;
-
-        let mut max_diff = 0.0f32;
-        let mut sum_diff = 0.0f32;
-        for i in 0..n {
-            let diff = (cpu_out[i] - metal_out[i]).abs();
-            if diff > max_diff { max_diff = diff; }
-            sum_diff += diff;
-        }
-        Ok((max_diff, sum_diff / n as f32))
-    }
-
-    pub fn test_rope_parity(
-        &mut self,
-        n_heads: usize,
-        head_dim: usize,
-        rotary_dim: usize,
-        pos: usize,
-        theta: f32,
-    ) -> Result<(f32, f32), CoreError> {
-        let n = n_heads * head_dim;
-        let mut x = vec![0.0f32; n];
-        for i in 0..n { x[i] = (i as f32) / 100.0; }
-
-        // 1. CPU
-        let mut cpu_out = x.clone();
-        rope_inplace_f32_partial(&mut cpu_out, n_heads, head_dim, rotary_dim, pos, theta);
-
-        // 2. Metal
-        let mut metal_out = x.clone();
-        if self.metal_ops.is_none() { self.enable_metal_full_backend(); }
-        self.metal_ops.as_mut().unwrap()
-            .rope_half_f32(&mut metal_out, n_heads, head_dim, rotary_dim, pos, theta)
-            .map_err(|e| CoreError::Backend(e.to_string()))?;
-
-        let mut max_diff = 0.0f32;
-        let mut sum_diff = 0.0f32;
-        for i in 0..n {
-            let diff = (cpu_out[i] - metal_out[i]).abs();
-            if diff > max_diff { max_diff = diff; }
-            sum_diff += diff;
-        }
-        Ok((max_diff, sum_diff / n as f32))
-    }
     fn linear_qkv_f16_out_in(
         &mut self,
         x: &[f32],
@@ -1143,7 +803,7 @@ impl QwenRunner {
         }
         if x.len() != in_dim || q_out.len() != q_out_dim || k_out.len() != k_out_dim || v_out.len() != v_out_dim {
             return Err(CoreError::Backend(format!(
-                "qwen qkv dims mismatch: x={} q={} k={} v={} expected in={} q_out={} k_out={} v_out={}",
+                "qwen qkv fused dims mismatch: x={} q={} k={} v={} expected in={} q_out={} k_out={} v_out={}",
                 x.len(), q_out.len(), k_out.len(), v_out.len(), in_dim, q_out_dim, k_out_dim, v_out_dim
             )));
         }
@@ -1177,6 +837,7 @@ impl QwenRunner {
                 q_meta.shape, k_meta.shape, v_meta.shape, q_out_dim, in_dim, k_out_dim, in_dim, v_out_dim, in_dim
             )));
         }
+
         if q_meta.dtype != "f16" || k_meta.dtype != "f16" || v_meta.dtype != "f16" {
             return Ok(false);
         }
@@ -1279,101 +940,24 @@ fn linear_attn_step(
         ));
     }
 
-    // 1) Projections: qkv, z, a, b
-    linear_f16_out_in_file(
-        file,
-        x_norm,
-        &format!("language_model.model.layers.{layer}.linear_attn.in_proj_qkv.weight"),
-        conv_dim,
-        hidden,
-        qkv,
-    )?;
-    linear_f16_out_in_file(
-        file,
-        x_norm,
-        &format!("language_model.model.layers.{layer}.linear_attn.in_proj_z.weight"),
-        value_dim,
-        hidden,
-        z,
-    )?;
-    linear_f16_out_in_file(
-        file,
-        x_norm,
-        &format!("language_model.model.layers.{layer}.linear_attn.in_proj_a.weight"),
-        spec.num_v_heads,
-        hidden,
-        a,
-    )?;
-    linear_f16_out_in_file(
-        file,
-        x_norm,
-        &format!("language_model.model.layers.{layer}.linear_attn.in_proj_b.weight"),
-        spec.num_v_heads,
-        hidden,
-        b,
-    )?;
+    linear_f16_out_in_file(file, x_norm, &format!("language_model.model.layers.{layer}.linear_attn.in_proj_qkv.weight"), conv_dim, hidden, qkv)?;
+    linear_f16_out_in_file(file, x_norm, &format!("language_model.model.layers.{layer}.linear_attn.in_proj_z.weight"), value_dim, hidden, z)?;
+    linear_f16_out_in_file(file, x_norm, &format!("language_model.model.layers.{layer}.linear_attn.in_proj_a.weight"), spec.num_v_heads, hidden, a)?;
+    linear_f16_out_in_file(file, x_norm, &format!("language_model.model.layers.{layer}.linear_attn.in_proj_b.weight"), spec.num_v_heads, hidden, b)?;
 
-    if spec.num_k_heads == 0 {
-        return Err(CoreError::Backend("qwen linear_attn: num_k_heads=0".into()));
-    }
-    if spec.num_v_heads % spec.num_k_heads != 0 {
-        return Err(CoreError::Backend(format!(
-            "qwen linear_attn: num_v_heads={} not divisible by num_k_heads={}",
-            spec.num_v_heads, spec.num_k_heads
-        )));
-    }
+    if spec.num_k_heads == 0 { return Err(CoreError::Backend("qwen linear_attn: num_k_heads=0".into())); }
     let ratio = spec.num_v_heads / spec.num_k_heads;
 
-    // 2) Mixed QKV for the causal conv.
-    //
-    // HF Qwen3.5 uses plain packed layout:
-    //   [q_all, k_all, v_all] with sizes [key_dim, key_dim, value_dim].
-    if qkv.len() != conv_dim {
-        return Err(CoreError::Backend(format!(
-            "qwen linear_attn: in_proj_qkv out_dim {} unexpected (expected {})",
-            qkv.len(),
-            conv_dim
-        )));
-    }
     mixed_qkv.copy_from_slice(qkv);
 
-    // 3) Causal depthwise conv1d update + SiLU.
-    let conv_w = tensor_f16_file(
-        file,
-        &format!("language_model.model.layers.{layer}.linear_attn.conv1d.weight"),
-    )?;
-    let conv_shape = tensor_shape_file(
-        file,
-        &format!("language_model.model.layers.{layer}.linear_attn.conv1d.weight"),
-    )?;
-    if conv_shape.len() != 3 || conv_shape[0] != conv_dim {
-        return Err(CoreError::Backend(format!(
-            "qwen linear_attn: unexpected conv1d.weight shape {:?} at layer {layer}",
-            conv_shape
-        )));
-    }
-    let kernel_size = conv_shape[1].max(conv_shape[2]);
-    if kernel_size != spec.conv_kernel_size {
-        return Err(CoreError::Backend(format!(
-            "qwen linear_attn: conv kernel_size={kernel_size} != spec.conv_kernel_size={} at layer {layer}",
-            spec.conv_kernel_size
-        )));
-    }
-    if state.conv.len() != conv_dim * kernel_size {
-        return Err(CoreError::Backend(format!(
-            "qwen linear_attn: conv_state len {} unexpected (expected {})",
-            state.conv.len(),
-            conv_dim * kernel_size
-        )));
-    }
+    let conv_w = tensor_f16_file(file, &format!("language_model.model.layers.{layer}.linear_attn.conv1d.weight"))?;
+    let kernel_size = spec.conv_kernel_size;
     causal_conv1d_update_silu(mixed_qkv, &mut state.conv, conv_w, kernel_size, conv_out);
 
-    // 4) Split conv output into q/k/v and reshape.
     let q_base = &conv_out[..key_dim];
     let k_base = &conv_out[key_dim..2 * key_dim];
     v.copy_from_slice(&conv_out[2 * key_dim..]);
 
-    // repeat query/key if num_v_heads > num_k_heads (GQA-style)
     if ratio == 1 {
         q_rep.copy_from_slice(q_base);
         k_rep.copy_from_slice(k_base);
@@ -1389,7 +973,6 @@ fn linear_attn_step(
         }
     }
 
-    // 5) Kernel normalization (l2norm) and scaling.
     if spec.use_qk_l2norm_in_kernel {
         for h in 0..spec.num_v_heads {
             l2norm_inplace(&mut q_rep[h * spec.head_k_dim..(h + 1) * spec.head_k_dim], 1e-6);
@@ -1397,134 +980,63 @@ fn linear_attn_step(
         }
     }
     let scale = 1.0 / (spec.head_k_dim as f32).sqrt();
-    for v in q_rep.iter_mut() {
-        *v *= scale;
-    }
-    // 6) Compute g + beta for recurrent delta rule.
-    let a_log = tensor_f16_file(
-        file,
-        &format!("language_model.model.layers.{layer}.linear_attn.A_log"),
-    )?;
-    let dt_bias = tensor_f16_file(
-        file,
-        &format!("language_model.model.layers.{layer}.linear_attn.dt_bias"),
-    )?;
-    if a_log.len() != spec.num_v_heads || dt_bias.len() != spec.num_v_heads {
-        return Err(CoreError::Backend(format!(
-            "qwen linear_attn: A_log/dt_bias len mismatch at layer {layer} (A_log={} dt_bias={} expected {})",
-            a_log.len(),
-            dt_bias.len(),
-            spec.num_v_heads
-        )));
-    }
+    for v_val in q_rep.iter_mut() { *v_val *= scale; }
 
-    // 7) Recurrent gated delta rule (single step) + state update.
-    if state.recurrent.len() != spec.num_v_heads * spec.head_k_dim * spec.head_v_dim {
-        return Err(CoreError::Backend(format!(
-            "qwen linear_attn: recurrent_state len {} unexpected (expected {})",
-            state.recurrent.len(),
-            spec.num_v_heads * spec.head_k_dim * spec.head_v_dim
-        )));
-    }
+    let a_log = tensor_f16_file(file, &format!("language_model.model.layers.{layer}.linear_attn.A_log"))?;
+    let dt_bias = tensor_f16_file(file, &format!("language_model.model.layers.{layer}.linear_attn.dt_bias"))?;
+
     core_out.fill(0.0);
     for h in 0..spec.num_v_heads {
         let beta = sigmoid_f32(b[h]);
-        let g = -f16::from_bits(a_log[h]).to_f32().exp()
-            * softplus_f32(a[h] + f16::from_bits(dt_bias[h]).to_f32());
+        let g = -f16::from_bits(a_log[h]).to_f32().exp() * softplus_f32(a[h] + f16::from_bits(dt_bias[h]).to_f32());
         let g_exp = g.exp();
-
         let qh = &q_rep[h * spec.head_k_dim..(h + 1) * spec.head_k_dim];
         let kh = &k_rep[h * spec.head_k_dim..(h + 1) * spec.head_k_dim];
         let vh = &v[h * spec.head_v_dim..(h + 1) * spec.head_v_dim];
-
         let st_base = h * spec.head_k_dim * spec.head_v_dim;
         let st = &mut state.recurrent[st_base..st_base + spec.head_k_dim * spec.head_v_dim];
-
-        for s in st.iter_mut() {
-            *s *= g_exp;
-        }
-
+        for s in st.iter_mut() { *s *= g_exp; }
         tmp_kv.fill(0.0);
         for i in 0..spec.head_k_dim {
             let ki = kh[i];
-            if ki == 0.0 {
-                continue;
-            }
-            let row = &st[i * spec.head_v_dim..(i + 1) * spec.head_v_dim];
-            for j in 0..spec.head_v_dim {
-                tmp_kv[j] += row[j] * ki;
+            if ki != 0.0 {
+                let row = &st[i * spec.head_v_dim..(i + 1) * spec.head_v_dim];
+                for j in 0..spec.head_v_dim { tmp_kv[j] += row[j] * ki; }
             }
         }
-
-        for j in 0..spec.head_v_dim {
-            tmp_delta[j] = (vh[j] - tmp_kv[j]) * beta;
-        }
-
+        for j in 0..spec.head_v_dim { tmp_delta[j] = (vh[j] - tmp_kv[j]) * beta; }
         for i in 0..spec.head_k_dim {
             let ki = kh[i];
-            if ki == 0.0 {
-                continue;
-            }
-            let row = &mut st[i * spec.head_v_dim..(i + 1) * spec.head_v_dim];
-            for j in 0..spec.head_v_dim {
-                row[j] += ki * tmp_delta[j];
+            if ki != 0.0 {
+                let row = &mut st[i * spec.head_v_dim..(i + 1) * spec.head_v_dim];
+                for j in 0..spec.head_v_dim { row[j] += ki * tmp_delta[j]; }
             }
         }
-
         let out_dst = &mut core_out[h * spec.head_v_dim..(h + 1) * spec.head_v_dim];
-        out_dst.fill(0.0);
         for i in 0..spec.head_k_dim {
             let qi = qh[i];
-            if qi == 0.0 {
-                continue;
-            }
-            let row = &st[i * spec.head_v_dim..(i + 1) * spec.head_v_dim];
-            for j in 0..spec.head_v_dim {
-                out_dst[j] += row[j] * qi;
+            if qi != 0.0 {
+                let row = &st[i * spec.head_v_dim..(i + 1) * spec.head_v_dim];
+                for j in 0..spec.head_v_dim { out_dst[j] += row[j] * qi; }
             }
         }
     }
 
-    // 8) Output gated RMSNorm per head.
-    let norm_w = tensor_f16_file(
-        file,
-        &format!("language_model.model.layers.{layer}.linear_attn.norm.weight"),
-    )?;
-    if norm_w.len() != spec.head_v_dim {
-        return Err(CoreError::Backend(format!(
-            "qwen linear_attn: norm.weight len {} mismatch (expected {}) at layer {layer}",
-            norm_w.len(),
-            spec.head_v_dim
-        )));
-    }
+    let norm_w = tensor_f16_file(file, &format!("language_model.model.layers.{layer}.linear_attn.norm.weight"))?;
     for h in 0..spec.num_v_heads {
         let src = &core_out[h * spec.head_v_dim..(h + 1) * spec.head_v_dim];
         let gate = &z[h * spec.head_v_dim..(h + 1) * spec.head_v_dim];
-
         let mut var = 0.0f32;
-        for &v in src {
-            var += v * v;
-        }
+        for &v_val in src { var += v_val * v_val; }
         var /= spec.head_v_dim as f32;
         let inv = 1.0 / (var + eps).sqrt();
-
-        let dst = &mut normed[h * spec.head_v_dim..(h + 1) * spec.head_v_dim];
+        let dst_seg = &mut normed[h * spec.head_v_dim..(h + 1) * spec.head_v_dim];
         for j in 0..spec.head_v_dim {
             let wj = f16::from_bits(norm_w[j]).to_f32();
-            dst[j] = src[j] * inv * wj * silu_f32(gate[j]);
+            dst_seg[j] = src[j] * inv * wj * silu_f32(gate[j]);
         }
     }
-
-    // 9) Output projection: hidden <- value_dim
-    linear_f16_out_in_file(
-        file,
-        normed,
-        &format!("language_model.model.layers.{layer}.linear_attn.out_proj.weight"),
-        hidden,
-        value_dim,
-        out_proj,
-    )?;
-
+    linear_f16_out_in_file(file, normed, &format!("language_model.model.layers.{layer}.linear_attn.out_proj.weight"), hidden, value_dim, out_proj)?;
     Ok(())
 }
 
@@ -1553,30 +1065,7 @@ struct LinearLayerState {
 #[derive(Debug)]
 struct QwenSessionState {
     linear: Vec<Option<LinearLayerState>>,
-}
-
-impl QwenSessionState {
-    fn new(num_layers: usize, kinds: &[LayerKind], spec: &LinearAttnSpec) -> Self {
-        let key_dim = spec.num_k_heads * spec.head_k_dim;
-        let value_dim = spec.num_v_heads * spec.head_v_dim;
-        let conv_dim = key_dim * 2 + value_dim;
-        // Match `torch_causal_conv1d_update`: the cached conv state keeps `kernel_size`
-        // values per channel (not kernel_size-1).
-        let state_len = spec.conv_kernel_size;
-        let mut linear = Vec::with_capacity(num_layers);
-        for i in 0..num_layers {
-            let kind = kinds.get(i).copied().unwrap_or(LayerKind::FullAttention);
-            if kind == LayerKind::LinearAttention {
-                linear.push(Some(LinearLayerState {
-                    conv: vec![0.0; conv_dim * state_len],
-                    recurrent: vec![0.0; spec.num_v_heads * spec.head_k_dim * spec.head_v_dim],
-                }));
-            } else {
-                linear.push(None);
-            }
-        }
-        Self { linear }
-    }
+    graph_state: Option<QwenGraphState>,
 }
 
 fn infer_qwen_layer_kinds_and_linear_spec(
@@ -1585,232 +1074,65 @@ fn infer_qwen_layer_kinds_and_linear_spec(
     let n_layers = file.header.num_layers;
     let mut kinds: Vec<LayerKind> = Vec::with_capacity(n_layers);
     let mut partial_rotary_factor = 1.0f32;
-
-    // Prefer config-derived layer_types if present.
     let mut spec: Option<LinearAttnSpec> = None;
+
     if let Some(Value::Object(obj)) = &file.header.source_text_config {
         if let Some(Value::Object(rope_params)) = obj.get("rope_parameters") {
             if let Some(v) = rope_params.get("partial_rotary_factor").and_then(|v| v.as_f64()) {
                 partial_rotary_factor = (v as f32).clamp(0.0, 1.0);
             }
         }
-
         if let Some(Value::Array(layer_types)) = obj.get("layer_types") {
-            for (i, v) in layer_types.iter().enumerate() {
-                let s = v
-                    .as_str()
-                    .ok_or_else(|| CoreError::Backend("qwen: layer_types not strings".into()))?;
+            for v in layer_types {
+                let s = v.as_str().unwrap_or("");
                 kinds.push(match s {
-                    "full_attention" => LayerKind::FullAttention,
                     "linear_attention" => LayerKind::LinearAttention,
-                    other => {
-                        return Err(CoreError::Backend(format!(
-                            "qwen: unknown layer_types[{i}]={other}"
-                        )))
-                    }
+                    _ => LayerKind::FullAttention,
                 });
             }
         }
-
-        // Linear-attn spec (optional; can infer from tensors if missing).
-        let get_usize = |k: &str| -> Option<usize> { obj.get(k).and_then(|v| v.as_u64()).map(|x| x as usize) };
-        if let (Some(num_k_heads), Some(num_v_heads), Some(head_k_dim), Some(head_v_dim), Some(conv_kernel_size)) = (
-            get_usize("linear_num_key_heads"),
-            get_usize("linear_num_value_heads"),
-            get_usize("linear_key_head_dim"),
-            get_usize("linear_value_head_dim"),
-            get_usize("linear_conv_kernel_dim"),
+        let get_usize = |k: &str| obj.get(k).and_then(|v| v.as_u64()).map(|x| x as usize);
+        if let (Some(num_k), Some(num_v), Some(hk), Some(hv), Some(kw)) = (
+            get_usize("linear_num_key_heads"), get_usize("linear_num_value_heads"),
+            get_usize("linear_key_head_dim"), get_usize("linear_value_head_dim"),
+            get_usize("linear_conv_kernel_dim")
         ) {
-            spec = Some(LinearAttnSpec {
-                num_k_heads,
-                num_v_heads,
-                head_k_dim,
-                head_v_dim,
-                conv_kernel_size,
-                use_qk_l2norm_in_kernel: true,
-            });
+            spec = Some(LinearAttnSpec { num_k_heads: num_k, num_v_heads: num_v, head_k_dim: hk, head_v_dim: hv, conv_kernel_size: kw, use_qk_l2norm_in_kernel: true });
         }
     }
 
-    // Fallback: infer kinds from tensors if layer_types missing/invalid.
     if kinds.len() != n_layers {
         kinds.clear();
         for layer in 0..n_layers {
-            let has_self = has_tensor_file(
-                file,
-                &format!("language_model.model.layers.{layer}.self_attn.q_proj.weight"),
-            );
-            let has_linear = has_tensor_file(
-                file,
-                &format!("language_model.model.layers.{layer}.linear_attn.in_proj_qkv.weight"),
-            );
-            kinds.push(match (has_self, has_linear) {
-                (true, _) => LayerKind::FullAttention,
-                (false, true) => LayerKind::LinearAttention,
-                (false, false) => LayerKind::FullAttention,
-            });
+            let has_linear = has_tensor_file(file, &format!("language_model.model.layers.{layer}.linear_attn.in_proj_qkv.weight"));
+            kinds.push(if has_linear { LayerKind::LinearAttention } else { LayerKind::FullAttention });
         }
     }
-
-    // If any linear layers exist but we couldn't parse spec, infer a minimal spec from tensor shapes.
-    if spec.is_none() && kinds.iter().any(|k| *k == LayerKind::LinearAttention) {
-        let mut layer0 = None;
-        for (i, k) in kinds.iter().enumerate() {
-            if *k == LayerKind::LinearAttention {
-                layer0 = Some(i);
-                break;
-            }
-        }
-        let layer = layer0.ok_or_else(|| CoreError::Backend("qwen: no linear layers".into()))?;
-        let qkv = tensor_index_file(
-            file,
-            &format!("language_model.model.layers.{layer}.linear_attn.in_proj_qkv.weight"),
-        )
-            .ok_or_else(|| CoreError::Backend("qwen: missing linear in_proj_qkv".into()))?;
-        let z = tensor_index_file(
-            file,
-            &format!("language_model.model.layers.{layer}.linear_attn.in_proj_z.weight"),
-        )
-            .ok_or_else(|| CoreError::Backend("qwen: missing linear in_proj_z".into()))?;
-        let a = tensor_index_file(
-            file,
-            &format!("language_model.model.layers.{layer}.linear_attn.in_proj_a.weight"),
-        )
-            .ok_or_else(|| CoreError::Backend("qwen: missing linear in_proj_a".into()))?;
-        let norm = tensor_index_file(
-            file,
-            &format!("language_model.model.layers.{layer}.linear_attn.norm.weight"),
-        )
-            .ok_or_else(|| CoreError::Backend("qwen: missing linear norm.weight".into()))?;
-        let conv = tensor_index_file(
-            file,
-            &format!("language_model.model.layers.{layer}.linear_attn.conv1d.weight"),
-        )
-            .ok_or_else(|| CoreError::Backend("qwen: missing linear conv1d.weight".into()))?;
-
-        let conv_dim = qkv.shape[0];
-        let value_dim = z.shape[0];
-        let num_v_heads = a.shape[0];
-        let head_v_dim = norm.shape[0];
-        if num_v_heads == 0 || head_v_dim == 0 {
-            return Err(CoreError::Backend("qwen: invalid inferred linear spec".into()));
-        }
-        if value_dim != num_v_heads * head_v_dim {
-            return Err(CoreError::Backend(format!(
-                "qwen: inferred value_dim {value_dim} != num_v_heads*head_v_dim {}",
-                num_v_heads * head_v_dim
-            )));
-        }
-        let key_dim2 = (conv_dim - value_dim) / 2;
-        let head_k_dim = head_v_dim;
-        let num_k_heads = key_dim2 / head_k_dim;
-        let kernel = conv.shape.iter().skip(1).copied().max().unwrap_or(1);
-
-        spec = Some(LinearAttnSpec {
-            num_k_heads,
-            num_v_heads,
-            head_k_dim,
-            head_v_dim,
-            conv_kernel_size: kernel,
-            use_qk_l2norm_in_kernel: true,
-        });
-    }
-
     Ok((kinds, spec, partial_rotary_factor))
 }
 
 fn qwen_rmsnorm_is_offset(header: &crate::cellm_file::CellmHeader) -> bool {
-    if header.model_type.starts_with("qwen3_5") {
-        return true;
-    }
-    if header
-        .source_model_type
-        .as_deref()
-        .is_some_and(|m| m.starts_with("qwen3_5"))
-    {
-        return true;
-    }
-    if let Some(Value::Object(obj)) = &header.source_text_config {
-        if obj
-            .get("model_type")
-            .and_then(|v| v.as_str())
-            .is_some_and(|m| m.starts_with("qwen3_5"))
-        {
-            return true;
-        }
-    }
-    false
+    let check = |s: &str| s.starts_with("qwen3_5");
+    header.model_type.starts_with("qwen3_5") || header.source_model_type.as_deref().is_some_and(check)
 }
 
-fn add_one_inplace(x: &mut [f32]) {
-    for v in x {
-        *v += 1.0;
-    }
-}
-
-fn sigmoid_f32(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
-
-fn silu_f32(x: f32) -> f32 {
-    x * sigmoid_f32(x)
-}
-
-fn softplus_f32(x: f32) -> f32 {
-    // Stable softplus.
-    if x > 20.0 {
-        x
-    } else if x < -20.0 {
-        x.exp()
-    } else {
-        (1.0 + x.exp()).ln()
-    }
-}
-
+fn add_one_inplace(x: &mut [f32]) { for v in x { *v += 1.0; } }
+fn sigmoid_f32(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
+fn silu_f32(x: f32) -> f32 { x * sigmoid_f32(x) }
+fn softplus_f32(x: f32) -> f32 { if x > 20.0 { x } else if x < -20.0 { x.exp() } else { (1.0 + x.exp()).ln() } }
 fn l2norm_inplace(x: &mut [f32], eps: f32) {
     let mut s = 0.0f32;
-    for &v in x.iter() {
-        s += v * v;
-    }
+    for &v in x.iter() { s += v * v; }
     let inv = 1.0 / (s + eps).sqrt();
-    for v in x.iter_mut() {
-        *v *= inv;
-    }
+    for v in x.iter_mut() { *v *= inv; }
 }
-
 fn l2norm_value(x: &[f32]) -> f32 {
     let mut s = 0.0f32;
-    for &v in x {
-        s += v * v;
-    }
+    for &v in x { s += v * v; }
     s.sqrt()
 }
 
-fn rms_norm_inplace_f32(x: &mut [f32], weight: &[f32], eps: f32) {
-    debug_assert_eq!(x.len(), weight.len());
-    let mut var = 0.0f32;
-    for &v in x.iter() {
-        var += v * v;
-    }
-    var /= x.len().max(1) as f32;
-    let inv = 1.0 / (var + eps).sqrt();
-    for i in 0..x.len() {
-        x[i] = x[i] * inv * weight[i];
-    }
-}
-
-fn rope_inplace_f32_partial(
-    x: &mut [f32],
-    n_heads: usize,
-    head_dim: usize,
-    rotary_dim: usize,
-    pos: usize,
-    theta: f32,
-) {
-    debug_assert_eq!(x.len(), n_heads * head_dim);
-    debug_assert!(rotary_dim <= head_dim);
-    debug_assert!(rotary_dim % 2 == 0);
-
+fn rope_inplace_f32_partial(x: &mut [f32], n_heads: usize, head_dim: usize, rotary_dim: usize, pos: usize, theta: f32) {
     let half = rotary_dim / 2;
     for h in 0..n_heads {
         let base = h * head_dim;
@@ -1818,257 +1140,242 @@ fn rope_inplace_f32_partial(
             let inv_freq = theta.powf(-(2.0 * i as f32) / rotary_dim as f32);
             let angle = pos as f32 * inv_freq;
             let (sin, cos) = angle.sin_cos();
-            let x0 = x[base + i];
-            let x1 = x[base + half + i];
+            let x0 = x[base + i]; let x1 = x[base + half + i];
             x[base + i] = x0 * cos - x1 * sin;
             x[base + half + i] = x1 * cos + x0 * sin;
         }
     }
 }
 
-fn causal_conv1d_update_silu(
-    x: &[f32],          // [channels]
-    state: &mut [f32],  // [channels, kernel_size] (time-ordered oldest->newest)
-    weight_f16: &[u16], // stored as [channels, *, *] but each channel has `kernel_size` contiguous weights
-    kernel_size: usize,
-    out: &mut [f32],
-) {
-    let channels = x.len();
-    let state_len = kernel_size;
-    debug_assert_eq!(state.len(), channels * state_len);
-    debug_assert_eq!(out.len(), channels);
-
-    for c in 0..channels {
-        let st_base = c * state_len;
+fn causal_conv1d_update_silu(x: &[f32], state: &mut [f32], weight_f16: &[u16], kernel_size: usize, out: &mut [f32]) {
+    let ch = x.len();
+    for c in 0..ch {
+        let st_base = c * kernel_size;
         let w_base = c * kernel_size;
-
         let mut acc = 0.0f32;
-        // Match `torch_causal_conv1d_update` which concatenates `[state, x]`, runs a
-        // conv1d, then takes the last `seq_len` outputs. For `seq_len=1`, this
-        // corresponds to applying the kernel over `[state[1..], x]`.
-        for t in 0..kernel_size.saturating_sub(1) {
+        for t in 0..kernel_size - 1 {
             acc += f16::from_bits(weight_f16[w_base + t]).to_f32() * state[st_base + t + 1];
         }
         acc += f16::from_bits(weight_f16[w_base + kernel_size - 1]).to_f32() * x[c];
-
         out[c] = silu_f32(acc);
-
-        // Shift state and append current x.
-        if state_len > 0 {
-            for t in 0..(state_len - 1) {
-                state[st_base + t] = state[st_base + t + 1];
-            }
-            state[st_base + state_len - 1] = x[c];
-        }
+        for t in 0..kernel_size - 1 { state[st_base + t] = state[st_base + t + 1]; }
+        state[st_base + kernel_size - 1] = x[c];
     }
 }
 
 fn resolve_tensor_name_file(file: &CellmFile, name: &str) -> String {
-    if file.tensor_index(name).is_some() {
-        return name.to_string();
-    }
-    if let Some(rest) = name.strip_prefix("language_model.model.") {
-        let candidates = [
-            format!("model.{rest}"),
-            format!("model.language_model.{rest}"),
-        ];
-        for candidate in candidates {
-            if file.tensor_index(&candidate).is_some() {
-                return candidate;
-            }
-        }
-    }
-    if let Some(rest) = name.strip_prefix("model.") {
-        let candidates = [
-            format!("language_model.model.{rest}"),
-            format!("model.language_model.{rest}"),
-        ];
-        for candidate in candidates {
-            if file.tensor_index(&candidate).is_some() {
-                return candidate;
-            }
-        }
-    }
-    if let Some(rest) = name.strip_prefix("model.language_model.") {
-        let candidates = [
-            format!("language_model.model.{rest}"),
-            format!("model.{rest}"),
-        ];
-        for candidate in candidates {
-            if file.tensor_index(&candidate).is_some() {
-                return candidate;
-            }
-        }
+    if file.tensor_index(name).is_some() { return name.to_string(); }
+    
+    let stem = if let Some(rest) = name.strip_prefix("language_model.model.") { rest }
+               else if let Some(rest) = name.strip_prefix("model.language_model.") { rest }
+               else if let Some(rest) = name.strip_prefix("model.") { rest }
+               else { name };
+    
+    let candidates = [
+        format!("model.{stem}"),
+        format!("language_model.model.{stem}"),
+        format!("model.language_model.{stem}"),
+    ];
+    for c in candidates {
+        if file.tensor_index(&c).is_some() { return c; }
     }
     name.to_string()
 }
 
-fn has_tensor_file(file: &CellmFile, name: &str) -> bool {
-    let resolved = resolve_tensor_name_file(file, name);
-    file.tensor_index(&resolved).is_some()
-}
+fn has_tensor_file(file: &CellmFile, name: &str) -> bool { file.tensor_index(&resolve_tensor_name_file(file, name)).is_some() }
 
-fn tensor_index_file<'a>(
-    file: &'a CellmFile,
-    name: &str,
-) -> Option<&'a crate::cellm_file::CellmTensorIndex> {
-    let resolved = resolve_tensor_name_file(file, name);
-    file.tensor_index(&resolved)
+fn tensor_index_file<'a>(file: &'a CellmFile, name: &str) -> Option<&'a crate::cellm_file::CellmTensorIndex> {
+    file.tensor_index(&resolve_tensor_name_file(file, name))
 }
 
 fn tensor_f16_file<'a>(file: &'a CellmFile, name: &str) -> Result<&'a [u16], CoreError> {
-    let resolved = resolve_tensor_name_file(file, name);
-    let bytes = file.tensor_bytes(&resolved)?;
-    if bytes.len() % 2 != 0 {
-        return Err(CoreError::Backend(format!("tensor {name} nbytes not even")));
-    }
-    Ok(cast_slice(bytes))
+    let b = file.tensor_bytes(&resolve_tensor_name_file(file, name))?;
+    Ok(cast_slice(b))
 }
 
 fn tensor_i8_file<'a>(file: &'a CellmFile, name: &str) -> Result<&'a [i8], CoreError> {
-    let resolved = resolve_tensor_name_file(file, name);
-    let bytes = file.tensor_bytes(&resolved)?;
-    Ok(cast_slice(bytes))
+    let b = file.tensor_bytes(&resolve_tensor_name_file(file, name))?;
+    Ok(cast_slice(b))
 }
 
 fn tensor_u8_file<'a>(file: &'a CellmFile, name: &str) -> Result<&'a [u8], CoreError> {
-    let resolved = resolve_tensor_name_file(file, name);
-    file.tensor_bytes(&resolved)
+    file.tensor_bytes(&resolve_tensor_name_file(file, name))
 }
 
 fn tensor_shape_file(file: &CellmFile, name: &str) -> Result<Vec<usize>, CoreError> {
-    let resolved = resolve_tensor_name_file(file, name);
-    let t = file
-        .tensor_index(&resolved)
-        .ok_or_else(|| CoreError::Backend(format!("unknown tensor {name}")))?;
-    Ok(t.shape.clone())
+    Ok(tensor_index_file(file, name).ok_or_else(|| CoreError::Backend(format!("unknown tensor {name}")))?.shape.clone())
 }
 
-fn linear_f16_out_in_file(
-    file: &CellmFile,
-    x: &[f32],
-    weight_name: &str,
-    out_dim: usize,
-    in_dim: usize,
-    out: &mut [f32],
-) -> Result<(), CoreError> {
-    if x.len() != in_dim || out.len() != out_dim {
-        return Err(CoreError::Backend(format!(
-            "linear dims mismatch for {weight_name}: x={} out={} expected in={in_dim} out={out_dim}",
-            x.len(),
-            out.len()
-        )));
-    }
-
-    let resolved = resolve_tensor_name_file(file, weight_name);
-    let shape = tensor_shape_file(file, weight_name)?;
-    let meta = file
-        .tensor_index(&resolved)
-        .ok_or_else(|| CoreError::Backend(format!("unknown tensor {weight_name}")))?;
-    if shape.len() != 2 {
-        return Err(CoreError::Backend(format!(
-            "weight {weight_name} expected 2D, got {:?}",
-            shape
-        )));
-    }
-    // HF linear weight: [out, in]
-    if shape[0] != out_dim || shape[1] != in_dim {
-        return Err(CoreError::Backend(format!(
-            "weight {weight_name} shape mismatch: {:?} expected [{out_dim},{in_dim}]",
-            shape
-        )));
-    }
-    match meta.dtype.as_str() {
-        "f16" => {
-            let w = tensor_f16_file(file, weight_name)?;
-            if w.len() != out_dim * in_dim {
-                return Err(CoreError::Backend(format!(
-                    "weight {weight_name} len mismatch: {} expected {}",
-                    w.len(),
-                    out_dim * in_dim
-                )));
-            }
-            for j in 0..out_dim {
-                let row = &w[j * in_dim..(j + 1) * in_dim];
-                let mut acc = 0.0f32;
-                for i in 0..in_dim {
-                    acc += x[i] * f16::from_bits(row[i]).to_f32();
-                }
-                out[j] = acc;
-            }
-        }
-        "i8" => {
-            let w = tensor_i8_file(file, weight_name)?;
-            if w.len() != out_dim * in_dim {
-                return Err(CoreError::Backend(format!(
-                    "weight {weight_name} len mismatch: {} expected {}",
-                    w.len(),
-                    out_dim * in_dim
-                )));
-            }
-            let scales_name = format!("{weight_name}.qscale");
-            let scales = tensor_f16_file(file, &scales_name)?;
-            if scales.len() != out_dim {
-                return Err(CoreError::Backend(format!(
-                    "weight {weight_name} qscale len mismatch: {} expected {}",
-                    scales.len(),
-                    out_dim
-                )));
-            }
-            for j in 0..out_dim {
-                let row = &w[j * in_dim..(j + 1) * in_dim];
-                let scale = f16::from_bits(scales[j]).to_f32();
-                let mut acc = 0.0f32;
-                for i in 0..in_dim {
-                    acc += x[i] * (row[i] as f32) * scale;
-                }
-                out[j] = acc;
-            }
-        }
-        "i4" => {
-            let w = tensor_u8_file(file, weight_name)?;
-            let row_stride = in_dim.div_ceil(2);
-            if w.len() != out_dim * row_stride {
-                return Err(CoreError::Backend(format!(
-                    "weight {weight_name} len mismatch: {} expected {}",
-                    w.len(),
-                    out_dim * row_stride
-                )));
-            }
-            let scales_name = format!("{weight_name}.qscale");
-            let scales = tensor_f16_file(file, &scales_name)?;
-            if scales.len() != out_dim {
-                return Err(CoreError::Backend(format!(
-                    "weight {weight_name} qscale len mismatch: {} expected {}",
-                    scales.len(),
-                    out_dim
-                )));
-            }
-            for j in 0..out_dim {
-                let row = &w[j * row_stride..(j + 1) * row_stride];
-                let scale = f16::from_bits(scales[j]).to_f32();
-                let mut acc = 0.0f32;
-                for i in 0..in_dim {
-                    acc += x[i] * unpack_i4(row, i) * scale;
-                }
-                out[j] = acc;
-            }
-        }
-        other => {
-            return Err(CoreError::Backend(format!(
-                "unsupported weight dtype for {weight_name}: {other}"
-            )));
-        }
+fn linear_f16_out_in_file(file: &CellmFile, x: &[f32], name: &str, out_dim: usize, in_dim: usize, out: &mut [f32]) -> Result<(), CoreError> {
+    let w = tensor_f16_file(file, name)?;
+    for j in 0..out_dim {
+        let row = &w[j * in_dim..(j+1)*in_dim];
+        let mut acc = 0.0f32;
+        for i in 0..in_dim { acc += x[i] * f16::from_bits(row[i]).to_f32(); }
+        out[j] = acc;
     }
     Ok(())
 }
 
-fn unpack_i4(packed_row: &[u8], idx: usize) -> f32 {
-    let byte = packed_row[idx / 2];
-    let nibble = if idx % 2 == 0 {
-        byte & 0x0f
-    } else {
-        (byte >> 4) & 0x0f
-    };
-    (nibble as i8 - 8) as f32
+fn unpack_i4(packed: &[u8], idx: usize) -> f32 {
+    let b = packed[idx / 2];
+    let n = if idx % 2 == 0 { b & 0xf } else { b >> 4 };
+    (n as i8 - 8) as f32
 }
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub struct QwenGraphState {
+    pub device: metal::Device,
+    pub queue: metal::CommandQueue,
+    pub ops: MetalOps,
+    pub weights: HashMap<String, metal::Buffer>,
+    pub x_buf: metal::Buffer,
+    pub x_norm_buf: metal::Buffer,
+    pub q_buf: metal::Buffer,
+    pub k_buf: metal::Buffer,
+    pub v_buf: metal::Buffer,
+    pub attn_out_buf: metal::Buffer,
+    pub mlp_in_buf: metal::Buffer,
+    pub gate_buf: metal::Buffer,
+    pub up_buf: metal::Buffer,
+    pub down_buf: metal::Buffer,
+    pub logits_buf: metal::Buffer,
+    pub bases_buf: Option<metal::Buffer>,
+    pub bases_capacity: usize,
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+impl QwenGraphState {
+    pub fn new(hidden: usize, heads: usize, kv_heads: usize, vocab: usize, inter: usize, ops: MetalOps) -> Result<Self, CoreError> {
+        let dev = ops.device.clone();
+        let make = |l: usize| dev.new_buffer((l * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let q_buf = make(hidden);
+        let k_buf = make(kv_heads * (hidden/heads));
+        let v_buf = make(kv_heads * (hidden/heads));
+        let x_buf = make(hidden);
+        let x_norm_buf = make(hidden);
+        let attn_out_buf = make(hidden);
+        let mlp_in_buf = make(hidden);
+        let gate_buf = make(inter);
+        let up_buf = make(inter);
+        let down_buf = make(hidden);
+        let logits_buf = make(vocab);
+
+        Ok(Self {
+            device: dev, queue: ops.queue.clone(), ops, weights: HashMap::new(),
+            x_buf, x_norm_buf, q_buf, k_buf, v_buf,
+            attn_out_buf, mlp_in_buf, gate_buf, up_buf, down_buf,
+            logits_buf, bases_buf: None, bases_capacity: 0       })
+    }
+    pub fn preload_weight(&mut self, name: String, bytes: &[u8]) {
+        let b = self.device.new_buffer_with_data(bytes.as_ptr() as *const _, bytes.len() as u64, metal::MTLResourceOptions::StorageModeShared);
+        self.weights.insert(name, b);
+    }
+    fn get_w(&self, name: &str) -> &metal::Buffer {
+        match self.try_get_w(name) {
+            Some(b) => b,
+            None => {
+                let keys: Vec<_> = self.weights.keys().collect();
+                panic!("weight {name} not found. Available keys (up to 5): {:?}", &keys[0..5.min(keys.len())]);
+            }
+        }
+    }
+    fn try_get_w(&self, name: &str) -> Option<&metal::Buffer> {
+        if let Some(b) = self.weights.get(name) { return Some(b); }
+        let stem = if let Some(rest) = name.strip_prefix("language_model.model.") { rest }
+                   else if let Some(rest) = name.strip_prefix("model.language_model.") { rest }
+                   else if let Some(rest) = name.strip_prefix("model.") { rest }
+                   else { name };
+        let candidates = [
+            format!("model.{stem}"),
+            format!("language_model.model.{stem}"),
+            format!("model.language_model.{stem}"),
+        ];
+        for c in candidates {
+            if let Some(b) = self.weights.get(&c) { return Some(b); }
+        }
+        None
+    }
+    pub fn step_fused(&mut self, x_in: &[f32], cfg: &ModelConfig, prefix: &str, kv_cache: &mut KVCache, page_table: &PageTable, pos: usize, off: usize, bid: u32, rotary: f32, offset: bool, logits: bool) -> Result<Option<Vec<f32>>, CoreError> {
+        let h = cfg.hidden_size; let nh = cfg.num_attention_heads; let nkv = cfg.num_key_value_heads; let hd = h/nh;
+        unsafe { std::ptr::copy_nonoverlapping(x_in.as_ptr(), self.x_buf.contents() as *mut f32, h); }
+        let cv = kv_cache.view_mut();
+        let total = pos + 1;
+        if self.bases_capacity < total * cfg.num_hidden_layers {
+            self.bases_capacity = total * cfg.num_hidden_layers;
+            self.bases_buf = Some(self.device.new_buffer((self.bases_capacity * 4) as u64, metal::MTLResourceOptions::StorageModeShared));
+        }
+        let mut bases = Vec::with_capacity(total * cfg.num_hidden_layers);
+        for l in 0..cfg.num_hidden_layers {
+            for t in 0..total {
+                let b = page_table.block_for_token(t).map_err(|e| CoreError::Backend(e.to_string()))?;
+                let o = page_table.offset_in_block(t).map_err(|e| CoreError::Backend(e.to_string()))?;
+                bases.push(cv.layout.token_base_elem(b, l, o)? as u32);
+            }
+        }
+        if let Some(bb) = &self.bases_buf { unsafe { std::ptr::copy_nonoverlapping(bases.as_ptr(), bb.contents() as *mut u32, bases.len()); } }
+        let bb = self.bases_buf.as_ref().unwrap();
+        let cb = self.queue.new_command_buffer(); let enc = cb.new_compute_command_encoder();
+        for l in 0..cfg.num_hidden_layers {
+            let pref = format!("{prefix}model.layers.{l}");
+            self.ops.encode_rms_norm_f16w(enc, &self.x_buf, self.get_w(&format!("{pref}.input_layernorm.weight")), &self.x_norm_buf, h, cfg.rms_norm_eps, offset);
+            let (wq, wk, wv) = (self.get_w(&format!("{pref}.self_attn.q_proj.weight")), self.get_w(&format!("{pref}.self_attn.k_proj.weight")), self.get_w(&format!("{pref}.self_attn.v_proj.weight")));
+            let (bq, bk, bv) = (self.try_get_w(&format!("{pref}.self_attn.q_proj.bias")), self.try_get_w(&format!("{pref}.self_attn.k_proj.bias")), self.try_get_w(&format!("{pref}.self_attn.v_proj.bias")));
+            let (sq, sk, sv) = (self.try_get_w(&format!("{pref}.self_attn.q_proj.qscale")), self.try_get_w(&format!("{pref}.self_attn.k_proj.qscale")), self.try_get_w(&format!("{pref}.self_attn.v_proj.qscale")));
+            if let (Some(q), Some(k), Some(v)) = (sq, sk, sv) { self.ops.encode_qkv_i8_bias(enc, wq, q, wk, k, wv, v, &self.x_norm_buf, bq, bk, bv, &self.q_buf, &self.k_buf, &self.v_buf, h, nkv * hd, h); }
+            else { self.ops.encode_qkv_f16_bias(enc, wq, wk, wv, &self.x_norm_buf, bq, bk, bv, &self.q_buf, &self.k_buf, &self.v_buf, h, nkv * hd, h); }
+            self.ops.encode_rope_half_f32(enc, &self.q_buf, nh, hd, (hd as f32 * rotary) as usize, pos, cfg.rope_theta);
+            self.ops.encode_rope_half_f32(enc, &self.k_buf, nkv, hd, (hd as f32 * rotary) as usize, pos, cfg.rope_theta);
+            let km = kv_cache.storage().as_any().downcast_ref::<cellm_cache::kvcache::MetalKvStorage>().unwrap();
+            km.encode_write_token_f32(enc, kv_cache.layout().token_base_elem(bid, l, off)?, &self.k_buf, &self.v_buf, nkv * hd);
+            km.encode_attention(enc, bb, (l * total * 4) as u64, &self.q_buf, &self.attn_out_buf, total as u32, nh as u32, nkv as u32, hd as u32, None);
+            let wo = self.get_w(&format!("{pref}.self_attn.o_proj.weight")); let bo = self.try_get_w(&format!("{pref}.self_attn.o_proj.bias"));
+            if let Some(so) = self.try_get_w(&format!("{pref}.self_attn.o_proj.qscale")) { self.ops.encode_mv_i8_bias(enc, wo, so, &self.attn_out_buf, bo, &self.mlp_in_buf, h, h); }
+            else { self.ops.encode_mv_f16_bias(enc, wo, &self.attn_out_buf, bo, &self.mlp_in_buf, h, h); }
+            self.ops.encode_add_f32_inplace(enc, &self.x_buf, &self.mlp_in_buf, h);
+            self.ops.encode_rms_norm_f16w(enc, &self.x_buf, self.get_w(&format!("{pref}.post_attention_layernorm.weight")), &self.x_norm_buf, h, cfg.rms_norm_eps, offset);
+            let (wg, wu) = (self.get_w(&format!("{pref}.mlp.gate_proj.weight")), self.get_w(&format!("{pref}.mlp.up_proj.weight")));
+            let (bg, bu) = (self.try_get_w(&format!("{pref}.mlp.gate_proj.bias")), self.try_get_w(&format!("{pref}.mlp.up_proj.bias")));
+            let (sg, su) = (self.try_get_w(&format!("{pref}.mlp.gate_proj.qscale")), self.try_get_w(&format!("{pref}.mlp.up_proj.qscale")));
+            if let (Some(g), Some(u)) = (sg, su) { self.ops.encode_mv_i8_bias(enc, wg, g, &self.x_norm_buf, bg, &self.gate_buf, cfg.intermediate_size, h); self.ops.encode_mv_i8_bias(enc, wu, u, &self.x_norm_buf, bu, &self.up_buf, cfg.intermediate_size, h); }
+            else { self.ops.encode_mv_f16_bias(enc, wg, &self.x_norm_buf, bg, &self.gate_buf, cfg.intermediate_size, h); self.ops.encode_mv_f16_bias(enc, wu, &self.x_norm_buf, bu, &self.up_buf, cfg.intermediate_size, h); }
+            self.ops.encode_silu_mul_f32_inplace(enc, &self.gate_buf, &self.up_buf, cfg.intermediate_size);
+            let wd = self.get_w(&format!("{pref}.mlp.down_proj.weight")); let bd = self.try_get_w(&format!("{pref}.mlp.down_proj.bias"));
+            if let Some(sd) = self.try_get_w(&format!("{pref}.mlp.down_proj.qscale")) { self.ops.encode_mv_i8_bias(enc, wd, sd, &self.gate_buf, bd, &self.down_buf, h, cfg.intermediate_size); }
+            else { self.ops.encode_mv_f16_bias(enc, wd, &self.gate_buf, bd, &self.down_buf, h, cfg.intermediate_size); }
+            self.ops.encode_add_f32_inplace(enc, &self.x_buf, &self.down_buf, h);
+        }
+        self.ops.encode_rms_norm_f16w(enc, &self.x_buf, self.get_w(&format!("{prefix}model.norm.weight")), &self.x_norm_buf, h, cfg.rms_norm_eps, offset);
+        if logits {
+            let (wl, sl) = if let Some(wl) = self.try_get_w(&format!("{prefix}lm_head.weight")) {
+                (wl, self.try_get_w(&format!("{prefix}lm_head.weight.qscale")))
+            } else {
+                let name = format!("{prefix}model.embed_tokens.weight");
+                (self.get_w(&name), self.try_get_w(&format!("{name}.qscale")))
+            };
+
+            if let Some(s) = sl {
+                self.ops.encode_mv_i8(enc, wl, s, &self.x_norm_buf, &self.logits_buf, cfg.vocab_size, h);
+            } else {
+                self.ops.encode_mv_f16(enc, wl, &self.x_norm_buf, &self.logits_buf, cfg.vocab_size, h);
+            }
+        }
+        enc.end_encoding(); cb.commit(); cb.wait_until_completed();
+        if !logits { return Ok(None); }
+        let mut out = vec![0.0f32; cfg.vocab_size];
+        unsafe { std::ptr::copy_nonoverlapping(self.logits_buf.contents() as *const f32, out.as_mut_ptr(), cfg.vocab_size); }
+        
+        // Final NaN check to avoid panic in sort
+        if out[0].is_nan() {
+            return Err(CoreError::Backend("Metal output NaN".into()));
+        }
+        
+        Ok(Some(out))
+    }
+}
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+impl std::fmt::Debug for QwenGraphState { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("QwenGraphState").finish() } }
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+pub struct QwenGraphState;
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+impl std::fmt::Debug for QwenGraphState { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("QwenGraphState (No Metal)").finish() } }

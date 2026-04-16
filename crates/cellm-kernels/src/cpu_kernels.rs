@@ -248,7 +248,7 @@ pub fn softmax_f32_inplace(x: &mut [f32]) {
     }
 }
 
-pub fn rope_non_interleaved_inplace_f32(x: &mut [f32], n_heads: usize, head_dim: usize, rotary_dim: usize, pos: usize, theta: f32) {
+pub fn rope_non_interleaved_inplace_f32(x: &mut [f32], _n_heads: usize, head_dim: usize, rotary_dim: usize, pos: usize, theta: f32) {
     let half = rotary_dim / 2;
     x.par_chunks_exact_mut(head_dim).for_each(|head| {
         for i in 0..half {
@@ -263,7 +263,7 @@ pub fn rope_non_interleaved_inplace_f32(x: &mut [f32], n_heads: usize, head_dim:
     });
 }
 
-pub fn rope_interleaved_inplace_f32(x: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, theta: f32) {
+pub fn rope_interleaved_inplace_f32(x: &mut [f32], _n_heads: usize, head_dim: usize, pos: usize, theta: f32) {
     let half = head_dim / 2;
     x.par_chunks_exact_mut(head_dim).for_each(|head| {
         for i in 0..half {

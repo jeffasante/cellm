@@ -20,3 +20,8 @@ metal = "0.27.0"
 [[example]]
 name = "test_linear_parity"
 path = "../../scratch/test_linear_parity.rs"
+
+[[example]]
+name = "test_qwen"
+path = "../../scratch/test_qwen.rs"
+

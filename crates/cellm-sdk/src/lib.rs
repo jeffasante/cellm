@@ -73,14 +73,24 @@ enum Runner {
 }
 
 impl Runner {
-    fn embed(&self, token: u32) -> anyhow::Result<Vec<f32>> {
+    pub fn prefill(&mut self, tokens: &[u32], start_pos: usize, pt: &mut PageTable, kv: &mut KVCache) -> anyhow::Result<()> {
         match self {
-            Runner::Llama(r) => r.embed(token).map_err(|e: cellm_core::CoreError| anyhow::anyhow!(e.to_string())),
-            Runner::Gemma(r) => r.embed(token).map_err(|e: cellm_core::CoreError| anyhow::anyhow!(e.to_string())),
-            Runner::Qwen(r) => r.embed(token).map_err(|e: cellm_core::CoreError| anyhow::anyhow!(e.to_string())),
+            Runner::Llama(r) => r.prefill(tokens, start_pos, pt, kv).map_err(|e| anyhow::anyhow!(e)),
+            Runner::Gemma(r) => {
+                // Fallback for Gemma
+                for (i, &tok) in tokens.iter().enumerate() {
+                    r.step_topk(tok, start_pos + i, pt, kv, 0).map_err(|e| anyhow::anyhow!(e))?;
+                }
+                Ok(())
+            }
+            Runner::Qwen(r) => {
+                r.prefill(tokens, start_pos, pt, kv).map_err(|e| anyhow::anyhow!(e))
+            }
         }
     }
 }
+
+
 
 /// cellm public API engine.
 ///
@@ -311,21 +321,10 @@ impl Engine {
             (&[][..], tokens[0])
         };
 
-        for &tok in tokens_prefill {
-            let pos = s.next_pos;
-            match &mut self.runner {
-                Runner::Llama(r) => { 
-                    r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, 0)?; 
-                }
-                Runner::Gemma(r) => {
-                    r.step_inner(&r.embed(tok).map_err(|e| anyhow::anyhow!(e.to_string()))?, None, pos, &mut s.page_table, &mut self.kv_cache)?;
-                }
-                Runner::Qwen(r) => {
-                    r.step_topk(tok, pos, &mut s.page_table, &mut self.kv_cache, 0)?;
-                }
-            }
-            s.recent.push(tok);
-            s.next_pos += 1;
+        if !tokens_prefill.is_empty() {
+            self.runner.prefill(tokens_prefill, s.next_pos, &mut s.page_table, &mut self.kv_cache)?;
+            s.recent.extend_from_slice(tokens_prefill);
+            s.next_pos += tokens_prefill.len();
         }
 
         let pos = s.next_pos;

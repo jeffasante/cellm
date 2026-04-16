@@ -126,7 +126,7 @@ impl LlamaRunner {
             // experimental. Keep it opt-in so default Metal runs stay fast/stable.
             let graph_enabled = std::env::var("CELLM_LLAMA_ENABLE_GRAPH")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
+                .unwrap_or(true);
             if graph_enabled {
                 let gs_res = LlamaGraphState::new(
                     self.cfg.hidden_size,
@@ -204,6 +204,39 @@ impl LlamaRunner {
         kv_cache: &mut KVCache,
         top_k: usize,
     ) -> Result<Vec<(u32, f32)>, CoreError> {
+        let logits = self.step_inner(x0, pos, page_table, kv_cache, true)?;
+        self.topk_from_logits(&logits, top_k)
+    }
+
+    pub fn prefill(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        page_table: &mut PageTable,
+        kv_cache: &mut KVCache,
+    ) -> Result<(), CoreError> {
+        for (i, &tok) in tokens.iter().enumerate() {
+            let pos = start_pos + i;
+            if pos == page_table.token_count() {
+                page_table.append_token(kv_cache.allocator_mut()).map_err(|e| {
+                    CoreError::Backend(format!("llama prefill: page_table append_token failed: {e}"))
+                })?;
+            }
+            let mut x = vec![0.0f32; self.cfg.hidden_size];
+            self.embed_token(tok, &mut x)?;
+            self.step_inner(&x, pos, page_table, kv_cache, false)?;
+        }
+        Ok(())
+    }
+
+    fn step_inner(
+        &mut self,
+        x0: &[f32],
+        pos: usize,
+        page_table: &mut PageTable,
+        kv_cache: &mut KVCache,
+        return_logits: bool,
+    ) -> Result<Vec<f32>, CoreError> {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             let mut disable_graph = false;
@@ -221,13 +254,17 @@ impl LlamaRunner {
                     CoreError::Backend(format!("llama step: page_table offset_in_block failed: {e}"))
                 })?;
 
-                if let Ok(logits) = gs.step_fused(x0, &self.cfg, &self.tensor_prefix, kv_cache, page_table, pos, token_off, block_id as u32) {
-                    let has_non_finite = logits.iter().any(|v| !v.is_finite());
-                    if has_non_finite {
-                        eprintln!("llama fused graph: non-finite logits detected; disabling fused graph and continuing with non-fused Metal path");
-                        disable_graph = true;
+                if let Ok(maybe_logits) = gs.step_fused(x0, &self.cfg, &self.tensor_prefix, kv_cache, page_table, pos, token_off, block_id as u32, return_logits) {
+                    if let Some(logits) = maybe_logits {
+                        let has_non_finite = logits.iter().any(|v| !v.is_finite());
+                        if has_non_finite {
+                            eprintln!("llama fused graph: non-finite logits detected; disabling fused graph and continuing with non-fused Metal path");
+                            disable_graph = true;
+                        } else {
+                            return Ok(logits);
+                        }
                     } else {
-                        return self.topk_from_logits(&logits, top_k);
+                        return Ok(vec![]);
                     }
                 }
             }
@@ -467,12 +504,13 @@ impl LlamaRunner {
             rms_norm_f32(&x, &norm_w, cfg.rms_norm_eps, &mut x_final);
         }
 
+        if !return_logits {
+            return Ok(vec![]);
+        }
+
         // Logits via tied embeddings: logits[v] = dot(x_final, embed[v])
         let vocab = cfg.vocab_size;
-        let k = top_k.max(1).min(vocab);
-        let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
-        let mut min_idx = 0usize;
-        let mut min_val = f32::INFINITY;
+        let mut buf = vec![0.0f32; vocab];
 
         let lm_head_name = self.resolve_name("lm_head.weight");
         let maybe_lm_head = lm_head_name
@@ -486,8 +524,8 @@ impl LlamaRunner {
         let lm_meta = self
             .tensor_meta_by_exact_name(&lm_src_resolved)
             .ok_or_else(|| CoreError::Backend(format!("unknown tensor {}", lm_src_resolved)))?;
+
         if use_metal_logits {
-            let mut buf = vec![0.0f32; vocab];
             match lm_meta.dtype.as_str() {
                 "f16" => {
                     let w = self.tensor_f16_by_exact_name(&lm_src_resolved)?;
@@ -514,7 +552,7 @@ impl LlamaRunner {
                 other => return Err(CoreError::Backend(format!("unsupported lm dtype {other} for {lm_src_resolved}"))),
             }
             sanitize_logits_non_finite(&mut buf, "llama metal logits");
-            return self.topk_from_logits(&buf, top_k);
+            return Ok(buf);
         }
 
         let lm_src_f16 = if lm_meta.dtype == "f16" {
@@ -559,27 +597,9 @@ impl LlamaRunner {
             if !dot.is_finite() {
                 dot = f32::NEG_INFINITY;
             }
-
-            if top.len() < k {
-                top.push((vid as u32, dot));
-                if dot < min_val {
-                    min_val = dot;
-                    min_idx = top.len() - 1;
-                }
-            } else if dot > min_val {
-                top[min_idx] = (vid as u32, dot);
-                min_val = top[0].1;
-                min_idx = 0;
-                for (i, &(_, s)) in top.iter().enumerate().skip(1) {
-                    if s < min_val {
-                        min_val = s;
-                        min_idx = i;
-                    }
-                }
-            }
+            buf[vid] = dot;
         }
-        top.sort_by(|a, b| b.1.total_cmp(&a.1));
-        Ok(top)
+        Ok(buf)
     }
 
     fn tensor_f16(&self, name: &str) -> Result<&[u16], CoreError> {

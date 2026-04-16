@@ -1241,7 +1241,7 @@ impl GemmaRunner {
             )));
         }
         let dtype = meta.dtype.clone();
-        let disable_metal_i4 = self.is_gemma4_text
+        let _disable_metal_i4 = self.is_gemma4_text
             && std::env::var("CELLM_GEMMA4_I4_DISABLE_METAL_LINEAR")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true);

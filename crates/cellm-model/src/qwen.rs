@@ -12,7 +12,7 @@ use half::f16;
 use serde_json::Value;
 
 use crate::{CellmFile, ModelConfig};
-use metal::{Buffer, BufferRef};
+use metal::Buffer;
 
 const QWEN_METAL_LINEAR_MAX_ELEMS: usize = 262_144;
 
@@ -152,7 +152,7 @@ impl QwenRunner {
                 }
             }
         }
-        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         top
     }
 
@@ -206,6 +206,9 @@ impl QwenRunner {
                     mo,
                 ).expect("failed to create graph state");
                 for (name, bytes) in self.file.all_tensors() {
+                    if let Some(t) = self.file.tensor_index(name) {
+                         gs.tensor_dtypes.insert(name.clone(), t.dtype.clone());
+                    }
                     if name.ends_with(".bias") {
                         // Bias tensors are stored as f16 but the GPU shaders read them as float32.
                         // Convert f16 -> f32 before uploading.
@@ -479,7 +482,11 @@ impl QwenRunner {
                     let s = self.tensor_f16(&format!("{weight_name}.qscale"))?.to_vec();
                     self.metal_ops.as_ref().unwrap().logits_i8(&x_final, &w, &s, vocab, hidden, weight_name, &mut logits).map_err(|e| CoreError::Backend(e.to_string()))?;
                 }
-                _ => return Err(CoreError::Backend("unsupported lm_head dtype".into())),
+                "q1_0_g128" => {
+                    let w = self.file.tensor_bytes(weight_name)?.to_vec();
+                    self.metal_ops.as_ref().unwrap().logits_q1(&x_final, &w, vocab, hidden, weight_name, &mut logits).map_err(|e| CoreError::Backend(e.to_string()))?;
+                }
+                _ => return Err(CoreError::Backend(format!("unsupported lm_head dtype: {dtype}").into())),
             }
         } else {
             for vid in 0..vocab { logits[vid] = self.dot_row(weight_name, vid, hidden, &x_final)?; }
@@ -508,6 +515,23 @@ impl QwenRunner {
                 let scale = f16::from_bits(scales[t]).to_f32();
                 let row = &embed[t * hidden..(t + 1) * hidden];
                 for i in 0..hidden { out[i] = (row[i] as f32) * scale; }
+            }
+            "q1_0_g128" => {
+                let embed = self.file.tensor_bytes(&resolved)?;
+                let row_stride = (hidden / 128) * 18;
+                let row = &embed[t * row_stride..(t + 1) * row_stride];
+                for i in 0..(hidden / 128) {
+                    let block = &row[i * 18..(i + 1) * 18];
+                    let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+                    let bits = &block[2..18];
+                    for b in 0..16 {
+                        let bb = bits[b];
+                        for j in 0..8 {
+                            let bit_val = if (bb & (1 << j)) != 0 { d } else { -d };
+                            out[i * 128 + b * 8 + j] = bit_val;
+                        }
+                    }
+                }
             }
             "i4" => {
                 let embed = self.tensor_u8(&weight_name)?;
@@ -556,7 +580,7 @@ impl QwenRunner {
     fn resolve_tensor_name(&self, name: &str) -> String { resolve_tensor_name_file(&self.file, name) }
 
     fn dot_row(&self, weight_name: &str, row_idx: usize, in_dim: usize, x: &[f32]) -> Result<f32, CoreError> {
-        let shape = self.tensor_shape(weight_name)?;
+        let _shape = self.tensor_shape(weight_name)?;
         let resolved = self.resolve_tensor_name(weight_name);
         let dtype = self.file.tensor_index(&resolved).ok_or_else(|| CoreError::Backend(format!("unknown tensor {weight_name}")))?.dtype.clone();
         match dtype.as_str() {
@@ -574,6 +598,25 @@ impl QwenRunner {
                 let row = &w[row_idx * in_dim..(row_idx + 1) * in_dim];
                 let mut acc = 0.0f32;
                 for i in 0..in_dim { acc += x[i] * (row[i] as f32) * scale; }
+                Ok(acc)
+            }
+            "q1_0_g128" => {
+                let bytes = self.file.tensor_bytes(&resolved)?;
+                let row_stride = (in_dim / 128) * 18;
+                let row = &bytes[row_idx * row_stride..(row_idx + 1) * row_stride];
+                let mut acc = 0.0f32;
+                for i in 0..(in_dim / 128) {
+                    let block = &row[i * 18..(i + 1) * 18];
+                    let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+                    let bits = &block[2..18];
+                    for b in 0..16 {
+                        let bb = bits[b];
+                        for j in 0..8 {
+                            let bit_val = if (bb & (1 << j)) != 0 { d } else { -d };
+                            acc += bit_val * x[i * 128 + b * 8 + j];
+                        }
+                    }
+                }
                 Ok(acc)
             }
             _ => Err(CoreError::Backend(format!("unsupported dot_row dtype for {weight_name}: {dtype}"))),
@@ -608,12 +651,22 @@ impl QwenRunner {
                     self.metal_ops.as_mut().unwrap().logits_i8(x, unsafe { std::slice::from_raw_parts(w_ptr, w_len) }, unsafe { std::slice::from_raw_parts(s_ptr, s_len) }, out_dim, in_dim, &resolved, out).map_err(|e| CoreError::Backend(e.to_string()))?;
                     return Ok(());
                 }
+                "q1_0_g128" => {
+                    let w = self.file.tensor_bytes(&resolved)?;
+                    self.metal_ops.as_mut().unwrap().logits_q1(x, w, out_dim, in_dim, &resolved, out).map_err(|e| CoreError::Backend(e.to_string()))?;
+                    return Ok(());
+                }
                 _ => {}
             }
         }
         match dtype.as_str() {
             "f16" => cellm_kernels::cpu_kernels::matmul_f16_f32(self.tensor_f16(weight_name)?, out_dim, in_dim, x, out),
             "i8" => cellm_kernels::cpu_kernels::matmul_i8_f32(self.tensor_i8(weight_name)?, self.tensor_f16(&format!("{weight_name}.qscale"))?, out_dim, in_dim, x, out),
+            "q1_0_g128" => {
+                for r in 0..out_dim {
+                    out[r] = self.dot_row(weight_name, r, in_dim, x)?;
+                }
+            }
             _ => return Err(CoreError::Backend(format!("linear fallback unsupported dtype {dtype}"))),
         }
         Ok(())
@@ -667,6 +720,9 @@ pub struct QwenGraphState {
     pub up_buf: metal::Buffer,
     pub down_buf: metal::Buffer,
     pub logits_buf: metal::Buffer,
+    pub q_norm_buf: metal::Buffer,
+    pub k_norm_buf: metal::Buffer,
+    pub tensor_dtypes: HashMap<String, String>,
     pub weight_cache: Mutex<HashMap<String, Option<metal::Buffer>>>,
     pub bases_buf: Option<metal::Buffer>,
     pub bases_capacity: usize,
@@ -687,13 +743,18 @@ impl QwenGraphState {
         let up_buf = dev.new_buffer((inter * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
         let down_buf = dev.new_buffer((hidden * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
         let logits_buf = dev.new_buffer((vocab * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let q_norm_buf = dev.new_buffer((hidden * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        let hd = hidden / heads;
+        let k_norm_buf = dev.new_buffer((kv_heads * hd * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
 
         Ok(Self {
             device: dev, queue: ops.queue.clone(), ops, weights: HashMap::new(),
             weight_cache: Mutex::new(HashMap::new()),
             x_buf, x_norm_buf, q_buf, k_buf, v_buf,
             attn_out_buf, mlp_in_buf, gate_buf, up_buf, down_buf,
-            logits_buf, bases_buf: None, bases_capacity: 0       })
+            logits_buf, q_norm_buf, k_norm_buf, 
+            tensor_dtypes: HashMap::new(),
+            bases_buf: None, bases_capacity: 0       })
     }
 
     fn get_w_cached(&self, name: &str) -> &metal::Buffer {
@@ -741,8 +802,18 @@ impl QwenGraphState {
     
     fn try_get_w(&self, name: &str) -> Option<&metal::Buffer> { self.weights.get(&self.resolve_tensor_name(name)) }
 
+    fn get_dtype(&self, name: &str) -> String {
+        self.tensor_dtypes.get(&self.resolve_tensor_name(name)).cloned().unwrap_or_default()
+    }
 
-    fn check_nan(&self, _buf: &BufferRef, _n: usize, _msg: &str) {}
+
+    fn check_nan(&self, buf: &metal::BufferRef, n: usize, msg: &str) {
+        let mut data = vec![0.0f32; n];
+        unsafe { std::ptr::copy_nonoverlapping(buf.contents() as *const f32, data.as_mut_ptr(), n); }
+        if data.iter().any(|v| v.is_nan()) {
+            println!("CRITICAL: NaNs detected in {}!", msg);
+        }
+    }
 
     pub fn step_fused(&mut self, x_in: &[f32], cfg: &ModelConfig, prefix: &str, kv_cache: &mut KVCache, page_table: &PageTable, pos: usize, off: usize, bid: u32, rotary: f32, offset: bool, logits: bool) -> Result<Option<Vec<f32>>, CoreError> {
         let h = cfg.hidden_size;
@@ -775,9 +846,16 @@ impl QwenGraphState {
 
         if logits {
             let enc_logits = cb.new_compute_command_encoder();
-            let (wl, sl) = if let Some(wl) = self.try_get_w_cached(&format!("{prefix}lm_head.weight")) { (wl, self.try_get_w_cached(&format!("{prefix}lm_head.weight.qscale"))) }
-                           else { let name = format!("{prefix}model.embed_tokens.weight"); (self.get_w_cached(&name), self.try_get_w_cached(&format!("{name}.qscale"))) };
+            let lm_head_name = format!("{prefix}lm_head.weight");
+            let embed_name = format!("{prefix}model.embed_tokens.weight");
+            let (target_name, wl, sl) = if self.tensor_dtypes.contains_key(&lm_head_name) {
+                (lm_head_name.clone(), self.get_w_cached(&lm_head_name), self.try_get_w_cached(&format!("{lm_head_name}.qscale")))
+            } else {
+                (embed_name.clone(), self.get_w_cached(&embed_name), self.try_get_w_cached(&format!("{embed_name}.qscale")))
+            };
+            
             if let Some(s) = sl { self.ops.encode_mv_i8(enc_logits, wl, s, &self.x_norm_buf, &self.logits_buf, cfg.vocab_size, h); }
+            else if self.get_dtype(&target_name) == "q1_0_g128" { self.ops.encode_mv_q1(enc_logits, wl, &self.x_norm_buf, &self.logits_buf, cfg.vocab_size, h); }
             else { self.ops.encode_mv_f16(enc_logits, wl, &self.x_norm_buf, &self.logits_buf, cfg.vocab_size, h); }
             enc_logits.end_encoding();
         }
@@ -831,14 +909,31 @@ impl QwenGraphState {
         let bq = self.try_get_w_cached(&format!("{pref}.self_attn.q_proj.bias"));
         let bk = self.try_get_w_cached(&format!("{pref}.self_attn.k_proj.bias"));
         let bv = self.try_get_w_cached(&format!("{pref}.self_attn.v_proj.bias"));
-        let sq = self.try_get_w_cached(&format!("{pref}.self_attn.q_proj.weight.qscale")).or_else(|| self.try_get_w_cached(&format!("{pref}.self_attn.q_proj.qscale")));
-        let sk = self.try_get_w_cached(&format!("{pref}.self_attn.k_proj.weight.qscale")).or_else(|| self.try_get_w_cached(&format!("{pref}.self_attn.k_proj.qscale")));
-        let sv = self.try_get_w_cached(&format!("{pref}.self_attn.v_proj.weight.qscale")).or_else(|| self.try_get_w_cached(&format!("{pref}.self_attn.v_proj.qscale")));
+        let qs = self.try_get_w_cached(&format!("{pref}.self_attn.q_proj.weight.qscale")).or_else(|| self.try_get_w_cached(&format!("{pref}.self_attn.q_proj.qscale")));
+        let ks = self.try_get_w_cached(&format!("{pref}.self_attn.k_proj.weight.qscale")).or_else(|| self.try_get_w_cached(&format!("{pref}.self_attn.k_proj.qscale")));
+        let vs = self.try_get_w_cached(&format!("{pref}.self_attn.v_proj.weight.qscale")).or_else(|| self.try_get_w_cached(&format!("{pref}.self_attn.v_proj.qscale")));
         
-        if let (Some(q), Some(k), Some(v)) = (sq, sk, sv) { 
+        if self.get_dtype(&format!("{pref}.self_attn.q_proj.weight")) == "q1_0_g128" {
+            self.ops.encode_mv_q1(enc, wq, &self.x_norm_buf, &self.q_buf, h, h);
+            self.ops.encode_mv_q1(enc, wk, &self.x_norm_buf, &self.k_buf, nkv * hd, h);
+            self.ops.encode_mv_q1(enc, wv, &self.x_norm_buf, &self.v_buf, nkv * hd, h);
+            if let Some(b) = bq { self.ops.encode_add_f32_inplace(enc, &self.q_buf, b, h); }
+            if let Some(b) = bk { self.ops.encode_add_f32_inplace(enc, &self.k_buf, b, nkv * hd); }
+            if let Some(b) = bv { self.ops.encode_add_f32_inplace(enc, &self.v_buf, b, nkv * hd); }
+        } else if let (Some(q), Some(k), Some(v)) = (qs, ks, vs) { 
             self.ops.encode_qkv_i8_bias(enc, wq, q, wk, k, wv, v, &self.x_norm_buf, bq, bk, bv, &self.q_buf, &self.k_buf, &self.v_buf, h, nkv * hd, h); 
         } else { 
             self.ops.encode_qkv_f16_bias(enc, wq, wk, wv, &self.x_norm_buf, bq, bk, bv, &self.q_buf, &self.k_buf, &self.v_buf, h, nkv * hd, h); 
+        }
+
+        // QK Norm
+        let q_norm_w = self.try_get_w_cached(&format!("{pref}.self_attn.q_norm.weight"));
+        let k_norm_w = self.try_get_w_cached(&format!("{pref}.self_attn.k_norm.weight"));
+        if let Some(qw) = q_norm_w {
+            self.ops.encode_rms_norm_f16w(enc, &self.q_buf, qw, &self.q_buf, h, cfg.rms_norm_eps, offset);
+        }
+        if let Some(kw) = k_norm_w {
+            self.ops.encode_rms_norm_f16w(enc, &self.k_buf, kw, &self.k_buf, nkv * hd, cfg.rms_norm_eps, offset);
         }
 
         let km = kv_cache.storage().as_any().downcast_ref::<cellm_cache::kvcache::MetalKvStorage>().unwrap();
@@ -851,8 +946,14 @@ impl QwenGraphState {
         let wo = self.get_w_cached(&format!("{pref}.self_attn.o_proj.weight"));
         let bo = self.try_get_w_cached(&format!("{pref}.self_attn.o_proj.bias"));
         let so = self.try_get_w_cached(&format!("{pref}.self_attn.o_proj.weight.qscale")).or_else(|| self.try_get_w_cached(&format!("{pref}.self_attn.o_proj.qscale")));
-        if let Some(s) = so { self.ops.encode_mv_i8_bias(enc, wo, s, &self.attn_out_buf, bo, &self.mlp_in_buf, h, h); }
-        else { self.ops.encode_mv_f16_bias(enc, wo, &self.attn_out_buf, bo, &self.mlp_in_buf, h, h); }
+        if self.get_dtype(&format!("{pref}.self_attn.o_proj.weight")) == "q1_0_g128" {
+            self.ops.encode_mv_q1(enc, wo, &self.attn_out_buf, &self.mlp_in_buf, h, h);
+            if let Some(b) = bo { self.ops.encode_add_f32_inplace(enc, &self.mlp_in_buf, b, h); }
+        } else if let Some(s) = so { 
+            self.ops.encode_mv_i8_bias(enc, wo, s, &self.attn_out_buf, bo, &self.mlp_in_buf, h, h); 
+        } else { 
+            self.ops.encode_mv_f16_bias(enc, wo, &self.attn_out_buf, bo, &self.mlp_in_buf, h, h); 
+        }
         self.ops.encode_add_f32_inplace(enc, &self.x_buf, &self.mlp_in_buf, h);
         
         self.ops.encode_rms_norm_f16w(enc, &self.x_buf, self.get_w_cached(&format!("{pref}.post_attention_layernorm.weight")), &self.x_norm_buf, h, cfg.rms_norm_eps, offset);
@@ -864,7 +965,12 @@ impl QwenGraphState {
         let sg = self.try_get_w_cached(&format!("{pref}.mlp.gate_proj.weight.qscale")).or_else(|| self.try_get_w_cached(&format!("{pref}.mlp.gate_proj.qscale")));
         let su = self.try_get_w_cached(&format!("{pref}.mlp.up_proj.weight.qscale")).or_else(|| self.try_get_w_cached(&format!("{pref}.mlp.up_proj.qscale")));
 
-        if let (Some(g), Some(u)) = (sg, su) { 
+        if self.get_dtype(&format!("{pref}.mlp.gate_proj.weight")) == "q1_0_g128" {
+            self.ops.encode_mv_q1(enc, wg, &self.x_norm_buf, &self.gate_buf, cfg.intermediate_size, h);
+            self.ops.encode_mv_q1(enc, wu, &self.x_norm_buf, &self.up_buf, cfg.intermediate_size, h);
+            if let Some(b) = bg { self.ops.encode_add_f32_inplace(enc, &self.gate_buf, b, cfg.intermediate_size); }
+            if let Some(b) = bu { self.ops.encode_add_f32_inplace(enc, &self.up_buf, b, cfg.intermediate_size); }
+        } else if let (Some(g), Some(u)) = (sg, su) { 
             self.ops.encode_mv_i8_bias(enc, wg, g, &self.x_norm_buf, bg, &self.gate_buf, cfg.intermediate_size, h); 
             self.ops.encode_mv_i8_bias(enc, wu, u, &self.x_norm_buf, bu, &self.up_buf, cfg.intermediate_size, h); 
         } else { 
@@ -877,8 +983,14 @@ impl QwenGraphState {
         let wd = self.get_w_cached(&format!("{pref}.mlp.down_proj.weight"));
         let bd = self.try_get_w_cached(&format!("{pref}.mlp.down_proj.bias"));
         let sd = self.try_get_w_cached(&format!("{pref}.mlp.down_proj.weight.qscale")).or_else(|| self.try_get_w_cached(&format!("{pref}.mlp.down_proj.qscale")));
-        if let Some(s) = sd { self.ops.encode_mv_i8_bias(enc, wd, s, &self.gate_buf, bd, &self.down_buf, h, cfg.intermediate_size); }
-        else { self.ops.encode_mv_f16_bias(enc, wd, &self.gate_buf, bd, &self.down_buf, h, cfg.intermediate_size); }
+        if self.get_dtype(&format!("{pref}.mlp.down_proj.weight")) == "q1_0_g128" {
+            self.ops.encode_mv_q1(enc, wd, &self.gate_buf, &self.down_buf, h, cfg.intermediate_size);
+            if let Some(b) = bd { self.ops.encode_add_f32_inplace(enc, &self.down_buf, b, h); }
+        } else if let Some(s) = sd { 
+            self.ops.encode_mv_i8_bias(enc, wd, s, &self.gate_buf, bd, &self.down_buf, h, cfg.intermediate_size); 
+        } else { 
+            self.ops.encode_mv_f16_bias(enc, wd, &self.gate_buf, bd, &self.down_buf, h, cfg.intermediate_size); 
+        }
         
         self.ops.encode_add_f32_inplace(enc, &self.x_buf, &self.down_buf, h);
         
@@ -935,9 +1047,9 @@ fn infer_qwen_layer_kinds_and_linear_spec(
     Ok((kinds, spec, partial_rotary_factor))
 }
 
-fn qwen_rmsnorm_is_offset(header: &crate::cellm_file::CellmHeader) -> bool {
-    let check = |s: &str| s.starts_with("qwen3_5") || s.starts_with("qwen2_5");
-    header.model_type.starts_with("qwen3_5") || header.model_type.starts_with("qwen2_5") || header.source_model_type.as_deref().is_some_and(check)
+fn qwen_rmsnorm_is_offset(header: &crate::CellmHeader) -> bool {
+    let check = |s: &str| s.contains("gemma");
+    header.model_type.contains("gemma") || header.source_model_type.as_deref().is_some_and(check)
 }
 
 fn add_one_inplace(x: &mut [f32]) { for v in x { *v += 1.0; } }

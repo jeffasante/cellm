@@ -518,6 +518,36 @@ kernel void mv2_i8(
         o1[off] = acc * scale;
     }
 }
+kernel void mv_q1_0_g128(
+    device const uchar*  A        [[buffer(0)]],
+    device const float*  x        [[buffer(1)]],
+    device       float*  out      [[buffer(2)]],
+    constant     uint&   rows     [[buffer(3)]],
+    constant     uint&   cols     [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= rows) return;
+    device const uchar* row_ptr = A + (uint64_t)gid * (cols / 128 * 18);
+    float acc = 0.0f;
+    for (uint i = 0; i < cols; i += 128) {
+        uchar d_low = row_ptr[0];
+        uchar d_high = row_ptr[1];
+        ushort d_bits = ((ushort)d_high << 8) | (ushort)d_low;
+        float d = (float)as_type<half>(d_bits);
+        
+        device const uchar* bits = row_ptr + 2;
+        for (uint b = 0; b < 16; ++b) {
+            uchar bb = bits[b];
+            for (uint j = 0; j < 8; ++j) {
+                float bit_val = (bb & (1 << j)) ? d : -d;
+                acc += bit_val * x[i + b * 8 + j];
+            }
+        }
+        row_ptr += 18;
+    }
+    out[gid] = acc;
+}
+
 "#;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -536,6 +566,7 @@ pub struct MetalOps {
     pub pso_mv2_i8: ComputePipelineState,
     pub pso_add_f32: ComputePipelineState,
     pub pso_silu_mul_f32: ComputePipelineState,
+    pub pso_mv_q1: ComputePipelineState,
     x_buf: Mutex<Option<Buffer>>,
     out_buf: Mutex<Option<Buffer>>,
     tensor_cache: Mutex<HashMap<String, Buffer>>,
@@ -559,6 +590,7 @@ impl Clone for MetalOps {
             pso_mv2_i8: self.pso_mv2_i8.clone(),
             pso_add_f32: self.pso_add_f32.clone(),
             pso_silu_mul_f32: self.pso_silu_mul_f32.clone(),
+            pso_mv_q1: self.pso_mv_q1.clone(),
             x_buf: Mutex::new(None), // New scratch for new clone
             out_buf: Mutex::new(None),
             tensor_cache: Mutex::new(HashMap::new()), // Could share, but safer to have own cache
@@ -588,11 +620,12 @@ impl MetalOps {
         let pso_mv2_i8 = build_pso_ops(&device, &lib, "mv2_i8")?;
         let pso_add_f32 = build_pso_ops(&device, &lib, "add_f32_inplace")?;
         let pso_silu_mul_f32 = build_pso_ops(&device, &lib, "silu_mul_f32_inplace")?;
+        let pso_mv_q1 = build_pso_ops(&device, &lib, "mv_q1_0_g128")?;
 
         Ok(Self {
             device, queue, _lib: lib,
             pso_rms_norm, pso_rope_adj, pso_rope_half, pso_mv_f16, pso_mv_i8, pso_mv_qkv_f16, pso_mv_qkv_i8, pso_mv2_f16, pso_mv2_i8,
-            pso_add_f32, pso_silu_mul_f32,
+            pso_add_f32, pso_silu_mul_f32, pso_mv_q1,
             x_buf: Mutex::new(None), out_buf: Mutex::new(None),
             tensor_cache: Mutex::new(HashMap::new()),
         })
@@ -822,6 +855,26 @@ impl MetalOps {
         });
         read_f32(ob, out)
     }
+    
+    pub fn logits_q1(&self, x: &[f32], embed_q1: &[u8], vocab: usize, hidden: usize, cache_key: &str, out: &mut [f32]) -> anyhow::Result<()> {
+        if !self.tensor_cache.lock().unwrap().contains_key(cache_key) {
+            self.tensor_cache.lock().unwrap().insert(cache_key.to_string(), upload_i8(&self.device, unsafe { std::slice::from_raw_parts(embed_q1.as_ptr() as *const i8, embed_q1.len()) })?);
+        }
+        let cache = self.tensor_cache.lock().unwrap();
+        let eb = cache.get(cache_key).unwrap();
+        ensure_buf_f32(&self.device, &mut *self.x_buf.lock().unwrap(), hidden)?;
+        ensure_buf_f32(&self.device, &mut *self.out_buf.lock().unwrap(), vocab)?;
+        let xb_ref = self.x_buf.lock().unwrap(); let xb = xb_ref.as_ref().unwrap();
+        let ob_ref = self.out_buf.lock().unwrap(); let ob = ob_ref.as_ref().unwrap();
+        write_f32(xb, x)?;
+        autoreleasepool(|| {
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            self.encode_mv_q1(enc, eb, xb, ob, vocab, hidden);
+            enc.end_encoding(); cb.commit(); cb.wait_until_completed();
+        });
+        read_f32(ob, out)
+    }
 
     // Compat stubs for old callers
     pub fn encode_mv_f16(&self, enc: &metal::ComputeCommandEncoderRef, a: &metal::Buffer, x: &metal::Buffer, out: &metal::Buffer, rs: usize, cs: usize) {
@@ -835,6 +888,16 @@ impl MetalOps {
     }
     pub fn encode_qkv_i8(&self, enc: &metal::ComputeCommandEncoderRef, w_q: &metal::Buffer, s_q: &metal::Buffer, w_k: &metal::Buffer, s_k: &metal::Buffer, w_v: &metal::Buffer, s_v: &metal::Buffer, x_buf: &metal::Buffer, q_out: &metal::Buffer, k_out: &metal::Buffer, v_out: &metal::Buffer, rows_q: usize, rows_kv: usize, cols: usize) {
         self.encode_qkv_i8_bias(enc, w_q, s_q, w_k, s_k, w_v, s_v, x_buf, None, None, None, q_out, k_out, v_out, rows_q, rows_kv, cols);
+    }
+
+    pub fn encode_mv_q1(&self, enc: &metal::ComputeCommandEncoderRef, a: &metal::Buffer, x: &metal::Buffer, out: &metal::Buffer, rs: usize, cs: usize) {
+        let r = rs as u32; let c = cs as u32;
+        enc.set_compute_pipeline_state(&self.pso_mv_q1);
+        enc.set_buffer(0, Some(a), 0); enc.set_buffer(1, Some(x), 0); enc.set_buffer(2, Some(out), 0);
+        enc.set_bytes(3, 4, (&r as *const u32).cast());
+        enc.set_bytes(4, 4, (&c as *const u32).cast());
+        let w = self.pso_mv_q1.thread_execution_width() as u64;
+        enc.dispatch_threads(MTLSize { width: rs as u64, height: 1, depth: 1 }, MTLSize { width: w.min(rs as u64), height: 1, depth: 1 });
     }
 }
 

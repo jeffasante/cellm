@@ -249,6 +249,7 @@ enum TensorOp {
     QuantizeI2Data,
     QuantizeI2Scales { weight_name: String },
     QuantizeFp8E4M3,
+    CopyRaw,
 }
 
 fn main() -> Result<()> {
@@ -622,6 +623,12 @@ fn main() -> Result<()> {
                 })?;
                 write_quant_i2_scales_per_row_symmetric(t.data(), t.shape(), t.dtype(), &mut w)?;
             }
+            TensorOp::CopyRaw => {
+                let t = st.tensor(&p.name).with_context(|| {
+                    format!("tensor {} in {:?}", p.name, safetensors_paths[p.file_idx])
+                })?;
+                w.write_all(t.data())?;
+            }
         }
 
         pos += p.out_nbytes as u64;
@@ -748,6 +755,7 @@ fn ggml_type_name(t: u32) -> &'static str {
         28 => "F64",
         29 => "IQ1_M",
         30 => "BF16",
+        41 => "Q1_0_g128",
         _ => "UNKNOWN",
     }
 }
@@ -960,6 +968,13 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
             required_gemma4_tensor_names,
             "blk.0.ffn_gate.weight",
         ),
+        "qwen3" => (
+            "qwen3",
+            "qwen3",
+            map_gguf_qwen3_tensor_name,
+            required_qwen3_tensor_names,
+            "blk.0.ffn_gate.weight",
+        ),
         _ => {
             anyhow::bail!(
                 "GGUF architecture {:?} is not supported yet. Current GGUF conversion path supports llama and gemma4.",
@@ -1034,6 +1049,33 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
             .ok_or_else(|| anyhow::anyhow!("output nbytes overflow for {}", src.name))?;
 
         let mut final_out_nbytes = out_nbytes;
+
+        // Keep native 1-bit if no re-quantization is requested
+        if src.ggml_type == 41 
+            && !args.quantize_fp8_e4m3 
+            && !args.quantize_int2_symmetric 
+            && !args.quantize_int4_symmetric 
+            && !args.quantize_int8_symmetric 
+        {
+            out_tensors.push(GgufOutTensor {
+                src_name: src.name.clone(),
+                src_dims: src.dims.clone(),
+                name: dst_name.clone(),
+                shape: shape.clone(),
+                header_shape: shape.clone(),
+                out_dtype: "q1_0_g128".to_string(),
+                src_type: src.ggml_type,
+                src_offset,
+                src_nbytes,
+                out_nbytes: src_nbytes,
+                out_offset: 0,
+                reverse_2d,
+                is_q8_head: false,
+                layer_idx,
+                op: TensorOp::CopyRaw,
+            });
+            continue;
+        }
 
         // Apply quantization if requested and if the tensor is a candidate (usually 2D weights)
         if args.quantize_fp8_e4m3
@@ -1417,6 +1459,9 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
             TensorOp::CopyAsF16 => {
                 write_gguf_tensor_as_f16(src, p.src_type, numel, &mut w)?;
             }
+            TensorOp::CopyRaw => {
+                w.write_all(src)?;
+            }
             TensorOp::QuantizeI2Data => {
                 let f16_data = decode_gguf_all_f16(src, p.src_type, numel)?;
                 write_quant_i2_data_per_row_symmetric(
@@ -1745,6 +1790,7 @@ fn decode_gguf_prefix_f32(
         12 => decode_qk_prefix(src, target, 144, dequantize_q4k_block, &mut out)?,
         13 => decode_qk_prefix(src, target, 176, dequantize_q5k_block, &mut out)?,
         14 => decode_qk_prefix(src, target, 210, dequantize_q6k_block, &mut out)?,
+        41 => decode_q1_0_g128_prefix(src, target, &mut out)?,
         other => anyhow::bail!("decode prefix: unsupported GGUF type {}", other),
     }
     if out.len() < target {
@@ -1783,6 +1829,33 @@ fn decode_q4_0_prefix(src: &[u8], target: usize, out: &mut Vec<f32>) -> Result<(
             }
             let q1 = (b >> 4) as i32 - 8;
             out.push(d * q1 as f32);
+        }
+    }
+    Ok(())
+}
+
+fn decode_q1_0_g128_prefix(src: &[u8], target: usize, out: &mut Vec<f32>) -> Result<()> {
+    let bs = 18usize;
+    if src.len() % bs != 0 {
+        anyhow::bail!("Q1_0_g128 decode prefix: bad source length {}", src.len());
+    }
+    let nblk = src.len() / bs;
+    for bi in 0..nblk {
+        if out.len() >= target {
+            break;
+        }
+        let off = bi * bs;
+        let d = read_f16_le_as_f32(src[off], src[off + 1]);
+        let b_slice = &src[off + 2..off + bs];
+        for &b in b_slice {
+            for bit_idx in 0..8 {
+                if out.len() >= target {
+                    break;
+                }
+                let bit = (b >> bit_idx) & 1;
+                let val = if bit == 1 { d } else { -d };
+                out.push(val);
+            }
         }
     }
     Ok(())
@@ -1902,6 +1975,64 @@ fn required_gemma4_tensor_names(num_layers: usize) -> Vec<String> {
     out
 }
 
+fn required_qwen3_tensor_names(num_layers: usize) -> Vec<String> {
+    let mut out = vec![
+        "model.embed_tokens.weight".to_string(),
+        "model.norm.weight".to_string(),
+    ];
+    // Qwen3 often has an explicit lm_head. If missing, it's tied.
+    // We add it to required if it's there? No, we need a better way.
+    // For now, let's assume standard llama-like.
+    for i in 0..num_layers {
+        out.push(format!("model.layers.{i}.input_layernorm.weight"));
+        out.push(format!("model.layers.{i}.self_attn.q_proj.weight"));
+        out.push(format!("model.layers.{i}.self_attn.k_proj.weight"));
+        out.push(format!("model.layers.{i}.self_attn.v_proj.weight"));
+        out.push(format!("model.layers.{i}.self_attn.o_proj.weight"));
+        out.push(format!("model.layers.{i}.mlp.gate_proj.weight"));
+        out.push(format!("model.layers.{i}.mlp.up_proj.weight"));
+        out.push(format!("model.layers.{i}.mlp.down_proj.weight"));
+        out.push(format!("model.layers.{i}.post_attention_layernorm.weight"));
+        // Optional: q_norm, k_norm, post_attention_layernorm etc.
+        // We handle optionality by checking what's mapped later.
+    }
+    out
+}
+
+fn map_gguf_qwen3_tensor_name(name: &str) -> Option<(String, bool, Option<usize>)> {
+    match name {
+        "token_embd.weight" => {
+            return Some(("model.embed_tokens.weight".to_string(), true, None))
+        }
+        "output_norm.weight" => return Some(("model.norm.weight".to_string(), false, None)),
+        "output.weight" => return Some(("lm_head.weight".to_string(), true, None)),
+        _ => {}
+    }
+    let rest = name.strip_prefix("blk.")?;
+    let (layer_s, suffix) = rest.split_once('.')?;
+    let layer_idx: usize = layer_s.parse().ok()?;
+    let mapped = match suffix {
+        "attn_norm.weight" => ("input_layernorm.weight", false),
+        "attn_q.weight" => ("self_attn.q_proj.weight", true),
+        "attn_k.weight" => ("self_attn.k_proj.weight", true),
+        "attn_v.weight" => ("self_attn.v_proj.weight", true),
+        "attn_output.weight" => ("self_attn.o_proj.weight", true),
+        "attn_q_norm.weight" => ("self_attn.q_norm.weight", false),
+        "attn_k_norm.weight" => ("self_attn.k_norm.weight", false),
+        "ffn_norm.weight" => ("post_attention_layernorm.weight", false),
+        "ffn_gate.weight" => ("mlp.gate_proj.weight", true),
+        "ffn_up.weight" => ("mlp.up_proj.weight", true),
+        "ffn_down.weight" => ("mlp.down_proj.weight", true),
+        _ => return None,
+    };
+    Some((
+        format!("model.layers.{layer_idx}.{}", mapped.0),
+        mapped.1,
+        Some(layer_idx),
+    ))
+}
+
+
 fn map_gguf_llama_tensor_name(name: &str) -> Option<(String, bool, Option<usize>)> {
     match name {
         "token_embd.weight" => {
@@ -2006,31 +2137,31 @@ fn parse_gguf(bytes: &[u8]) -> Result<ParsedGguf> {
                 meta.quant_version = Some(read_gguf_u64_typed(&mut c, t)?)
             }
             "general.alignment" => meta.alignment = Some(read_gguf_u64_typed(&mut c, t)?),
-            "llama.vocab_size" | "gemma4.vocab_size" => {
+            "llama.vocab_size" | "gemma4.vocab_size" | "qwen3.vocab_size" => {
                 meta.vocab_size = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
-            "llama.embedding_length" | "gemma4.embedding_length" => {
+            "llama.embedding_length" | "gemma4.embedding_length" | "qwen3.embedding_length" => {
                 meta.embedding_length = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
-            "llama.block_count" | "gemma4.block_count" => {
+            "llama.block_count" | "gemma4.block_count" | "qwen3.block_count" => {
                 meta.block_count = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
-            "llama.feed_forward_length" | "gemma4.feed_forward_length" => {
+            "llama.feed_forward_length" | "gemma4.feed_forward_length" | "qwen3.feed_forward_length" => {
                 meta.feed_forward_length = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
-            "llama.attention.head_count" | "gemma4.attention.head_count" => {
+            "llama.attention.head_count" | "gemma4.attention.head_count" | "qwen3.attention.head_count" => {
                 meta.head_count = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
-            "llama.attention.head_count_kv" | "gemma4.attention.head_count_kv" => {
+            "llama.attention.head_count_kv" | "gemma4.attention.head_count_kv" | "qwen3.attention.head_count_kv" => {
                 meta.head_count_kv = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
-            "llama.attention.layer_norm_rms_epsilon" | "gemma4.attention.layer_norm_rms_epsilon" => {
-                meta.rms_norm_eps = Some(read_gguf_f32_typed(&mut c, t)?)
-            }
-            "llama.rope.freq_base" | "gemma4.rope.freq_base" => {
+            "llama.attention.layer_norm_rms_epsilon"
+            | "gemma4.attention.layer_norm_rms_epsilon"
+            | "qwen3.attention.layer_norm_rms_epsilon" => meta.rms_norm_eps = Some(read_gguf_f32_typed(&mut c, t)?),
+            "llama.rope.freq_base" | "gemma4.rope.freq_base" | "qwen3.rope.freq_base" => {
                 meta.rope_freq_base = Some(read_gguf_f32_typed(&mut c, t)?)
             }
-            "llama.context_length" | "gemma4.context_length" => {
+            "llama.context_length" | "gemma4.context_length" | "qwen3.context_length" => {
                 meta.context_length = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
             "tokenizer.ggml.bos_token_id" => {
@@ -2137,6 +2268,14 @@ fn ggml_type_elem_size(t: u32) -> Option<usize> {
 
 fn ggml_tensor_nbytes(t: u32, numel: usize) -> Option<usize> {
     // Legacy Q4_0 uses 32-element blocks.
+    if t == 41 {
+        let qk = 128usize;
+        if numel % qk != 0 {
+            return None;
+        }
+        let nblk = numel / qk;
+        return nblk.checked_mul(18);
+    }
     if t == 2 || t == 3 {
         let qk = 32usize;
         if numel % qk != 0 {
@@ -2202,12 +2341,46 @@ fn write_gguf_tensor_as_f16<W: Write>(
         11 => {
             dequant_q3k_to_f16(src, numel, w)?;
         }
+        41 => {
+            dequant_q1_0_g128_to_f16(src, numel, w)?;
+        }
         other => {
             anyhow::bail!(
                 "unsupported GGUF source tensor type for f16 conversion: {} ({})",
                 other,
                 ggml_type_name(other)
             );
+        }
+    }
+    Ok(())
+}
+
+fn dequant_q1_0_g128_to_f16<W: Write>(src: &[u8], numel: usize, w: &mut W) -> Result<()> {
+    let qk = 128usize;
+    if numel % qk != 0 {
+        anyhow::bail!("Q1_0_g128 tensor numel {} is not divisible by {}", numel, qk);
+    }
+    let bs = 18usize;
+    let nblk = numel / qk;
+    if src.len() != nblk * bs {
+        anyhow::bail!(
+            "Q1_0_g128 source size mismatch: got {} bytes, expected {}",
+            src.len(),
+            nblk * bs
+        );
+    }
+    for bi in 0..nblk {
+        let off = bi * bs;
+        let d_bits = u16::from_le_bytes([src[off], src[off + 1]]);
+        let d = f16::from_bits(d_bits);
+        let neg_d = f16::from_f32(-d.to_f32());
+        let bits_slice = &src[off + 2..off + bs];
+        for &b in bits_slice {
+            for bit_idx in 0..8 {
+                let bit = (b >> bit_idx) & 1;
+                let val = if bit == 1 { d } else { neg_d };
+                w.write_all(&val.to_le_bytes())?;
+            }
         }
     }
     Ok(())

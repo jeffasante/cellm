@@ -274,6 +274,11 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             t_stage.elapsed().as_secs_f64()
         );
     }
+    let added_token_ids = if let Some(tok_path) = args.tokenizer.as_ref() {
+        load_added_token_ids(tok_path)?
+    } else {
+        std::collections::HashMap::new()
+    };
 
     let effective_chat_format = if args.chat {
         match args.chat_format {
@@ -404,7 +409,11 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         .unwrap_or(false);
     for (i, &tok) in prompt_tokens.iter().enumerate() {
         let cand = match &mut runner {
-            Runner::Llama(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
+            Runner::Llama(r) => {
+                r.prefill(&prompt_tokens[..prompt_tokens.len() - 1], 0, &mut page_table, &mut kv_cache)?;
+                let last_tok = *prompt_tokens.last().unwrap();
+                r.step_topk(last_tok, prompt_tokens.len() - 1, &mut page_table, &mut kv_cache, args.top_k)?
+            }
             Runner::Gemma(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
             Runner::Qwen(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
         };
@@ -448,17 +457,35 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         if debug_logits && step == 0 {
             println!("Decode step0 top candidates:");
             for (rank, (id, score)) in cand.iter().take(10).enumerate() {
-                let text = tokenizer
+                let mut text = tokenizer
                     .as_ref()
                     .map(|t| t.decode(&[*id], true).unwrap_or_default())
                     .unwrap_or_default();
+                if text.is_empty() {
+                    for (t, tid) in &added_token_ids {
+                        if *tid == *id {
+                            text = t.clone();
+                            break;
+                        }
+                    }
+                }
+                if text.is_empty() { text = format!("[ID:{}]", id); }
                 println!("  {:2}: id={} score={:.6} text={:?}", rank, id, score, text);
             }
         }
 
         all_ids.push(cur);
         if let Some(tok) = tokenizer.as_ref() {
-            let piece = tok.decode(&[cur], true).unwrap_or_default();
+            let mut piece = tok.decode(&[cur], true).unwrap_or_default();
+            if piece.is_empty() {
+                for (text, id) in &added_token_ids {
+                    if *id == cur {
+                        piece = text.clone();
+                        break;
+                    }
+                }
+            }
+            if piece.is_empty() { piece = format!("[ID:{}]", cur); }
             println!("step {:3}: token={} text={:?}", step, cur, piece);
         } else {
             println!("step {:3}: token={}", step, cur);

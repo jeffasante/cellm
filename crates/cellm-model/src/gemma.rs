@@ -253,8 +253,8 @@ impl GemmaRunner {
                 self.metal_ops = Some(ops);
                 self.metal_strict = true;
                 // Full-metal mode must enable all eligible Gemma ops on GPU.
-                self.use_metal_norm = true;
-                self.use_metal_rope = true;
+                self.use_metal_norm = false;  // DIAG: temporarily disabled
+                self.use_metal_rope = false;  // DIAG: temporarily disabled
                 self.use_metal_logits = true;
                 true
             }
@@ -451,7 +451,7 @@ impl GemmaRunner {
                 self.metal_ops
                     .as_mut()
                     .unwrap()
-                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, "gemma.norm", &mut x_norm)
+                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, add_one, &format!("gemma.layer.{layer}.input_norm"), &mut x_norm)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
             } else {
                 self.rmsnorm_weight(
@@ -493,7 +493,7 @@ impl GemmaRunner {
             }
 
 
-            // ── Gemma per-head Q/K RMSNorm before RoPE ────────────────────────
+            // Gemma per-head Q/K RMSNorm before RoPE
             if use_metal_norm {
                 let qw = self.tensor_f16(
                     &format!("model.layers.{layer}.self_attn.q_norm.weight"))?.to_vec();
@@ -512,7 +512,7 @@ impl GemmaRunner {
                 for hidx in 0..n_heads {
                     let seg = &mut q_slice[hidx * head_dim..(hidx + 1) * head_dim];
                     let inp = seg.to_vec();
-                    ops.rms_norm_f16w(&inp, &qw, cfg.rms_norm_eps, add_one, "gemma.norm", seg)
+                    ops.rms_norm_f16w(&inp, &qw, cfg.rms_norm_eps, add_one, &format!("gemma.layer.{layer}.q_norm"), seg)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                 }
                 if !is_kv_shared_layer {
@@ -520,7 +520,7 @@ impl GemmaRunner {
                     for hidx in 0..n_kv_heads {
                         let seg = &mut k_slice[hidx * kv_head_dim..(hidx + 1) * kv_head_dim];
                         let inp = seg.to_vec();
-                        ops.rms_norm_f16w(&inp, &kw, cfg.rms_norm_eps, add_one, "gemma.norm", seg)
+                        ops.rms_norm_f16w(&inp, &kw, cfg.rms_norm_eps, add_one, &format!("gemma.layer.{layer}.k_norm"), seg)
                             .map_err(|e| CoreError::Backend(e.to_string()))?;
                     }
                 }
@@ -652,7 +652,7 @@ impl GemmaRunner {
                 let add_one = self.rmsnorm_weight_is_offset;
                 let mut x_out = vec![0.0f32; hidden];
                 self.metal_ops.as_ref().unwrap()
-                    .rms_norm_f16w(&attn_proj, &w, cfg.rms_norm_eps, add_one, "gemma.norm", &mut x_out)
+                    .rms_norm_f16w(&attn_proj, &w, cfg.rms_norm_eps, add_one, &format!("gemma.layer.{layer}.post_attn_norm"), &mut x_out)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
                 for i in 0..hidden { x[i] = x_out[i] + x_residual[i]; }
             } else {

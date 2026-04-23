@@ -89,6 +89,21 @@ impl CellmFile {
             tensors.insert(t.name.clone(), t.clone());
         }
 
+        // Pre-warm all weight pages into the OS page cache.
+        // Without this, each weight tensor access during inference causes a page fault
+        // (OS must read the data from the SSD on first access per page).
+        // For a 500MB int8 model this adds ~50-300ms to the FIRST prefill token and
+        // makes decode unpredictable under memory pressure.
+        // Paying the cost once at startup (before inference begins) is far cheaper overall.
+        // Metal avoids this by calling preload_weight() for all tensors; we replicate that
+        // benefit here for the CPU path.
+        {
+            // Read one byte per OS page to force all page faults now.
+            // Apple Silicon uses 16 KB pages; use 4 KB as safe lower bound on all platforms.
+            const PAGE: usize = 4096;
+            let _ = (0..mmap.len()).step_by(PAGE).fold(0u8, |acc, i| acc | mmap[i]);
+        }
+
         // Basic bounds check.
         for t in header.tensors.iter() {
             let start = t.offset_bytes as usize;

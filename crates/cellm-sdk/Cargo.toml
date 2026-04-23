@@ -18,6 +18,7 @@ rand = "0.8"
 ndarray = "0.17"
 bytemuck = { workspace = true }
 half = { workspace = true }
+rayon = { workspace = true }
 tempfile = "3.10"
 
 [lib]

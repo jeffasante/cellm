@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::Parser;
 use cellm_cache::{KVCache, KvEncodingKind, PageTable};
 use cellm_core::KvCacheLayout;
-use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, qwen::QwenRunner, CellmFile};
+use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, qwen::QwenRunner, granite::GraniteRunner, CellmFile};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
@@ -164,6 +164,7 @@ Please convert from the original non-MLX Hugging Face checkpoint (e.g. Qwen/Qwen
         Llama(LlamaRunner),
         Gemma(GemmaRunner),
         Qwen(QwenRunner),
+        Granite(GraniteRunner),
     }
 
     let text_model_type = effective_text_model_type(&header);
@@ -184,9 +185,10 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         "llama" | "smollm3" => Runner::Llama(LlamaRunner::load(&args.model)?),
         t if t.starts_with("gemma") => Runner::Gemma(GemmaRunner::load(&args.model)?),
         t if t.starts_with("qwen") => Runner::Qwen(QwenRunner::load(&args.model)?),
+        "granitemoehybrid" => Runner::Granite(GraniteRunner::load(&args.model)?),
         _ => {
             anyhow::bail!(
-                "infer supports only llama/smollm3/gemma/qwen right now. Detected model_type={:?} effective_text_model_type={:?} architectures={:?} quantization_config={:?}.",
+                "infer supports only llama/smollm3/gemma/qwen/granite right now. Detected model_type={:?} effective_text_model_type={:?} architectures={:?} quantization_config={:?}.",
                 header.model_type,
                 text_model_type,
                 header.source_architectures,
@@ -224,6 +226,13 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                     anyhow::bail!("LLM backend: metal requested, but Llama full-metal init failed");
                 }
             }
+            Runner::Granite(r) => {
+                if r.enable_metal_full_backend() {
+                    println!("LLM backend: metal (Granite full acceleration)");
+                } else {
+                    anyhow::bail!("LLM backend: metal requested, but Granite full-metal init failed");
+                }
+            }
         }
         println!("Startup: metal init {:.2}s", t_stage.elapsed().as_secs_f64());
     }
@@ -233,6 +242,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             Runner::Llama(r) => r.set_max_layers(n),
             Runner::Gemma(r) => r.set_max_layers(n),
             Runner::Qwen(r) => r.set_max_layers(n),
+            Runner::Granite(r) => r.set_max_layers(n),
         }
     }
 
@@ -240,6 +250,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         Runner::Llama(r) => r.config().clone(),
         Runner::Gemma(r) => r.config().clone(),
         Runner::Qwen(r) => r.config().clone(),
+        Runner::Granite(r) => r.config().clone(),
     };
     println!("Model: {:?}", args.model);
     println!(
@@ -255,6 +266,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         Runner::Llama(r) => r.max_layers(),
         Runner::Gemma(r) => r.max_layers(),
         Runner::Qwen(r) => r.max_layers(),
+        Runner::Granite(r) => r.max_layers(),
     };
     println!("Max layers (active): {}", active_layers);
 
@@ -330,8 +342,10 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
     if args.prompt.is_some() {
         if let (Some(tok_path), Some(bos_id)) = (args.tokenizer.as_ref(), file.header.bos_token_id)
         {
-            let wants_bos = tokenizer_config_add_bos(tok_path);
-            if wants_bos && prompt_tokens.first().copied() != Some(bos_id) {
+            // Always ensure a BOS token is present when the model header defines one.
+            // The previous logic added it only when `tokenizer_config_add_bos` returned true,
+            // which omitted the token for some models (e.g., Granite) that still expect it.
+            if prompt_tokens.first().copied() != Some(bos_id) {
                 prompt_tokens.insert(0, bos_id);
             }
         }
@@ -348,6 +362,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         Runner::Llama(_) => cfg.hidden_size / cfg.num_attention_heads,
         Runner::Gemma(_) => infer_gemma_kv_head_dim(&file)?,
         Runner::Qwen(_) => infer_qwen_kv_head_dim(&file)?,
+        Runner::Granite(_) => cfg.hidden_size / cfg.num_attention_heads,
     };
     let total_tokens = seq + args.gen + 8;
     let total_blocks = args.total_blocks.unwrap_or_else(|| {
@@ -410,12 +425,22 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
     for (i, &tok) in prompt_tokens.iter().enumerate() {
         let cand = match &mut runner {
             Runner::Llama(r) => {
+                // Llama uses batch prefill and only needs a single pass through the loop.
+                // Subsequent iterations (i > 0) would re-run the full prefill with
+                // seq = token_count (full context) at every position — non-causal — which
+                // overwrites the KV cache with wrong values and corrupts all decode output.
+                // Skip them: just collect the remaining prompt tokens into all_ids and move on.
+                if i > 0 {
+                    all_ids.push(tok);
+                    continue;
+                }
                 r.prefill(&prompt_tokens[..prompt_tokens.len() - 1], 0, &mut page_table, &mut kv_cache)?;
                 let last_tok = *prompt_tokens.last().unwrap();
                 r.step_topk(last_tok, prompt_tokens.len() - 1, &mut page_table, &mut kv_cache, args.top_k)?
             }
             Runner::Gemma(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
             Runner::Qwen(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
+            Runner::Granite(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
         };
         if debug_logits && i + 1 == prompt_tokens.len() {
             println!("Prefill top candidates:");
@@ -453,6 +478,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             Runner::Llama(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
             Runner::Gemma(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
             Runner::Qwen(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
+            Runner::Granite(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
         };
         if debug_logits && step == 0 {
             println!("Decode step0 top candidates:");
@@ -496,6 +522,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                 Runner::Llama(r) => r.eos_token_id(),
                 Runner::Gemma(r) => r.eos_token_id(),
                 Runner::Qwen(r) => r.eos_token_id(),
+                Runner::Granite(r) => r.eos_token_id(),
             };
             if let Some(eos) = eos {
                 if cur == eos {

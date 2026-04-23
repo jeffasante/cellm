@@ -2,7 +2,7 @@ import Foundation
 
 protocol ModelDataProcessor {
     var label: String { get }
-    func wrapPrompt(_ prompt: String) -> String
+    func wrapPrompt(_ prompt: String, system: String?) -> String
     func isStopPiece(_ piece: String) -> Bool
 }
 
@@ -52,9 +52,10 @@ enum ModelDataProcessorFactory {
 private struct SmolChatProcessor: ModelDataProcessor {
     let label = "smol_chat"
 
-    func wrapPrompt(_ prompt: String) -> String {
+    func wrapPrompt(_ prompt: String, system: String?) -> String {
         let cleanPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        return "<|im_start|>User: \(cleanPrompt)<end_of_utterance>\nAssistant:"
+        let sys = system ?? "You are a helpful assistant."
+        return "<|im_start|>system\n\(sys)<|im_end|>\n<|im_start|>user\n\(cleanPrompt)<|im_end|>\n<|im_start|>assistant\n"
     }
 
     func isStopPiece(_ piece: String) -> Bool {
@@ -67,11 +68,12 @@ private struct ChatMLProcessor: ModelDataProcessor {
     let includeThinkPrefill: Bool
     let label = "chatml"
 
-    func wrapPrompt(_ prompt: String) -> String {
+    func wrapPrompt(_ prompt: String, system: String?) -> String {
         let cleanPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         // Qwen and SmolLM models can heavily hallucinate conversational formatting
         // (like "Human:" and "assistant:") if the system prompt is completely omitted.
-        var s = "<|im_start|>system\nYou are a helpful AI assistant.<|im_end|>\n"
+        let sys = system ?? "You are a helpful AI assistant."
+        var s = "<|im_start|>system\n\(sys)<|im_end|>\n"
         s += "<|im_start|>user\n\(cleanPrompt)<|im_end|>\n<|im_start|>assistant\n"
         if includeThinkPrefill {
             s += "<think>\n\n</think>\n\n"
@@ -88,11 +90,16 @@ private struct ChatMLProcessor: ModelDataProcessor {
 private struct GemmaTurnProcessor: ModelDataProcessor {
     let label = "gemma_turn"
 
-    func wrapPrompt(_ prompt: String) -> String {
+    func wrapPrompt(_ prompt: String, system: String?) -> String {
         let cleanPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let userText = if let sys = system, !sys.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            "\(sys)\n\n\(cleanPrompt)"
+        } else {
+            cleanPrompt
+        }
         // Do not prepend BOS as raw text. If BOS is needed it should be
         // injected as an id-level special token, not literal bytes.
-        return "<start_of_turn>user\n\(cleanPrompt)<end_of_turn>\n<start_of_turn>model\n"
+        return "<start_of_turn>user\n\(userText)<end_of_turn>\n<start_of_turn>model\n"
     }
 
     func isStopPiece(_ piece: String) -> Bool {
@@ -104,9 +111,14 @@ private struct GemmaTurnProcessor: ModelDataProcessor {
 private struct Gemma4TurnProcessor: ModelDataProcessor {
     let label = "gemma4_turn"
 
-    func wrapPrompt(_ prompt: String) -> String {
+    func wrapPrompt(_ prompt: String, system: String?) -> String {
         let cleanPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        return "<|turn>user\n\(cleanPrompt)<turn|>\n<|turn>model\n"
+        let userText = if let sys = system, !sys.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            "\(sys)\n\n\(cleanPrompt)"
+        } else {
+            cleanPrompt
+        }
+        return "<|turn>user\n\(userText)<turn|>\n<|turn>model\n"
     }
 
     func isStopPiece(_ piece: String) -> Bool {
@@ -118,8 +130,11 @@ private struct Gemma4TurnProcessor: ModelDataProcessor {
 private struct PlainProcessor: ModelDataProcessor {
     let label = "plain"
 
-    func wrapPrompt(_ prompt: String) -> String {
+    func wrapPrompt(_ prompt: String, system: String?) -> String {
         let cleanPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let sys = system, !sys.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "System: \(sys)\nUser: \(cleanPrompt)\nAssistant:"
+        }
         return "User: \(cleanPrompt)\nAssistant:"
     }
 

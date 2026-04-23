@@ -13,7 +13,7 @@ use metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
 pub struct LlamaGraphState {
     pub device: Device,
     pub queue: CommandQueue,
-    
+
     // Core Ops
     pub ops: MetalOps,
 
@@ -33,7 +33,11 @@ pub struct LlamaGraphState {
     pub down_buf: Buffer,
     pub logits_buf: Buffer,
     pub bases_buf: Option<Buffer>,
-    pub bases_capacity: usize,
+    pub bases_stride: usize,       // allocated tokens-per-layer (power of two, >= seq)
+    pub bases_last_session: u64,   // session that last wrote to this buffer
+    pub bases_last_seq: usize,     // token_count when buffer was last updated
+    /// When false, use rotate-half RoPE (e.g. SmolLM2); when true, use adjacent-pair RoPE (standard Llama).
+    pub rope_interleaved: bool,
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -44,10 +48,11 @@ impl LlamaGraphState {
         num_kv_heads: usize,
         vocab_size: usize,
         intermediate_size: usize,
+        rope_interleaved: bool,
     ) -> Result<Self, CoreError> {
         let ops = MetalOps::create().map_err(|e| CoreError::Backend(format!("{:?}", e)))?;
         let head_dim = hidden_size / num_heads;
-        
+
         let device = ops.device.clone();
         let queue = ops.queue.clone();
 
@@ -76,7 +81,10 @@ impl LlamaGraphState {
             down_buf: make_buf(hidden_size),
             logits_buf: make_buf(vocab_size),
             bases_buf: None,
-            bases_capacity: 0,
+            bases_stride: 0,
+            bases_last_session: 0,
+            bases_last_seq: 0,
+            rope_interleaved,
         })
     }
 
@@ -136,49 +144,86 @@ impl LlamaGraphState {
             std::ptr::copy_nonoverlapping(x_in.as_ptr(), ptr, hidden);
         }
 
-        // 2. Map the token bases once on CPU for the entire graph to use
-        let cv = kv_cache.view_mut();
-        let seq = page_table.token_count();
+        // 2. Build KV-bases index for the attention kernels.
+        //
+        // Layout: [num_layers][bases_stride] u32, where bases_stride is a fixed
+        // power-of-two capacity.  Layer l's entries live at byte offset
+        // l * bases_stride * 4.  This stable layout allows incremental updates:
+        // on consecutive decode steps for the same session we only need to write
+        // num_layers new u32 values (one per layer) rather than rebuilding the
+        // entire seq × num_layers array.
+        //
+        // Decomposed formula (avoids O(seq × L) page-table lookups):
+        //   base(t, layer) = base(t, 0) + layer * elems_per_block_per_layer
+        let seq        = page_table.token_count(); // pos + 1
         let num_layers = cfg.num_hidden_layers;
-        let total_bases = seq * num_layers;
-        
-        if self.bases_capacity < total_bases {
-            let new_cap = total_bases.max(4096 * num_layers);
-            self.bases_capacity = new_cap;
+        let session_id = page_table.session_id();
+
+        // Grow buffer if the current stride is too small for `seq`.
+        let need_resize = self.bases_stride < seq;
+        if need_resize || self.bases_buf.is_none() {
+            let new_stride = seq.next_power_of_two().max(64);
+            self.bases_stride = new_stride;
             self.bases_buf = Some(self.device.new_buffer(
-                (new_cap * std::mem::size_of::<u32>()) as u64,
+                (new_stride * num_layers * std::mem::size_of::<u32>()) as u64,
                 MTLResourceOptions::StorageModeShared,
             ));
+            self.bases_last_seq = 0; // force full rebuild after resize
         }
 
-        let mut bases_u32 = Vec::with_capacity(total_bases);
-        for layer in 0..num_layers {
-            for tpos in 0..seq {
-                let b = page_table.block_for_token(tpos).map_err(|e| {
-                    CoreError::Backend(format!("graph layout failed: {e}"))
-                })?;
-                let o = page_table.offset_in_block(tpos).map_err(|e| {
-                    CoreError::Backend(format!("graph offset failed: {e}"))
-                })?;
-                bases_u32.push(cv.layout.token_base_elem(b, layer, o)? as u32);
+        // SAFETY: StorageModeShared buffers are CPU-accessible; no GPU work is
+        // in flight (we haven't opened the command buffer yet).
+        let bases_ptr = self.bases_buf.as_ref().unwrap().contents() as *mut u32;
+        let layout    = kv_cache.layout(); // KvCacheLayout is Copy
+        let elems_per_layer = layout.elems_per_block_per_layer() as u32;
+        let stride = self.bases_stride;
+
+        let incremental = !need_resize
+            && self.bases_last_session == session_id
+            && self.bases_last_seq + 1 == seq;
+
+        if incremental {
+            // Fast path: only write the one new token's entry per layer. O(num_layers).
+            let b = page_table.block_for_token(pos)
+                .map_err(|e| CoreError::Backend(format!("graph bases: {e}")))?;
+            let o = page_table.offset_in_block(pos)
+                .map_err(|e| CoreError::Backend(format!("graph bases: {e}")))?;
+            let base_l0 = layout.token_base_elem(b, 0, o)? as u32;
+            for l in 0..num_layers {
+                unsafe {
+                    *bases_ptr.add(l * stride + pos) = base_l0 + l as u32 * elems_per_layer;
+                }
+            }
+        } else {
+            // Full rebuild: O(seq) page-table lookups + O(seq × L) cheap additions.
+            let mut token_bases_l0: Vec<u32> = Vec::with_capacity(seq);
+            for t in 0..seq {
+                let b = page_table.block_for_token(t)
+                    .map_err(|e| CoreError::Backend(format!("graph bases: {e}")))?;
+                let o = page_table.offset_in_block(t)
+                    .map_err(|e| CoreError::Backend(format!("graph bases: {e}")))?;
+                token_bases_l0.push(layout.token_base_elem(b, 0, o)? as u32);
+            }
+            for l in 0..num_layers {
+                let layer_add = l as u32 * elems_per_layer;
+                let row_ptr = unsafe { bases_ptr.add(l * stride) };
+                for t in 0..seq {
+                    unsafe { *row_ptr.add(t) = token_bases_l0[t] + layer_add; }
+                }
             }
         }
 
-        if let Some(bb) = &self.bases_buf {
-            unsafe {
-                let ptr = bb.contents() as *mut std::ffi::c_void as *mut u32;
-                std::ptr::copy_nonoverlapping(bases_u32.as_ptr(), ptr, total_bases);
-            }
-        }
-        
+        self.bases_last_session = session_id;
+        self.bases_last_seq = seq;
+
         let bases_ref = self.bases_buf.as_ref().unwrap();
 
         // 3. Initiate Command Buffer!
         let cb = self.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
 
-        // 4. Fully fuse all execution layers into a single pipeline pass loop
+        // 4. One encoder per layer — ensures memory ordering between layers.
         for layer in 0..num_layers {
+            let enc = cb.new_compute_command_encoder();
             let w_in_norm = self.get_weight(&format!("{prefix}model.layers.{layer}.input_layernorm.weight"), Some(&format!("model.layers.{layer}.input_layernorm.weight")));
             self.ops.encode_rms_norm_f16w(enc, &self.x_buf, w_in_norm, &self.x_norm_buf, hidden, cfg.rms_norm_eps, false);
 
@@ -193,7 +238,7 @@ impl LlamaGraphState {
                     .or_else(|| self.try_get_weight(&format!("{prefix}model.layers.{layer}.self_attn.k_proj.qscale")));
                 let s_v = self.try_get_weight(&format!("{prefix}model.layers.{layer}.self_attn.v_proj.weight.qscale"))
                     .or_else(|| self.try_get_weight(&format!("{prefix}model.layers.{layer}.self_attn.v_proj.qscale")));
-                
+
                 if let (Some(sq), Some(sk), Some(sv)) = (s_q, s_k, s_v) {
                     self.ops.encode_qkv_i8(enc, wq, sq, wk, sk, wv, sv, &self.x_norm_buf, &self.q_buf, &self.k_buf, &self.v_buf, n_heads * head_dim, n_kv_heads * head_dim, hidden);
                 } else {
@@ -203,17 +248,35 @@ impl LlamaGraphState {
                 return Err(CoreError::Backend(format!("missing Q/K/V weights for layer {layer}")));
             }
 
-            self.ops.encode_rope_adj_f32(enc, &self.q_buf, n_heads, head_dim, pos, cfg.rope_theta);
-            self.ops.encode_rope_adj_f32(enc, &self.k_buf, n_kv_heads, head_dim, pos, cfg.rope_theta);
+            if self.rope_interleaved {
+                self.ops.encode_rope_adj_f32(enc, &self.q_buf, n_heads, head_dim, pos, cfg.rope_theta);
+                self.ops.encode_rope_adj_f32(enc, &self.k_buf, n_kv_heads, head_dim, pos, cfg.rope_theta);
+            } else {
+                // rotate-half style (SmolLM2, Mistral, etc.)
+                self.ops.encode_rope_half_f32(enc, &self.q_buf, n_heads, head_dim, head_dim, pos, cfg.rope_theta);
+                self.ops.encode_rope_half_f32(enc, &self.k_buf, n_kv_heads, head_dim, head_dim, pos, cfg.rope_theta);
+            }
 
             let kv_store = kv_cache.storage().as_any().downcast_ref::<cellm_cache::kvcache::MetalKvStorage>()
                 .expect("fused graph requires MetalKvStorage");
-            
+
             let target_base = kv_cache.layout().token_base_elem(block_id, layer, token_off)?;
             kv_store.encode_write_token_f32(enc, target_base, &self.k_buf, &self.v_buf, n_kv_heads * head_dim);
-            
-            let bases_offset = (layer * (pos + 1) * 4) as u64; 
-            kv_store.encode_attention(enc, bases_ref, bases_offset, &self.q_buf, &self.attn_out_buf, 1, n_heads as u32, n_kv_heads as u32, head_dim as u32, None);
+
+            let bases_offset = (layer * stride * 4) as u64;
+            kv_store.encode_attention(
+                enc,
+                bases_ref,
+                bases_offset,
+                &self.q_buf,
+                &self.attn_out_buf,
+                seq as u32,    // fixed: full context length, was wrongly hardcoded to 1
+                n_heads as u32,
+                n_kv_heads as u32,
+                head_dim as u32,
+                None,
+                None,
+            );
 
             let w_o = self.get_weight(&format!("{prefix}model.layers.{layer}.self_attn.o_proj.weight"), Some(&format!("model.layers.{layer}.self_attn.o_proj.weight")));
             if let Some(s_o) = self.try_get_weight(&format!("{prefix}model.layers.{layer}.self_attn.o_proj.weight.qscale"))
@@ -257,8 +320,11 @@ impl LlamaGraphState {
             }
 
             self.ops.encode_add_f32_inplace(enc, &self.x_buf, &self.down_buf, hidden);
+            enc.end_encoding();
         }
 
+        // 5. Final norm + logits in a separate encoder.
+        let enc = cb.new_compute_command_encoder();
         let w_norm = self.get_weight(&format!("{prefix}model.norm.weight"), Some("model.norm.weight"));
         self.ops.encode_rms_norm_f16w(enc, &self.x_buf, w_norm, &self.x_norm_buf, hidden, cfg.rms_norm_eps, false);
 
@@ -275,7 +341,7 @@ impl LlamaGraphState {
             } else {
                 "model.embed_tokens.weight".to_string()
             };
-            
+
             let w_lm = self.weights.get(&lm_weight_name).expect("LM head not found");
             if let Some(s_lm) = self.try_get_weight(&format!("{}.qscale", lm_weight_name)) {
                 self.ops.encode_mv_i8(enc, w_lm, s_lm, &self.x_norm_buf, &self.logits_buf, cfg.vocab_size, hidden);
@@ -299,7 +365,7 @@ impl LlamaGraphState {
         unsafe {
             let ptr = self.logits_buf.contents() as *const f32;
             std::ptr::copy_nonoverlapping(ptr, logits.as_mut_ptr(), cfg.vocab_size);
-            
+
             let x_ptr = self.x_buf.contents() as *const f32;
             std::ptr::copy_nonoverlapping(x_ptr, x_check.as_mut_ptr(), hidden);
 
@@ -313,7 +379,7 @@ impl LlamaGraphState {
             if v.is_nan() { nan_count += 1; }
             else if v.is_infinite() { inf_count += 1; }
         }
-        
+
         if nan_count > 0 || inf_count > 0 {
             return Err(CoreError::Backend(format!("LlamaGraphState: divergence detected at pos {pos} (NaNs={nan_count}, Infs={inf_count})")));
         }

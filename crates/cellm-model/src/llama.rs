@@ -134,6 +134,7 @@ impl LlamaRunner {
                     self.cfg.num_key_value_heads,
                     self.cfg.vocab_size,
                     self.cfg.intermediate_size,
+                    self.rope_interleaved,
                 );
                 match gs_res {
                     Ok(mut gs) => {
@@ -418,7 +419,9 @@ impl LlamaRunner {
                 &q,
                 n_heads,
                 n_kv_heads,
-                head_dim, None,
+                head_dim,
+                None, // attn_scale
+                None, // soft_cap
                 &mut attn_out,
             )?;
 

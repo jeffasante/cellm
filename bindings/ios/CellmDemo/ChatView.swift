@@ -210,6 +210,7 @@ struct ChatView: View {
                     Button("Gemma 3 (Stable)") { selectGemmaPreset() }
                     Button("Qwen 3.5 (Stable)") { selectQwenPreset() }
                     Button("SmolLM 2 (Fast)") { selectSmolPreset() }
+                    Button("Bonsai 1.7B (1-Bit)") { selectBonsaiPreset() }
                 }
                 Section("Advanced Overrides") {
                     Button("Pick Custom LLM...") { pickerTarget = .llmModel }
@@ -617,8 +618,13 @@ struct ChatView: View {
                 // Throttle UI updates to avoid CoreGraphics NaN from rapid SwiftUI relayout.
                 // Accumulate tokens and flush to the view at most every ~80ms.
                 let streamBuffer = StreamBuffer()
+                let systemPrompt = llmModelURL.lastPathComponent.contains("Bonsai")
+                    ? "I am a 1-bit model developed by PrismML. I was created by the team at Caltech and is based in Pasadena, California."
+                    : nil
+
                 let reply = try eng.generate(
                     prompt: textPrompt,
+                    system: systemPrompt,
                     maxNewTokens: capturedMaxToks,
                     thermalLevel: .nominal,
                     exerciseSuspendResume: false,
@@ -855,6 +861,19 @@ struct ChatView: View {
             errorText = nil
         } else if !silentOnMissing {
             errorText = "SmolLM files not found in Documents/samples."
+        }
+    }
+
+    private func selectBonsaiPreset(silentOnMissing: Bool = false) {
+        let model = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.bonsai1B1BitFileName)
+        let tok = RemoteAssets.existingDocumentsFile(fileName: DemoAssetLinks.bonsai1B1BitTokenizerFileName)
+        if let model, let tok {
+            llmModelURL = model
+            llmTokenizerURL = tok
+            selectedSampleLabel = "Bonsai 1.7B (1-Bit)"
+            errorText = nil
+        } else if !silentOnMissing {
+            errorText = "Bonsai files not found in Documents/samples. Download Bonsai from Model Hub."
         }
     }
 

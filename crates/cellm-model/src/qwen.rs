@@ -344,7 +344,6 @@ impl QwenRunner {
         let mut gate = vec![0.0f32; cfg.intermediate_size];
         let mut up = vec![0.0f32; cfg.intermediate_size];
         let mut down = vec![0.0f32; hidden];
-        let mut gather_bases = Vec::new();
 
         let use_metal_norm = self.metal_ops.is_some();
         let use_metal_rope = self.metal_ops.is_some() && !self.disable_full_attention;
@@ -379,6 +378,31 @@ impl QwenRunner {
                     self.add_projection_bias_if_present(&k_name, &mut k)?;
                     self.add_projection_bias_if_present(&v_name, &mut v)?;
 
+                    // QK Norm (Head-tied)
+                    let mut q_norm_w = Vec::<f32>::new();
+                    let mut k_norm_w = Vec::<f32>::new();
+                    let q_norm_w_name = format!("{prefix}model.layers.{layer}.self_attn.q_norm.weight");
+                    let k_norm_w_name = format!("{prefix}model.layers.{layer}.self_attn.k_norm.weight");
+                    let has_qn = has_tensor_file(&self.file, &q_norm_w_name);
+                    let has_kn = has_tensor_file(&self.file, &k_norm_w_name);
+                    if has_qn {
+                        q_norm_w.resize(head_dim, 0.0);
+                        self.rmsnorm_weight(&q_norm_w_name, &mut q_norm_w)?;
+                        for hidx in 0..n_heads {
+                            let start = hidx * head_dim;
+                            let end = start + head_dim;
+                            rms_norm_inplace_segment(&mut q[start..end], &q_norm_w, cfg.rms_norm_eps);
+                        }
+                    }
+                    if has_kn {
+                        k_norm_w.resize(head_dim, 0.0);
+                        self.rmsnorm_weight(&k_norm_w_name, &mut k_norm_w)?;
+                        for hidx in 0..n_kv_heads {
+                            let start = hidx * head_dim;
+                            let end = start + head_dim;
+                            rms_norm_inplace_segment(&mut k[start..end], &k_norm_w, cfg.rms_norm_eps);
+                        }
+                    }
 
                     if rotary_dim > 0 {
                         if use_metal_rope {
@@ -398,13 +422,22 @@ impl QwenRunner {
 
                     let seq = page_table.token_count();
                     let cr = kv_cache.view();
-                    gather_bases.clear();
+                    let mut gather_bases = Vec::with_capacity(seq);
                     for tpos in 0..seq {
                         let b = page_table.block_for_token(tpos).map_err(|e| CoreError::Backend(e.to_string()))?;
                         let o = page_table.offset_in_block(tpos).map_err(|e| CoreError::Backend(e.to_string()))?;
                         gather_bases.push(cr.layout.token_base_elem(b, layer, o)?);
                     }
-                    cr.attention_single_token_gqa_from_bases(&gather_bases, &q, n_heads, n_kv_heads, head_dim, None, &mut attn_out)?;
+                    cr.attention_single_token_gqa_from_bases(
+                        &gather_bases, 
+                        &q, 
+                        n_heads, 
+                        n_kv_heads, 
+                        head_dim, 
+                        None, // attn_scale
+                        None, // soft_cap
+                        &mut attn_out
+                    )?;
 
                     self.linear_f16_out_in(&attn_out, &format!("{prefix}model.layers.{layer}.self_attn.o_proj.weight"), hidden, hidden, &mut attn_proj)?;
                     self.add_projection_bias_if_present(&format!("{prefix}model.layers.{layer}.self_attn.o_proj.weight"), &mut attn_proj)?;
@@ -489,7 +522,22 @@ impl QwenRunner {
                 _ => return Err(CoreError::Backend(format!("unsupported lm_head dtype: {dtype}").into())),
             }
         } else {
-            for vid in 0..vocab { logits[vid] = self.dot_row(weight_name, vid, hidden, &x_final)?; }
+            // CPU path: use the parallel matmul kernels instead of the serial dot_row loop.
+            // The old loop called dot_row() once per vocab entry (151936× for Qwen) with a
+            // HashMap lookup + scalar inner loop each time — 200–400ms per decode token.
+            let dtype = self.file.tensor_index(weight_name).unwrap().dtype.clone();
+            match dtype.as_str() {
+                "f16" => {
+                    cellm_kernels::cpu_kernels::matmul_f16_f32(self.tensor_f16(weight_name)?, vocab, hidden, &x_final, &mut logits);
+                }
+                "i8" => {
+                    cellm_kernels::cpu_kernels::matmul_i8_f32(self.tensor_i8(weight_name)?, self.tensor_f16(&format!("{weight_name}.qscale"))?, vocab, hidden, &x_final, &mut logits);
+                }
+                _ => {
+                    // Fallback for exotic dtypes (q1_0_g128 etc.)
+                    for vid in 0..vocab { logits[vid] = self.dot_row(weight_name, vid, hidden, &x_final)?; }
+                }
+            }
         }
 
         Ok(logits)
@@ -881,18 +929,33 @@ impl QwenGraphState {
             }
         }
         let bases_buf = self.device.new_buffer_with_data(all_bases.as_ptr() as *const _, (all_bases.len() * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
+        // Upload all token embeddings to GPU once so CBs can blit without CPU involvement.
+        let x_all_buf = self.device.new_buffer_with_data(
+            x_all.as_ptr() as *const _,
+            (x_all.len() * 4) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        // Encode all per-token CBs without waiting between them. The Metal queue is FIFO
+        // so the GPU executes them serially and correctly. The CPU can encode CB[i+1]
+        // while the GPU is still executing CB[i], eliminating 151 round-trip stalls.
+        let mut last_cb = None;
         for i in 0..num_tokens {
             let cb = self.queue.new_command_buffer();
             let pos = start_pos + i;
             let bid = page_table.block_for_token(pos).map_err(|e| CoreError::Backend(e.to_string()))?;
             let off = page_table.offset_in_block(pos).map_err(|e| CoreError::Backend(e.to_string()))?;
-            unsafe { std::ptr::copy_nonoverlapping(x_all.as_ptr().add(i * h), self.x_buf.contents() as *mut f32, h); }
+            // GPU-side blit: copy embedding i from x_all_buf into x_buf (no CPU write, no sync needed).
+            let blit = cb.new_blit_command_encoder();
+            blit.copy_from_buffer(&x_all_buf, (i * h * 4) as u64, &self.x_buf, 0, (h * 4) as u64);
+            blit.end_encoding();
             for l in 0..cfg.num_hidden_layers {
                 self.encode_single_layer_efficient(cb, l, cfg, prefix, kv_cache, start_pos + i + 1, max_total, off, bid as u32, rotary, offset, &bases_buf);
             }
             cb.commit();
-            cb.wait_until_completed();
+            last_cb = Some(cb);
         }
+        // Single sync point after all tokens are submitted.
+        if let Some(cb) = last_cb { cb.wait_until_completed(); }
         self.queue.new_command_buffer().commit(); // sync
         Ok(())
     }
@@ -926,14 +989,18 @@ impl QwenGraphState {
             self.ops.encode_qkv_f16_bias(enc, wq, wk, wv, &self.x_norm_buf, bq, bk, bv, &self.q_buf, &self.k_buf, &self.v_buf, h, nkv * hd, h); 
         }
 
-        // QK Norm
+        // QK Norm (Head-tied)
         let q_norm_w = self.try_get_w_cached(&format!("{pref}.self_attn.q_norm.weight"));
         let k_norm_w = self.try_get_w_cached(&format!("{pref}.self_attn.k_norm.weight"));
         if let Some(qw) = q_norm_w {
-            self.ops.encode_rms_norm_f16w(enc, &self.q_buf, qw, &self.q_buf, h, cfg.rms_norm_eps, offset);
+            for hidx in 0..nh {
+                self.ops.encode_rms_norm_f16w_at(enc, &self.q_buf, (hidx * hd * 4) as u64, qw, &self.q_buf, (hidx * hd * 4) as u64, hd, cfg.rms_norm_eps, offset);
+            }
         }
         if let Some(kw) = k_norm_w {
-            self.ops.encode_rms_norm_f16w(enc, &self.k_buf, kw, &self.k_buf, nkv * hd, cfg.rms_norm_eps, offset);
+            for hidx in 0..nkv {
+                self.ops.encode_rms_norm_f16w_at(enc, &self.k_buf, (hidx * hd * 4) as u64, kw, &self.k_buf, (hidx * hd * 4) as u64, hd, cfg.rms_norm_eps, offset);
+            }
         }
 
         let km = kv_cache.storage().as_any().downcast_ref::<cellm_cache::kvcache::MetalKvStorage>().unwrap();
@@ -941,7 +1008,19 @@ impl QwenGraphState {
         self.ops.encode_rope_half_f32(enc, &self.k_buf, nkv, hd, (hd as f32 * rotary) as usize, total_tokens_now - 1, cfg.rope_theta);
         km.encode_write_token_f32(enc, kv_cache.layout().token_base_elem(bid, l, off).unwrap(), &self.k_buf, &self.v_buf, nkv * hd);
 
-        km.encode_attention(enc, bases_buf, (l * stride * 4) as u64, &self.q_buf, &self.attn_out_buf, total_tokens_now as u32, nh as u32, nkv as u32, hd as u32, None);
+        km.encode_attention(
+            enc, 
+            bases_buf, 
+            (l * stride * 4) as u64, 
+            &self.q_buf, 
+            &self.attn_out_buf, 
+            total_tokens_now as u32, 
+            nh as u32, 
+            nkv as u32, 
+            hd as u32, 
+            None, // attn_scale
+            None  // soft_cap
+        );
 
         let wo = self.get_w_cached(&format!("{pref}.self_attn.o_proj.weight"));
         let bo = self.try_get_w_cached(&format!("{pref}.self_attn.o_proj.bias"));
@@ -1050,6 +1129,16 @@ fn infer_qwen_layer_kinds_and_linear_spec(
 fn qwen_rmsnorm_is_offset(header: &crate::CellmHeader) -> bool {
     let check = |s: &str| s.contains("gemma");
     header.model_type.contains("gemma") || header.source_model_type.as_deref().is_some_and(check)
+}
+
+fn rms_norm_inplace_segment(x: &mut [f32], weight: &[f32], eps: f32) {
+    let n = x.len();
+    if n == 0 { return; }
+    let mut mean_sq = 0.0f32;
+    for &v in x.iter() { mean_sq += v * v; }
+    mean_sq /= n as f32;
+    let inv_rms = 1.0f32 / (mean_sq + eps).sqrt();
+    for i in 0..n { x[i] = x[i] * inv_rms * weight[i]; }
 }
 
 fn add_one_inplace(x: &mut [f32]) { for v in x { *v += 1.0; } }

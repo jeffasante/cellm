@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use rayon::prelude::*;
 
 use anyhow::{Context, Result};
 use bytemuck::cast_slice;
@@ -160,7 +161,7 @@ pub fn describe_image_with_cellm_timed(
         processor_hints.image_seq_len.unwrap_or(280),
     )?;
     let num_images = image_input.pixel_values.shape()[1];
-    let (image_features, image_seq_len, patch_ms, encoder_ms, encoder_layer_ms) =
+    let (mut image_features, image_seq_len, patch_ms, encoder_ms, encoder_layer_ms) =
         run_vision_cellm(
             &file,
             &image_input,
@@ -210,7 +211,10 @@ pub fn describe_image_with_cellm_timed(
                 .and_then(|v| v.as_i64())
         })
         .unwrap_or(2);
-    let end_of_utt = tok.token_to_id("<end_of_utterance>").map(|v| v as i64);
+    // For Gemma4, <turn|> is end-of-turn and also effectively EOS for generation.
+    let end_of_utt = tok.token_to_id("<turn|>")
+        .map(|v| v as i64)
+        .or_else(|| tok.token_to_id("<end_of_utterance>").map(|v| v as i64));
     let banned_token_ids = banned_token_ids(&tok);
 
     if let Some(expected) = processor_hints.image_seq_len {
@@ -284,6 +288,152 @@ pub fn describe_image_with_cellm_timed(
     Ok((text.trim().to_string(), timing))
 }
 
+/// Transcribe / describe audio using the Gemma 4 audio tower.
+pub fn describe_audio_with_cellm_timed(
+    model_path: &Path,
+    audio_bytes: &[u8],
+    user_prompt: &str,
+    cfg: VlmRunConfig,
+) -> Result<(String, VlmTimingBreakdown)> {
+    let total_start = Instant::now();
+    let tokenizer_path = resolve_tokenizer_path(model_path)?;
+    let tok = load_tokenizer(&tokenizer_path)?;
+    let file = CellmFile::load(model_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if file.tensor_index("model.audio_tower.output_proj.weight").is_none() {
+        anyhow::bail!("Model does not have an audio tower");
+    }
+
+    // Resolve audio token IDs from the tokenizer
+    let audio_token_id: i64 = tok
+        .token_to_id("<|audio|>")
+        .map(|id| id as i64)
+        .unwrap_or(258881);
+    let boa_str = if tok.token_to_id("<|audio>").is_some() { "<|audio>" } else { "" };
+    let eoa_str = if tok.token_to_id("<audio|>").is_some() { "<audio|>" } else { "" };
+
+    // Parse WAV → PCM i16 samples
+    let t_mel = Instant::now();
+    let (pcm_i16, sample_rate) = parse_wav_pcm16(audio_bytes)?;
+    if sample_rate != 16000 {
+        anyhow::bail!("Audio must be 16 kHz, got {} Hz. Resample before calling.", sample_rate);
+    }
+
+    // Compute mel spectrogram: [T_frames, 128]
+    let (mel_features, t_frames) = compute_mel_spectrogram(
+        &pcm_i16,
+        320,     // frame_length
+        160,     // hop_length
+        512,     // fft_length
+        128,     // num_mel_bins
+        0.0f64,  // min_frequency
+        8000.0f64, // max_frequency
+        0.001f32,  // mel_floor
+    );
+    let mel_ms = t_mel.elapsed().as_secs_f64() * 1000.0;
+
+    // Run the audio conformer encoder
+    let t_enc = Instant::now();
+    let audio_features = run_audio_cellm_gemma4(&file, &mel_features, t_frames, 128)?;
+    let encoder_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
+    let n_audio_tokens = audio_features.shape()[0];
+
+    if std::env::var("CELLM_VLM_DEBUG_FEATURE_STATS").is_ok() {
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut sum = 0.0f64;
+        let mut sumsq = 0.0f64;
+        let n = audio_features.len();
+        for &v in audio_features.iter() {
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+            sum += v as f64;
+            sumsq += (v as f64) * (v as f64);
+        }
+        let mean = sum / n as f64;
+        let std = ((sumsq / n as f64) - mean * mean).max(0.0).sqrt();
+        eprintln!(
+            "CELLM_AUDIO_FEATURE_STATS tokens={} cols={} min={:.6} max={:.6} mean={:.6} std={:.6}",
+            n_audio_tokens, audio_features.shape()[1], min_v, max_v, mean, std
+        );
+    }
+
+    // Build prompt
+    // Gemma4 chat template for audio: <|turn>user\n{audio_tokens}{user_text}<turn|>\n<|turn>model\n
+    // (no extra newlines around audio, unlike image which uses \n\n<|image|>\n\n)
+    let audio_token_text = tok
+        .id_to_token(audio_token_id as u32)
+        .unwrap_or_else(|| "<|audio|>".to_string());
+    let audio_placeholders = audio_token_text.repeat(n_audio_tokens);
+    let audio_block = format!("{boa_str}{audio_placeholders}{eoa_str}");
+    let use_gemma4_turn = tok.token_to_id("<|turn>").is_some() && tok.token_to_id("<turn|>").is_some();
+    let prompt = if use_gemma4_turn {
+        // Template: bos + <|turn>user\n + audio_tokens + user_text + <turn|>\n + <|turn>model\n
+        format!("<bos><|turn>user\n{audio_block}{user_prompt}<turn|>\n<|turn>model\n")
+    } else {
+        build_single_turn_prompt(user_prompt, &audio_block, false)
+    };
+
+    let enc_ids = encode_with_explicit_added_tokens(&tok, &tokenizer_path, &prompt)?;
+    let input_ids: Vec<i64> = enc_ids.into_iter().map(|x| x as i64).collect();
+
+    if std::env::var("CELLM_AUDIO_DEBUG").is_ok() {
+        let n_audio_in_ids = input_ids.iter().filter(|&&t| t == audio_token_id).count();
+        eprintln!(
+            "AUDIO_DECODE_DEBUG prompt={:?} n_input_ids={} audio_token_id={} n_audio_in_ids={} n_audio_features={}",
+            &prompt[..prompt.len().min(200)],
+            input_ids.len(), audio_token_id, n_audio_in_ids, n_audio_tokens
+        );
+        eprintln!("  first 10 input_ids: {:?}", &input_ids[..input_ids.len().min(10)]);
+        eprintln!("  last 10 input_ids: {:?}", &input_ids[input_ids.len().saturating_sub(10)..]);
+    }
+
+    let eos_token_id = file
+        .header
+        .eos_token_id
+        .map(|v| v as i64)
+        .or_else(|| {
+            file.header
+                .source_text_config
+                .as_ref()
+                .and_then(|v| v.get("eos_token_id"))
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or(2);
+    // For Gemma4, <turn|> = end-of-turn is also effectively EOS for generation.
+    let end_of_utt = tok.token_to_id("<turn|>")
+        .map(|v| v as i64)
+        .or_else(|| tok.token_to_id("<end_of_utterance>").map(|v| v as i64));
+    let banned = banned_token_ids(&tok);
+
+    let (generated, decode_ms) = run_decode_cellm(
+        model_path,
+        audio_token_id,
+        eos_token_id,
+        end_of_utt,
+        cfg,
+        input_ids,
+        &audio_features,
+        false, // never prefix; always bidir
+        &banned,
+    )?;
+    let text = tok
+        .decode(
+            &generated.into_iter().map(|t| t as u32).collect::<Vec<u32>>(),
+            true,
+        )
+        .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?;
+
+    let timing = VlmTimingBreakdown {
+        patch_ms: mel_ms,
+        encoder_ms,
+        decode_ms,
+        total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+        encoder_layer_ms: vec![],
+    };
+    Ok((text.trim().to_string(), timing))
+}
+
 fn run_decode_cellm(
     model_path: &Path,
     image_token_id: i64,
@@ -312,6 +462,16 @@ fn run_decode_cellm(
         }
         other => anyhow::bail!("unsupported text model for VLM decode: {other}"),
     };
+
+    // Enable Metal acceleration for the text decode path when requested.
+    // Without this the decode runner uses CPU-only math, which makes
+    // multimodal inference with 100+ audio/image tokens impractically slow.
+    if cfg.backend == BackendKind::Metal {
+        match &mut runner {
+            DecodeRunner::Llama(r) => { r.enable_metal_full_backend(); }
+            DecodeRunner::Gemma(r) => { r.enable_metal_full_backend(); }
+        }
+    }
 
     let (hidden, num_layers, num_kv_heads, num_heads) = match &runner {
         DecodeRunner::Llama(r) => {
@@ -350,7 +510,13 @@ fn run_decode_cellm(
         num_kv_heads,
         head_dim,
     };
-    let mut kv_cache = KVCache::new(layout).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let kv_storage_kind = if cfg.backend == BackendKind::Metal {
+        cellm_cache::KvStorageKind::Metal
+    } else {
+        cellm_cache::KvStorageKind::Cpu
+    };
+    let mut kv_cache = KVCache::new_with_kind(layout, kv_storage_kind)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut page_table =
         PageTable::new(1, cfg.tokens_per_block).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -423,7 +589,7 @@ fn run_decode_cellm(
                         .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
                         .map_err(|e| anyhow::anyhow!("{e}"))?,
                     DecodeRunner::Gemma(r) => r
-                        .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                        .step_topk_from_hidden_with_token(tok_id as u32, &x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
                         .map_err(|e| anyhow::anyhow!("{e}"))?,
                 };
                 next = sample_from_candidates(
@@ -510,7 +676,7 @@ fn run_decode_cellm(
                         .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
                         .map_err(|e| anyhow::anyhow!("{e}"))?,
                     DecodeRunner::Gemma(r) => r
-                        .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                        .step_topk_from_hidden_with_token(tok_id as u32, &x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
                         .map_err(|e| anyhow::anyhow!("{e}"))?,
                 };
                 next = sample_from_candidates(
@@ -541,7 +707,7 @@ fn run_decode_cellm(
                         .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
                         .map_err(|e| anyhow::anyhow!("{e}"))?,
                     DecodeRunner::Gemma(r) => r
-                        .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                        .step_topk_from_hidden_with_token(tok_id as u32, &x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
                         .map_err(|e| anyhow::anyhow!("{e}"))?,
                 };
                 next = sample_from_candidates(
@@ -584,9 +750,15 @@ fn run_decode_cellm(
                 DecodeRunner::Llama(r) => r
                     .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
                     .map_err(|e| anyhow::anyhow!("{e}"))?,
-                DecodeRunner::Gemma(r) => r
-                    .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
-                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                DecodeRunner::Gemma(r) => {
+                    let is_img = !prefix_image_features && tok_id == image_token_id;
+                    if is_img {
+                        r.step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                    } else {
+                        r.step_topk_from_hidden_with_token(tok_id as u32, &x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                    }
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                },
             };
             next = sample_from_candidates(
                 &cand,
@@ -607,11 +779,14 @@ fn run_decode_cellm(
         );
     }
 
+    let debug_gen = std::env::var("CELLM_GEN_DEBUG").is_ok();
+    if debug_gen { eprintln!("GEN_DEBUG: first token (from prefill) = {}", next); }
     let mut generated = Vec::new();
     let mut same_token_run = 0usize;
     let mut last_token: Option<i64> = None;
     for step in 0..cfg.max_new_tokens {
         generated.push(next);
+        if debug_gen { eprintln!("GEN_DEBUG[{}] = {}", step, next); }
         if Some(next) == last_token {
             same_token_run += 1;
         } else {
@@ -643,7 +818,7 @@ fn run_decode_cellm(
                 .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
                 .map_err(|e| anyhow::anyhow!("{e}"))?,
             DecodeRunner::Gemma(r) => r
-                .step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
+                .step_topk_from_hidden_with_token(next as u32, &x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1))
                 .map_err(|e| anyhow::anyhow!("{e}"))?,
         };
         next = sample_from_candidates(
@@ -1588,10 +1763,874 @@ fn infer_gemma4_vision_num_layers(file: &CellmFile) -> usize {
     layers
 }
 
+//  Audio encoder
+
+/// Parse a WAV file, returning (i16_samples, sample_rate).
+/// Handles PCM-16 mono/stereo; stereo is mixed to mono.
+fn parse_wav_pcm16(bytes: &[u8]) -> Result<(Vec<i16>, u32)> {
+    if bytes.len() < 44 {
+        anyhow::bail!("WAV file too short");
+    }
+    if &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        anyhow::bail!("Not a valid RIFF/WAVE file");
+    }
+    let mut pos = 12usize;
+    let mut sample_rate = 0u32;
+    let mut channels = 0u16;
+    let mut bits_per_sample = 0u16;
+    let mut data_start = 0usize;
+    let mut data_len = 0usize;
+    while pos + 8 <= bytes.len() {
+        let tag = &bytes[pos..pos + 4];
+        let chunk_len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        pos += 8;
+        if tag == b"fmt " {
+            let audio_fmt = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+            if audio_fmt != 1 {
+                anyhow::bail!("Only PCM (format=1) WAV supported, got {audio_fmt}");
+            }
+            channels = u16::from_le_bytes(bytes[pos + 2..pos + 4].try_into().unwrap());
+            sample_rate = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
+            bits_per_sample = u16::from_le_bytes(bytes[pos + 14..pos + 16].try_into().unwrap());
+        } else if tag == b"data" {
+            data_start = pos;
+            data_len = chunk_len;
+        }
+        pos += chunk_len;
+    }
+    if sample_rate == 0 || data_start == 0 {
+        anyhow::bail!("Invalid WAV: missing fmt or data chunk");
+    }
+    if bits_per_sample != 16 {
+        anyhow::bail!("Only 16-bit PCM supported, got {bits_per_sample}-bit");
+    }
+    let end = (data_start + data_len).min(bytes.len());
+    let raw = &bytes[data_start..end];
+    let n_samples = raw.len() / (2 * channels as usize);
+    let mut mono = Vec::with_capacity(n_samples);
+    for s in 0..n_samples {
+        let base = s * channels as usize * 2;
+        if channels == 1 {
+            mono.push(i16::from_le_bytes(raw[base..base + 2].try_into().unwrap()));
+        } else {
+            // Mix stereo to mono by averaging
+            let l = i16::from_le_bytes(raw[base..base + 2].try_into().unwrap()) as i32;
+            let r = i16::from_le_bytes(raw[base + 2..base + 4].try_into().unwrap()) as i32;
+            mono.push(((l + r) / 2) as i16);
+        }
+    }
+    Ok((mono, sample_rate))
+}
+
+/// Build the HTK mel filterbank matrix [fft_bins, num_mels] using linear frequency in FFT domain
+/// and the HTK mel scale.
+fn build_mel_filterbank(
+    fft_length: usize,
+    num_mels: usize,
+    sample_rate: f64,
+    min_freq: f64,
+    max_freq: f64,
+) -> Vec<Vec<f32>> {
+    let fft_bins = fft_length / 2 + 1;
+    // HTK mel scale
+    let hz_to_mel = |hz: f64| -> f64 { 2595.0 * (1.0 + hz / 700.0).log10() };
+    let mel_to_hz = |m: f64| -> f64 { 700.0 * (10.0_f64.powf(m / 2595.0) - 1.0) };
+
+    let mel_min = hz_to_mel(min_freq);
+    let mel_max = hz_to_mel(max_freq);
+
+    // num_mels + 2 linearly-spaced points in mel space
+    let n_points = num_mels + 2;
+    let mel_points: Vec<f64> = (0..n_points)
+        .map(|i| mel_min + (mel_max - mel_min) * i as f64 / (n_points - 1) as f64)
+        .collect();
+    let hz_points: Vec<f64> = mel_points.iter().map(|&m| mel_to_hz(m)).collect();
+
+    // Convert to FFT bin indices
+    let bin_pts: Vec<f64> = hz_points
+        .iter()
+        .map(|&hz| hz / (sample_rate / 2.0) * (fft_bins - 1) as f64)
+        .collect();
+
+    let mut filters = vec![vec![0.0f32; num_mels]; fft_bins];
+    for m in 0..num_mels {
+        let left = bin_pts[m];
+        let center = bin_pts[m + 1];
+        let right = bin_pts[m + 2];
+        for f in 0..fft_bins {
+            let fv = f as f64;
+            let val = if fv >= left && fv < center {
+                (fv - left) / (center - left)
+            } else if fv >= center && fv <= right {
+                (right - fv) / (right - center)
+            } else {
+                0.0
+            };
+            if val > 0.0 {
+                filters[f][m] = val as f32;
+            }
+        }
+    }
+    filters
+}
+
+/// Compute mel spectrogram from PCM i16 samples.
+/// Returns (features [T, num_mels], num_frames).
+fn compute_mel_spectrogram(
+    samples: &[i16],
+    frame_length: usize,
+    hop_length: usize,
+    fft_length: usize,
+    num_mels: usize,
+    min_freq: f64,
+    max_freq: f64,
+    mel_floor: f32,
+) -> (Vec<f32>, usize) {
+    // Normalise i16 → f32 in [-1, 1]
+    let signal: Vec<f64> = samples.iter().map(|&s| s as f64 / 32768.0).collect();
+
+    // Hann window (periodic) — window_function in HF uses periodic Hann: w[n] = 0.5 - 0.5*cos(2π*n/N)
+    let window: Vec<f64> = (0..frame_length)
+        .map(|n| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * n as f64 / frame_length as f64).cos())
+        .collect();
+
+    // Semicausal padding: prepend frame_length//2 zeros
+    let pad_left = frame_length / 2;
+    let mut padded = vec![0.0f64; pad_left + signal.len()];
+    padded[pad_left..].copy_from_slice(&signal);
+
+    // The feature extractor uses frame_size = frame_length + 1 for unfold, then takes [:-1]
+    // This effectively gives frame_length samples per frame
+    let frame_size_unfold = frame_length + 1;
+    let num_frames = if padded.len() >= frame_size_unfold {
+        (padded.len() - frame_size_unfold) / hop_length + 1
+    } else {
+        0
+    };
+
+    let mel_filters = build_mel_filterbank(fft_length, num_mels, 16000.0, min_freq, max_freq);
+    let fft_bins = fft_length / 2 + 1;
+
+    let mut features = vec![0.0f32; num_frames * num_mels];
+
+    for frame_idx in 0..num_frames {
+        let start = frame_idx * hop_length;
+        // Take frame_size_unfold samples, apply pre-emphasis=0 (just take first frame_length)
+        let frame: Vec<f64> = (0..frame_length)
+            .map(|i| padded.get(start + i).copied().unwrap_or(0.0) * window[i])
+            .collect();
+
+        // Real FFT via DFT (power of 2 length)
+        let mut re = vec![0.0f64; fft_length];
+        let mut im = vec![0.0f64; fft_length];
+        for (i, &v) in frame.iter().enumerate().take(fft_length) {
+            re[i] = v;
+        }
+        // Simple DFT for small sizes; use FFT for real use
+        fft_real_inplace(&mut re, &mut im, fft_length);
+
+        let row = &mut features[frame_idx * num_mels..(frame_idx + 1) * num_mels];
+        for m in 0..num_mels {
+            let mut mel_val = 0.0f32;
+            for f in 0..fft_bins {
+                let mag = (re[f] * re[f] + im[f] * im[f]).sqrt() as f32;
+                mel_val += mag * mel_filters[f][m];
+            }
+            row[m] = (mel_val + mel_floor).ln();
+        }
+    }
+    (features, num_frames)
+}
+
+/// Radix-2 Cooley-Tukey FFT in-place (power-of-2 length).
+fn fft_real_inplace(re: &mut [f64], im: &mut [f64], n: usize) {
+    // Bit-reversal permutation
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    // Cooley-Tukey butterfly
+    let mut len = 2usize;
+    while len <= n {
+        let ang = -2.0 * std::f64::consts::PI / len as f64;
+        let wr = ang.cos();
+        let wi = ang.sin();
+        let mut i = 0;
+        while i < n {
+            let mut w_re = 1.0f64;
+            let mut w_im = 0.0f64;
+            for k in 0..len / 2 {
+                let u_re = re[i + k];
+                let u_im = im[i + k];
+                let v_re = re[i + k + len / 2] * w_re - im[i + k + len / 2] * w_im;
+                let v_im = re[i + k + len / 2] * w_im + im[i + k + len / 2] * w_re;
+                re[i + k] = u_re + v_re;
+                im[i + k] = u_im + v_im;
+                re[i + k + len / 2] = u_re - v_re;
+                im[i + k + len / 2] = u_im - v_im;
+                let new_w_re = w_re * wr - w_im * wi;
+                w_im = w_re * wi + w_im * wr;
+                w_re = new_w_re;
+            }
+            i += len;
+        }
+        len <<= 1;
+    }
+}
+
+/// Compute Conv2d (no bias, stride 2, padding 1, kernel 3×3).
+/// Input shape: [in_c, H, W].  Weight: [out_c, in_c, 3, 3].
+/// Output: [out_c, ceil(H/2), ceil(W/2)].
+fn conv2d_3x3_stride2_pad1(
+    input: &[f32],
+    in_c: usize,
+    height: usize,
+    width: usize,
+    weight: &[f32],
+    out_c: usize,
+) -> Vec<f32> {
+    let out_h = (height + 1) / 2;
+    let out_w = (width + 1) / 2;
+    let mut output = vec![0.0f32; out_c * out_h * out_w];
+    for oc in 0..out_c {
+        for oh in 0..out_h {
+            let ih_base = oh as isize * 2 - 1;
+            for ow in 0..out_w {
+                let iw_base = ow as isize * 2 - 1;
+                let mut acc = 0.0f32;
+                for ic in 0..in_c {
+                    for kh in 0..3i32 {
+                        let ih = ih_base + kh as isize;
+                        if ih < 0 || ih >= height as isize { continue; }
+                        for kw in 0..3i32 {
+                            let iw = iw_base + kw as isize;
+                            if iw < 0 || iw >= width as isize { continue; }
+                            let inp_val = input[ic * height * width + ih as usize * width + iw as usize];
+                            let w_val = weight[oc * in_c * 9 + ic * 9 + kh as usize * 3 + kw as usize];
+                            acc += inp_val * w_val;
+                        }
+                    }
+                }
+                output[oc * out_h * out_w + oh * out_w + ow] = acc;
+            }
+        }
+    }
+    output
+}
+
+/// Compute sinusoidal relative positional embeddings for the audio conformer.
+/// Returns [context_size, hidden] where positions go from (context_size-1) down to 0.
+/// context_size = chunk_size + context_left - 1 + context_right = 12+13-1+0 = 24.
+fn compute_audio_rel_pos_embed(context_size: usize, hidden: usize) -> Vec<f32> {
+    let num_timescales = hidden / 2;
+    let max_timescale = 10000.0f64;
+    let log_inc = max_timescale.ln() / (num_timescales - 1).max(1) as f64;
+    let inv_timescales: Vec<f64> = (0..num_timescales)
+        .map(|k| (-log_inc * k as f64).exp())
+        .collect();
+
+    let mut out = vec![0.0f32; context_size * hidden];
+    // Ascending: rel_pos_embed[i] = embedding for pos_id i (= distance i).
+    // Lookup by distance d: rel_k_buf[d] uses pos_id d, matching HF's rel_shift result.
+    for i in 0..context_size {
+        let p = i as f64;
+        for k in 0..num_timescales {
+            let scaled = p * inv_timescales[k];
+            out[i * hidden + k] = scaled.sin() as f32;
+            out[i * hidden + num_timescales + k] = scaled.cos() as f32;
+        }
+    }
+    out
+}
+
+/// SiLU activation: x * sigmoid(x)
+#[inline(always)]
+fn silu(x: f32) -> f32 { x / (1.0 + (-x).exp()) }
+
+/// Run the Gemma 4 audio tower + embedder.
+/// Returns an Array2 of shape [n_audio_tokens, text_hidden=1536].
+fn audio_stats(tag: &str, buf: &[f32]) {
+    if std::env::var("CELLM_AUDIO_DEBUG").is_ok() {
+        let mut nan_count = 0usize;
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut sum = 0.0f64;
+        for &v in buf {
+            if v.is_nan() || v.is_infinite() { nan_count += 1; continue; }
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+            sum += v as f64;
+        }
+        let mean = sum / (buf.len() - nan_count).max(1) as f64;
+        eprintln!("AUDIO_STATS {:40} n={} nan/inf={} min={:.4} max={:.4} mean={:.4}", tag, buf.len(), nan_count, min_v, max_v, mean);
+    }
+}
+
+fn run_audio_cellm_gemma4(
+    file: &CellmFile,
+    mel_features: &[f32],   // [T_frames, 128] row-major
+    t_frames: usize,
+    num_mels: usize,        // 128
+) -> Result<Array2<f32>> {
+    let eps = 1e-6f32;
+    if std::env::var("CELLM_DUMP_AUDIO_TENSORS").is_ok() {
+        for t in &file.header.tensors {
+            if t.name.contains("audio") || t.name.contains("embed_proj") {
+                eprintln!("TENSOR {} {:?} {}", t.name, t.shape, t.dtype);
+            }
+        }
+        if let Some(cfg) = &file.header.source_text_config {
+            eprintln!("TEXT hidden_size={:?} model_type={:?}", cfg.get("hidden_size"), cfg.get("model_type"));
+        }
+    }
+
+    //  Config
+    let hidden = 1024usize;
+    let num_heads = 8usize;
+    let head_dim = hidden / num_heads; // 128
+    let ffw_intermediate = hidden * 4; // 4096
+    let text_hidden = 1536usize;
+    let chunk_size = 12usize;
+    let context_left = 13usize;
+    let context_right = 0usize;
+    let context_size = chunk_size + context_left - 1 + context_right; // 24
+    let conv_kernel = 5usize;
+    let residual_weight = 0.5f32;
+    let attn_cap = 50.0f32;
+    let attn_invalid = -1.0e9f32;
+    let q_scale = (head_dim as f32).powf(-0.5) / (2.0f32).ln();
+    let k_scale = (1.0 + std::f32::consts::E).ln() / (2.0f32).ln();
+    let num_audio_layers = 12usize;
+    let sub_ch0 = 128usize;
+    let sub_ch1 = 32usize;
+
+    // Use Metal for large conformer matmuls when available — the CPU rayon path
+    // achieves only ~1 GFLOPS (scalar, not SIMD-vectorised by LLVM at this loop
+    // shape) while Metal gives ~50–100× speedup for the 144×1024×4096 ops that
+    // dominate each conformer layer.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let mut backend = MetalKernels::create_matmul()
+        .map(|ctx| LinearBackend::Metal {
+            ctx,
+            weight_t_cache: std::collections::HashMap::new(),
+        })
+        .unwrap_or(LinearBackend::Cpu);
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let mut backend = LinearBackend::Cpu;
+
+    //  A. Subsampling Conv Projection
+    // Input mel: [T, 128] → treat as image [B, 1, T, 128] where T=time, 128=mel bins
+    // layer0: Conv2d(1→128, 3×3, stride=2, pad=1), LayerNorm(128), ReLU
+    audio_stats("mel_features", mel_features);
+    let conv0_w = load_audio_weight_f32(file, "model.audio_tower.subsample_conv_projection.layer0.conv.weight")?;
+    let norm0_w = load_audio_weight_f32(file, "model.audio_tower.subsample_conv_projection.layer0.norm.weight")?;
+    // Correct orientation: H=t_frames (time), W=num_mels (frequency)
+    // conv2d_3x3_stride2_pad1(input, in_c, height, width, weight, out_c)
+    let conv0_out = conv2d_3x3_stride2_pad1(mel_features, 1, t_frames, num_mels, &conv0_w, sub_ch0);
+    audio_stats("conv0_out", &conv0_out);
+    // conv0_out: [sub_ch0=128, h0=ceil(T/2), w0=ceil(128/2)=64]
+    // With H=t_frames, W=num_mels:
+    let h0 = (t_frames + 1) / 2; // ceil(T/2) — time dimension
+    let w0 = (num_mels + 1) / 2; // 64 — frequency dimension
+    // Apply LayerNorm on last dim (channels) after permuting [C,H,W]→[H,W,C]
+    // We permute by iterating h,w,c
+    let mut after_norm0 = vec![0.0f32; sub_ch0 * h0 * w0];
+    for hi in 0..h0 {
+        for wi in 0..w0 {
+            // Compute mean and var over channels
+            let mut mean = 0.0f32;
+            for c in 0..sub_ch0 {
+                mean += conv0_out[c * h0 * w0 + hi * w0 + wi];
+            }
+            mean /= sub_ch0 as f32;
+            let mut var = 0.0f32;
+            for c in 0..sub_ch0 {
+                let d = conv0_out[c * h0 * w0 + hi * w0 + wi] - mean;
+                var += d * d;
+            }
+            var /= sub_ch0 as f32;
+            let inv = 1.0 / (var + eps).sqrt();
+            for c in 0..sub_ch0 {
+                let v = (conv0_out[c * h0 * w0 + hi * w0 + wi] - mean) * inv * norm0_w[c];
+                after_norm0[c * h0 * w0 + hi * w0 + wi] = v.max(0.0); // ReLU
+            }
+        }
+    }
+    // layer1: Conv2d(128→32, 3×3, stride=2, pad=1), LayerNorm(32), ReLU
+    let conv1_w = load_audio_weight_f32(file, "model.audio_tower.subsample_conv_projection.layer1.conv.weight")?;
+    let norm1_w = load_audio_weight_f32(file, "model.audio_tower.subsample_conv_projection.layer1.norm.weight")?;
+    let conv1_out = conv2d_3x3_stride2_pad1(&after_norm0, sub_ch0, h0, w0, &conv1_w, sub_ch1);
+    let h1 = (h0 + 1) / 2; // ceil(T/4) — time steps after two stride-2 convs
+    let w1 = (w0 + 1) / 2; // 32 — frequency after two stride-2 convs
+    let t_sub = h1; // time steps (sequence length for conformer)
+    let mut after_norm1 = vec![0.0f32; sub_ch1 * h1 * w1];
+    for hi in 0..h1 {
+        for wi in 0..w1 {
+            let mut mean = 0.0f32;
+            for c in 0..sub_ch1 {
+                mean += conv1_out[c * h1 * w1 + hi * w1 + wi];
+            }
+            mean /= sub_ch1 as f32;
+            let mut var = 0.0f32;
+            for c in 0..sub_ch1 {
+                let d = conv1_out[c * h1 * w1 + hi * w1 + wi] - mean;
+                var += d * d;
+            }
+            var /= sub_ch1 as f32;
+            let inv = 1.0 / (var + eps).sqrt();
+            for c in 0..sub_ch1 {
+                let v = (conv1_out[c * h1 * w1 + hi * w1 + wi] - mean) * inv * norm1_w[c];
+                after_norm1[c * h1 * w1 + hi * w1 + wi] = v.max(0.0); // ReLU
+            }
+        }
+    }
+
+    // Reshape: permute [C, H, W] → [T, H*C] i.e. [w1, h1*sub_ch1]
+    // In HF: hidden_states.permute(0,2,3,1).reshape(batch, seq_len, -1)
+    // Tensor is [B=1, C=sub_ch1, H=t_sub, W=w1] → permute → [1, H=t_sub, W=w1, C=sub_ch1] → [1, t_sub, w1*sub_ch1]
+    let proj_in_dim = w1 * sub_ch1; // 32*32 = 1024
+    let mut sub_out = vec![0.0f32; t_sub * proj_in_dim];
+    for t in 0..t_sub {          // H dimension = time
+        for wi in 0..w1 {        // W dimension = frequency
+            for c in 0..sub_ch1 { // C dimension = channels
+                sub_out[t * proj_in_dim + wi * sub_ch1 + c] = after_norm1[c * t_sub * w1 + t * w1 + wi];
+            }
+        }
+    }
+
+    // input_proj_linear: [1024, 1024]
+    let proj_w = load_audio_weight_f32(file, "model.audio_tower.subsample_conv_projection.input_proj_linear.weight")?;
+    let mut hidden_states = vec![0.0f32; t_sub * hidden];
+    linear_rows(&sub_out, t_sub, proj_in_dim, &proj_w, hidden, None, &mut hidden_states, &mut backend);
+    audio_stats("hidden_states_init", &hidden_states);
+    let t_subsample_done = std::time::Instant::now();
+    eprintln!("[audio_timing] t_sub={t_sub} subsample_done");
+
+    //  B. Relative positional embeddings
+    // positions 12 down to 0 (context_size = 24, but only 13 unique positions for left context)
+    let n_rel_pos = context_left; // 13
+    let rel_pos_embed = compute_audio_rel_pos_embed(n_rel_pos, hidden);
+
+    //  C. 12 Conformer Layers
+    let t_conformer_start = std::time::Instant::now();
+    let mut norm_buf = vec![0.0f32; t_sub * hidden];
+    let mut norm2_buf = vec![0.0f32; t_sub * hidden];
+    let mut ffw1_buf = vec![0.0f32; t_sub * ffw_intermediate];
+    let mut ffw2_buf = vec![0.0f32; t_sub * hidden];
+    let mut q_buf = vec![0.0f32; t_sub * hidden];
+    let mut k_buf = vec![0.0f32; t_sub * hidden];
+    let mut v_buf = vec![0.0f32; t_sub * hidden];
+    let mut rel_k_buf = vec![0.0f32; n_rel_pos * hidden];
+    let mut score_buf = vec![0.0f32; context_size.max(t_sub)];
+    let mut prob_buf = vec![0.0f32; context_size.max(t_sub)];
+    let mut attn_out = vec![0.0f32; t_sub * hidden];
+    let mut lconv_lin_buf = vec![0.0f32; t_sub * hidden * 2];
+    let mut lconv_out = vec![0.0f32; t_sub * hidden];
+    let mut conv_state = vec![0.0f32; (conv_kernel - 1) * hidden]; // causal conv padding
+
+    for layer in 0..num_audio_layers {
+        let t_layer_start = std::time::Instant::now();
+        let p = format!("model.audio_tower.layers.{layer}.");
+
+        //  feed_forward1
+        {
+            let t0 = std::time::Instant::now();
+            let pre_w = load_audio_weight_f32(file, &format!("{p}feed_forward1.pre_layer_norm.weight"))?;
+            let ff1_w = load_audio_weight_f32(file, &format!("{p}feed_forward1.ffw_layer_1.linear.weight"))?;
+            let ff2_w = load_audio_weight_f32(file, &format!("{p}feed_forward1.ffw_layer_2.linear.weight"))?;
+            let post_w = load_audio_weight_f32(file, &format!("{p}feed_forward1.post_layer_norm.weight"))?;
+            if layer == 0 { eprintln!("[audio_timing] L0 ff1 weight_load={:.1}ms", t0.elapsed().as_secs_f64()*1000.0); }
+            let (ff1_in_clip, ff1_out_clip) = load_linear_clip_ranges(file, &format!("{p}feed_forward1.ffw_layer_1"))?;
+            let (ff2_in_clip, ff2_out_clip) = load_linear_clip_ranges(file, &format!("{p}feed_forward1.ffw_layer_2"))?;
+
+            let residual = hidden_states.clone();
+            rms_norm_rows(&hidden_states, t_sub, hidden, &pre_w, eps, &mut norm_buf);
+            if let Some((mn, mx)) = ff1_in_clip { for v in &mut norm_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
+            linear_rows(&norm_buf, t_sub, hidden, &ff1_w, ffw_intermediate, None, &mut ffw1_buf, &mut backend);
+            if let Some((mn, mx)) = ff1_out_clip { for v in &mut ffw1_buf[..t_sub*ffw_intermediate] { *v = v.clamp(mn, mx); } }
+            silu_inplace(&mut ffw1_buf);
+            if let Some((mn, mx)) = ff2_in_clip { for v in &mut ffw1_buf[..t_sub*ffw_intermediate] { *v = v.clamp(mn, mx); } }
+            linear_rows(&ffw1_buf, t_sub, ffw_intermediate, &ff2_w, hidden, None, &mut ffw2_buf, &mut backend);
+            if let Some((mn, mx)) = ff2_out_clip { for v in &mut ffw2_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
+            rms_norm_rows(&ffw2_buf, t_sub, hidden, &post_w, eps, &mut norm_buf);
+            for i in 0..t_sub * hidden {
+                hidden_states[i] = residual[i] + norm_buf[i] * residual_weight;
+            }
+            if layer == 0 { audio_stats("L0_after_ffn1", &hidden_states[..t_sub*hidden]); }
+            if layer == 0 { eprintln!("[audio_timing] L0 ff1 total={:.1}ms", t0.elapsed().as_secs_f64()*1000.0); }
+        }
+
+        //  self_attn (chunked local with relative pos bias)
+        {
+            let t0 = std::time::Instant::now();
+            let t_wload = std::time::Instant::now();
+            let norm_pre_w = load_audio_weight_f32(file, &format!("{p}norm_pre_attn.weight"))?;
+            let norm_post_w = load_audio_weight_f32(file, &format!("{p}norm_post_attn.weight"))?;
+            let q_w = load_audio_weight_f32(file, &format!("{p}self_attn.q_proj.linear.weight"))?;
+            let k_w = load_audio_weight_f32(file, &format!("{p}self_attn.k_proj.linear.weight"))?;
+            let v_w = load_audio_weight_f32(file, &format!("{p}self_attn.v_proj.linear.weight"))?;
+            let post_w = load_audio_weight_f32(file, &format!("{p}self_attn.post.linear.weight"))?;
+            let rel_k_w = load_audio_weight_f32(file, &format!("{p}self_attn.relative_k_proj.weight"))?;
+            let per_dim_scale = load_audio_weight_f32(file, &format!("{p}self_attn.per_dim_scale"))?;
+            let (qkv_in_clip, qkv_out_clip) = load_linear_clip_ranges(file, &format!("{p}self_attn.q_proj"))?;
+            let (post_in_clip, post_out_clip) = load_linear_clip_ranges(file, &format!("{p}self_attn.post"))?;
+            if layer == 0 { eprintln!("[audio_timing] L0 attn weight_load={:.1}ms", t_wload.elapsed().as_secs_f64()*1000.0); }
+            let t_qkv = std::time::Instant::now();
+
+            // softplus(per_dim_scale) element-wise
+            let pds: Vec<f32> = per_dim_scale.iter().map(|&v| (1.0 + v.exp()).ln()).collect();
+
+            let residual = hidden_states.clone();
+            rms_norm_rows(&hidden_states, t_sub, hidden, &norm_pre_w, eps, &mut norm_buf);
+            if let Some((mn, mx)) = qkv_in_clip { for v in &mut norm_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
+
+            linear_rows(&norm_buf, t_sub, hidden, &q_w, hidden, None, &mut q_buf, &mut backend);
+            linear_rows(&norm_buf, t_sub, hidden, &k_w, hidden, None, &mut k_buf, &mut backend);
+            linear_rows(&norm_buf, t_sub, hidden, &v_w, hidden, None, &mut v_buf, &mut backend);
+            if let Some((mn, mx)) = qkv_out_clip {
+                for v in &mut q_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); }
+                for v in &mut k_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); }
+                for v in &mut v_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); }
+            }
+
+            // Scale q and k
+            for t in 0..t_sub {
+                for h in 0..num_heads {
+                    for d in 0..head_dim {
+                        q_buf[t * hidden + h * head_dim + d] *= q_scale * pds[d];
+                        k_buf[t * hidden + h * head_dim + d] *= k_scale;
+                    }
+                }
+            }
+            if layer == 0 {
+                audio_stats("L0_q_scaled", &q_buf[..t_sub*hidden]);
+                audio_stats("L0_k_scaled", &k_buf[..t_sub*hidden]);
+                audio_stats("L0_v_buf", &v_buf[..t_sub*hidden]);
+                let pds_min = pds.iter().cloned().fold(f32::INFINITY, f32::min);
+                let pds_max = pds.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                if std::env::var("CELLM_AUDIO_DEBUG").is_ok() {
+                    eprintln!("L0_per_dim_scale softplus min={:.4} max={:.4} q_scale={:.6} k_scale={:.6}", pds_min, pds_max, q_scale, k_scale);
+                }
+            }
+
+            // rel_k_proj on pos embeddings: [n_rel_pos, hidden] → [n_rel_pos, hidden]
+            linear_rows(&rel_pos_embed, n_rel_pos, hidden, &rel_k_w, hidden, None, &mut rel_k_buf, &mut backend);
+
+            // Chunked local attention with relative position bias
+            let n_blocks = (t_sub + chunk_size - 1) / chunk_size;
+            let padded_t = n_blocks * chunk_size;
+            attn_out.resize(padded_t * hidden, 0.0);
+
+            for b in 0..n_blocks {
+                let q_start = b * chunk_size;
+                for bq in 0..chunk_size {
+                    let q_tok = q_start + bq;
+                    if q_tok >= t_sub {
+                        break;
+                    }
+                    for h in 0..num_heads {
+                        let q_off = q_tok * hidden + h * head_dim;
+                        let mut acc = vec![0.0f32; head_dim];
+
+                        // Compute scores against context window (left-causal only)
+                        let kv_start = (q_start as isize - context_left as isize + 1).max(0) as usize;
+                        let kv_end = (q_tok + context_right + 1).min(t_sub);
+                        let n_ctx = kv_end.saturating_sub(kv_start);
+
+                        score_buf[..context_size].fill(attn_invalid);
+                        // Matrix AC (content score)
+                        for (ctx_i, kv_tok) in (kv_start..kv_end).enumerate() {
+                            let k_off = kv_tok * hidden + h * head_dim;
+                            let mut dot = 0.0f32;
+                            for d in 0..head_dim {
+                                dot += q_buf[q_off + d] * k_buf[k_off + d];
+                            }
+                            score_buf[ctx_i] = dot;
+                        }
+
+                        // Matrix BD (relative position score)
+                        // rel_k_buf[d] corresponds to pos_id d (ascending), so lookup by distance is direct.
+                        for (ctx_i, kv_tok) in (kv_start..kv_end).enumerate() {
+                            if score_buf[ctx_i] <= attn_invalid + 1.0 { continue; }
+                            let rel_pos_idx = (q_tok as isize - kv_tok as isize).min(n_rel_pos as isize - 1).max(0) as usize;
+                            let rk_off = rel_pos_idx * hidden + h * head_dim;
+                            let mut dot = 0.0f32;
+                            for d in 0..head_dim {
+                                dot += q_buf[q_off + d] * rel_k_buf[rk_off + d];
+                            }
+                            score_buf[ctx_i] += dot;
+                        }
+
+                        // Softcap scores first, then softmax
+                        // First pass: apply softcap to all scores
+                        for i in 0..n_ctx {
+                            score_buf[i] = (score_buf[i] / attn_cap).tanh() * attn_cap;
+                        }
+                        // Find max of capped scores
+                        let mut mx = f32::NEG_INFINITY;
+                        for i in 0..n_ctx { if score_buf[i] > mx { mx = score_buf[i]; } }
+                        if mx == f32::NEG_INFINITY { mx = 0.0; }
+                        let mut sum = 0.0f32;
+                        for i in 0..n_ctx {
+                            let p = (score_buf[i] - mx).exp();
+                            prob_buf[i] = p;
+                            sum += p;
+                        }
+                        let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+
+                        // Weighted sum of values
+                        acc.fill(0.0);
+                        for (ctx_i, kv_tok) in (kv_start..kv_end).enumerate() {
+                            let p = prob_buf[ctx_i] * inv;
+                            let v_off = kv_tok * hidden + h * head_dim;
+                            for d in 0..head_dim {
+                                acc[d] += p * v_buf[v_off + d];
+                            }
+                        }
+                        let out_off = q_tok * hidden + h * head_dim;
+                        attn_out[out_off..out_off + head_dim].copy_from_slice(&acc);
+                    }
+                }
+            }
+            attn_out.truncate(t_sub * hidden);
+
+            if layer == 0 {
+                audio_stats("L0_attn_out_raw", &attn_out[..t_sub*hidden]);
+                if std::env::var("CELLM_AUDIO_DEBUG").is_ok() {
+                    // Find first NaN to understand context
+                    'find_nan: for qt in 0..t_sub {
+                        for h in 0..num_heads {
+                            let off = qt * hidden + h * head_dim;
+                            if attn_out[off..off+head_dim].iter().any(|v| v.is_nan()) {
+                                let q_start_for_qt = (qt / chunk_size) * chunk_size;
+                                let kv_start = (q_start_for_qt as isize - context_left as isize + 1).max(0) as usize;
+                                let kv_end = (qt + context_right + 1).min(t_sub);
+                                let n = kv_end.saturating_sub(kv_start);
+                                eprintln!("L0_first_nan tok={qt} h={h} q_start={q_start_for_qt} kv_start={kv_start} kv_end={kv_end} n_ctx={n}");
+                                let v_off = qt * hidden + h * head_dim;
+                                let v_s = &v_buf[v_off..v_off+4];
+                                eprintln!("  v_buf[tok,h,0..4]={:.4} {:.4} {:.4} {:.4}", v_s[0],v_s[1],v_s[2],v_s[3]);
+                                break 'find_nan;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // post projection
+            if let Some((mn, mx)) = post_in_clip { for v in &mut attn_out[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
+            linear_rows(&attn_out, t_sub, hidden, &post_w, hidden, None, &mut norm_buf, &mut backend);
+            if let Some((mn, mx)) = post_out_clip { for v in &mut norm_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
+            // norm_post_attn + add residual
+            rms_norm_rows(&norm_buf, t_sub, hidden, &norm_post_w, eps, &mut norm2_buf);
+            for i in 0..t_sub * hidden {
+                hidden_states[i] = residual[i] + norm2_buf[i];
+            }
+            if layer == 0 { audio_stats("L0_after_attn", &hidden_states[..t_sub*hidden]); }
+            if layer == 0 { eprintln!("[audio_timing] L0 attn qkv+rest={:.1}ms total={:.1}ms", t_qkv.elapsed().as_secs_f64()*1000.0, t0.elapsed().as_secs_f64()*1000.0); }
+        }
+
+        //  lconv1d
+        {
+            let t0 = std::time::Instant::now();
+            let pre_w = load_audio_weight_f32(file, &format!("{p}lconv1d.pre_layer_norm.weight"))?;
+            let lin_start_w = load_audio_weight_f32(file, &format!("{p}lconv1d.linear_start.linear.weight"))?;
+            let dw_w = load_audio_weight_f32(file, &format!("{p}lconv1d.depthwise_conv1d.weight"))?;
+            let conv_norm_w = load_audio_weight_f32(file, &format!("{p}lconv1d.conv_norm.weight"))?;
+            let lin_end_w = load_audio_weight_f32(file, &format!("{p}lconv1d.linear_end.linear.weight"))?;
+            let (ls_in_clip, ls_out_clip) = load_linear_clip_ranges(file, &format!("{p}lconv1d.linear_start"))?;
+            let (le_in_clip, le_out_clip) = load_linear_clip_ranges(file, &format!("{p}lconv1d.linear_end"))?;
+
+            let residual = hidden_states.clone();
+            rms_norm_rows(&hidden_states, t_sub, hidden, &pre_w, eps, &mut norm_buf);
+            if let Some((mn, mx)) = ls_in_clip { for v in &mut norm_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
+
+            // linear_start: [hidden, hidden*2]
+            lconv_lin_buf.resize(t_sub * hidden * 2, 0.0);
+            linear_rows(&norm_buf, t_sub, hidden, &lin_start_w, hidden * 2, None, &mut lconv_lin_buf, &mut backend);
+            if let Some((mn, mx)) = ls_out_clip { for v in &mut lconv_lin_buf[..t_sub*hidden*2] { *v = v.clamp(mn, mx); } }
+
+            // GLU: split into two halves, output = first_half * sigmoid(second_half)
+            lconv_out.resize(t_sub * hidden, 0.0);
+            for t in 0..t_sub {
+                for c in 0..hidden {
+                    let a = lconv_lin_buf[t * hidden * 2 + c];
+                    let b = lconv_lin_buf[t * hidden * 2 + hidden + c];
+                    lconv_out[t * hidden + c] = a / (1.0 + (-b).exp());
+                }
+            }
+
+            // Depthwise causal conv1d: kernel=5, groups=hidden
+            // Weight shape: [1024, 1, 5] → for each channel, convolve with 5-tap kernel
+            // Causal: left-pad by (kernel-1)=4
+            conv_state.resize((conv_kernel - 1) * hidden, 0.0);
+            conv_state.fill(0.0); // reset state for each layer (non-streaming)
+            let mut conv_result = vec![0.0f32; t_sub * hidden];
+            // Build padded input [pad + t_sub, hidden]
+            let pad_size = conv_kernel - 1;
+            let mut padded_input = vec![0.0f32; (pad_size + t_sub) * hidden];
+            padded_input[pad_size * hidden..].copy_from_slice(&lconv_out[..t_sub * hidden]);
+            for t in 0..t_sub {
+                for c in 0..hidden {
+                    let mut acc = 0.0f32;
+                    for k in 0..conv_kernel {
+                        acc += padded_input[(t + k) * hidden + c] * dw_w[c * conv_kernel + k];
+                    }
+                    conv_result[t * hidden + c] = acc;
+                }
+            }
+
+            // conv_norm (RMSNorm with scale)
+            rms_norm_rows(&conv_result, t_sub, hidden, &conv_norm_w, eps, &mut norm_buf);
+            // SiLU
+            silu_inplace(&mut norm_buf[..t_sub * hidden]);
+            // linear_end: [hidden, hidden]
+            if let Some((mn, mx)) = le_in_clip { for v in &mut norm_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
+            linear_rows(&norm_buf, t_sub, hidden, &lin_end_w, hidden, None, &mut lconv_out, &mut backend);
+            if let Some((mn, mx)) = le_out_clip { for v in &mut lconv_out[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
+            for i in 0..t_sub * hidden {
+                hidden_states[i] = residual[i] + lconv_out[i];
+            }
+            if layer == 0 { audio_stats("L0_after_lconv", &hidden_states[..t_sub*hidden]); }
+            if layer == 0 { eprintln!("[audio_timing] L0 lconv total={:.1}ms", t0.elapsed().as_secs_f64()*1000.0); }
+        }
+
+        //  feed_forward2
+        {
+            let t0 = std::time::Instant::now();
+            let pre_w = load_audio_weight_f32(file, &format!("{p}feed_forward2.pre_layer_norm.weight"))?;
+            let ff1_w = load_audio_weight_f32(file, &format!("{p}feed_forward2.ffw_layer_1.linear.weight"))?;
+            let ff2_w = load_audio_weight_f32(file, &format!("{p}feed_forward2.ffw_layer_2.linear.weight"))?;
+            let post_w = load_audio_weight_f32(file, &format!("{p}feed_forward2.post_layer_norm.weight"))?;
+            let (ff1_in_clip, ff1_out_clip) = load_linear_clip_ranges(file, &format!("{p}feed_forward2.ffw_layer_1"))?;
+            let (ff2_in_clip, ff2_out_clip) = load_linear_clip_ranges(file, &format!("{p}feed_forward2.ffw_layer_2"))?;
+
+            let residual = hidden_states.clone();
+            rms_norm_rows(&hidden_states, t_sub, hidden, &pre_w, eps, &mut norm_buf);
+            if let Some((mn, mx)) = ff1_in_clip { for v in &mut norm_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
+            linear_rows(&norm_buf, t_sub, hidden, &ff1_w, ffw_intermediate, None, &mut ffw1_buf, &mut backend);
+            if let Some((mn, mx)) = ff1_out_clip { for v in &mut ffw1_buf[..t_sub*ffw_intermediate] { *v = v.clamp(mn, mx); } }
+            silu_inplace(&mut ffw1_buf);
+            if let Some((mn, mx)) = ff2_in_clip { for v in &mut ffw1_buf[..t_sub*ffw_intermediate] { *v = v.clamp(mn, mx); } }
+            linear_rows(&ffw1_buf, t_sub, ffw_intermediate, &ff2_w, hidden, None, &mut ffw2_buf, &mut backend);
+            if let Some((mn, mx)) = ff2_out_clip { for v in &mut ffw2_buf[..t_sub*hidden] { *v = v.clamp(mn, mx); } }
+            rms_norm_rows(&ffw2_buf, t_sub, hidden, &post_w, eps, &mut norm_buf);
+            for i in 0..t_sub * hidden {
+                hidden_states[i] = residual[i] + norm_buf[i] * residual_weight;
+            }
+            if layer == 0 { eprintln!("[audio_timing] L0 ff2 total={:.1}ms", t0.elapsed().as_secs_f64()*1000.0); }
+        }
+
+        //  norm_out
+        {
+            let norm_out_w = load_audio_weight_f32(file, &format!("{p}norm_out.weight"))?;
+            rms_norm_rows(&hidden_states.clone(), t_sub, hidden, &norm_out_w, eps, &mut norm_buf);
+            hidden_states[..t_sub * hidden].copy_from_slice(&norm_buf[..t_sub * hidden]);
+        }
+        if layer < 2 || layer == 11 {
+            audio_stats(&format!("after_layer_{layer}"), &hidden_states[..t_sub * hidden]);
+        }
+        eprintln!("[audio_timing] layer {layer} done in {:.1}ms", t_layer_start.elapsed().as_secs_f64() * 1000.0);
+    }
+    eprintln!("[audio_timing] all conformer layers done in {:.1}ms", t_conformer_start.elapsed().as_secs_f64() * 1000.0);
+
+    //  D. Output projection [1024 → 1536]
+    let t_outproj_start = std::time::Instant::now();
+    let out_proj_w = load_audio_weight_f32(file, "model.audio_tower.output_proj.weight")?;
+    let out_proj_b = load_audio_weight_f32(file, "model.audio_tower.output_proj.bias")?;
+    let mut proj_out = vec![0.0f32; t_sub * text_hidden];
+    linear_rows(&hidden_states, t_sub, hidden, &out_proj_w, text_hidden, Some(&out_proj_b), &mut proj_out, &mut backend);
+    audio_stats("D_out_proj", &proj_out[..t_sub * text_hidden]);
+
+    eprintln!("[audio_timing] output_proj done in {:.1}ms", t_outproj_start.elapsed().as_secs_f64() * 1000.0);
+    //  E. Embedder (RMSNorm no-scale + Linear 1536→1536)
+    let embed_proj_w = load_audio_weight_f32(file, "model.embed_audio.embedding_projection.weight")?;
+    let mut embed_norm = vec![0.0f32; t_sub * text_hidden];
+    // RMSNorm with no scale (with_scale=False)
+    for t in 0..t_sub {
+        let x = &proj_out[t * text_hidden..(t + 1) * text_hidden];
+        let y = &mut embed_norm[t * text_hidden..(t + 1) * text_hidden];
+        let mut ms = 0.0f32;
+        for &v in x { ms += v * v; }
+        ms /= text_hidden as f32;
+        let inv = 1.0 / (ms + eps).sqrt();
+        for i in 0..text_hidden { y[i] = x[i] * inv; }
+    }
+    audio_stats("E_after_rmsnorm", &embed_norm[..t_sub * text_hidden]);
+    let mut embed_out = vec![0.0f32; t_sub * text_hidden];
+    linear_rows(&embed_norm, t_sub, text_hidden, &embed_proj_w, text_hidden, None, &mut embed_out, &mut backend);
+    audio_stats("E_embed_out", &embed_out[..t_sub * text_hidden]);
+
+    let out = Array2::from_shape_vec((t_sub, text_hidden), embed_out)
+        .map_err(|e| anyhow::anyhow!("audio features shape error: {e}"))?;
+    Ok(out)
+}
+
 fn tensor_shape(file: &CellmFile, name: &str) -> Result<Vec<usize>> {
     file.tensor_index(name)
         .map(|t| t.shape.clone())
         .ok_or_else(|| anyhow::anyhow!("missing tensor: {name}"))
+}
+
+/// Load an audio tower weight as f32, handling both f16 and i4 quantized dtypes.
+///
+/// The Gemma 4 audio conformer stores its linear weights as i4 with a per-row
+/// f16 qscale tensor at `{name}.qscale`. Reading them naively with
+/// `tensor_f16_to_f32` yields 4× too few values (i4 packs 2 values per byte;
+/// interpreted as f16 that is 8× smaller per element than f32, not 4×), causing
+/// out-of-bounds panics in `linear_rows` around row 256.
+fn load_audio_weight_f32(file: &CellmFile, name: &str) -> Result<Vec<f32>> {
+    let index = file
+        .tensor_index(name)
+        .ok_or_else(|| anyhow::anyhow!("missing audio weight: {name}"))?;
+    match index.dtype.as_str() {
+        "f16" => tensor_f16_to_f32(file, name),
+        "i4" => {
+            let bytes = file
+                .tensor_bytes(name)
+                .map_err(|e| anyhow::anyhow!("tensor bytes {name}: {e}"))?;
+            let scale_name = format!("{name}.qscale");
+            let scale_bytes = file
+                .tensor_bytes(&scale_name)
+                .map_err(|e| anyhow::anyhow!("qscale bytes {scale_name}: {e}"))?;
+            let scales_u16: &[u16] = cast_slice(scale_bytes);
+
+            // Treat the weight as [out_dim, in_dim] regardless of how many
+            // dimensions it has: the product of all but the first is in_dim.
+            let out_dim = index.shape[0];
+            let in_dim: usize = index.shape[1..].iter().product::<usize>().max(1);
+
+            // Parallel dequantization: each output row is independent.
+            let scales_f32: Vec<f32> = scales_u16.iter().map(|&s| f16::from_bits(s).to_f32()).collect();
+            let mut result = vec![0.0f32; out_dim * in_dim];
+            result.par_chunks_mut(in_dim).enumerate().for_each(|(r, row)| {
+                let scale = scales_f32[r];
+                for c in 0..in_dim {
+                    let flat = r * in_dim + c;
+                    let byte = bytes[flat / 2];
+                    // Lower nibble → even index; upper nibble → odd index.
+                    let nibble = if flat % 2 == 0 { byte & 0x0F } else { (byte >> 4) & 0x0F };
+                    // Sign-extend 4-bit value: range [-8, 7].
+                    let s = (nibble as i8) - (if nibble >= 8 { 16i8 } else { 0i8 });
+                    row[c] = s as f32 * scale;
+                }
+            });
+            Ok(result)
+        }
+        other => anyhow::bail!(
+            "unsupported audio weight dtype '{other}' for '{name}' \
+             (expected f16 or i4)"
+        ),
+    }
 }
 
 fn tensor_f16_to_f32(file: &CellmFile, name: &str) -> Result<Vec<f32>> {
@@ -1957,21 +2996,48 @@ fn linear_rows(
             return;
         }
     }
-    for r in 0..rows {
-        let x = &input[r * in_dim..(r + 1) * in_dim];
-        let y = &mut out[r * out_dim..(r + 1) * out_dim];
-        if let Some(b) = bias {
-            y.copy_from_slice(b);
-        } else {
-            y.fill(0.0);
-        }
-        for o in 0..out_dim {
-            let mut acc = y[o];
-            let wrow = &weight[o * in_dim..(o + 1) * in_dim];
-            for i in 0..in_dim {
-                acc += x[i] * wrow[i];
+    // For large matrices (audio conformer, vision encoder) use rayon to
+    // parallelise over input rows.  The threshold avoids spawning threads for
+    // the tiny projections used during token-by-token decode.
+    let total_ops = rows * in_dim * out_dim;
+    if total_ops >= 1 << 20 {
+        let out_slice = &mut out[..rows * out_dim];
+        let inp_slice = &input[..rows * in_dim];
+        out_slice
+            .par_chunks_mut(out_dim)
+            .zip(inp_slice.par_chunks(in_dim))
+            .for_each(|(y, x)| {
+                if let Some(b) = bias {
+                    y.copy_from_slice(b);
+                } else {
+                    y.fill(0.0);
+                }
+                for o in 0..out_dim {
+                    let wrow = &weight[o * in_dim..(o + 1) * in_dim];
+                    let mut acc = y[o];
+                    for i in 0..in_dim {
+                        acc += x[i] * wrow[i];
+                    }
+                    y[o] = acc;
+                }
+            });
+    } else {
+        for r in 0..rows {
+            let x = &input[r * in_dim..(r + 1) * in_dim];
+            let y = &mut out[r * out_dim..(r + 1) * out_dim];
+            if let Some(b) = bias {
+                y.copy_from_slice(b);
+            } else {
+                y.fill(0.0);
             }
-            y[o] = acc;
+            for o in 0..out_dim {
+                let mut acc = y[o];
+                let wrow = &weight[o * in_dim..(o + 1) * in_dim];
+                for i in 0..in_dim {
+                    acc += x[i] * wrow[i];
+                }
+                y[o] = acc;
+            }
         }
     }
 }
@@ -2249,11 +3315,11 @@ fn add_inplace(dst: &mut [f32], src: &[f32]) {
 fn build_single_turn_prompt(user_text: &str, image_block: &str, use_gemma4_turn: bool) -> String {
     if use_gemma4_turn {
         if image_block.is_empty() {
-            return format!("<|turn>user\n{user_text}<turn|>\n<|turn>model\n");
+            return format!("<bos><|turn>user\n{user_text}<turn|>\n<|turn>model\n");
         }
         // Match Gemma4 processor chat template layout more closely:
-        // user turn header, blank lines, image block, blank lines, user text.
-        return format!("<|turn>user\n\n\n{image_block}\n\n{user_text}<turn|>\n<|turn>model\n");
+        // BOS, user turn header, blank lines, image block, blank lines, user text.
+        return format!("<bos><|turn>user\n\n\n{image_block}\n\n{user_text}<turn|>\n<|turn>model\n");
     }
     format!("<|im_start|>User:{image_block}{user_text}<end_of_utterance>\nAssistant:")
 }

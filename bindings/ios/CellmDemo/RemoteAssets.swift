@@ -43,6 +43,14 @@ enum DemoAssetLinks {
     static let smolvlmProcessorConfigFileName = "processor_config-smolvlm-256m.json"
     static let smolvlmPreprocessorConfigFileName = "preprocessor_config-smolvlm-256m.json"
     static let rococoFileName = "rococo_1.jpg"
+
+    static let bonsai1B1Bit = "https://huggingface.co/jeffasante/cellm-models/resolve/main/Bonsai-1.7B_v2/Bonsai-1.7B_v2.cellm?download=true"
+    static let bonsai1B1BitTokenizer = "https://huggingface.co/jeffasante/cellm-models/resolve/main/Bonsai-1.7B_v2/tokenizer.json?download=true"
+    static let bonsai1B1BitTokenizerConfig = "https://huggingface.co/jeffasante/cellm-models/resolve/main/Bonsai-1.7B_v2/tokenizer_config.json?download=true"
+    static let bonsai1B1BitDir = "samples/bonsai-1.7b-1bit"
+    static let bonsai1B1BitFileName = "\(bonsai1B1BitDir)/Bonsai-1.7B_v2.cellm"
+    static let bonsai1B1BitTokenizerFileName = "\(bonsai1B1BitDir)/tokenizer.json"
+    static let bonsai1B1BitTokenizerConfigFileName = "\(bonsai1B1BitDir)/tokenizer_config.json"
 }
 
 enum RemoteAssets {

@@ -5,6 +5,11 @@ use objc::rc::autoreleasepool;
 use std::sync::Mutex;
 use std::collections::HashMap;
 
+// Compiled Metal library cache — MSL is compiled once per process so iOS cold-launches
+// don't pay the compile cost on every app restart after a cache eviction.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+static ELEM_OPS_LIB_CACHE: Mutex<Option<Library>> = Mutex::new(None);
+
 pub struct MetalKernels;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -173,7 +178,7 @@ impl MetalMatmul {
             let out_bytes = (out.len() * 4) as u64;
             let device = self.queue.device();
             let out_buf = device.new_buffer(out_bytes, MTLResourceOptions::StorageModeShared);
-            
+
             let m_u32 = m as u32; let n_u32 = n as u32; let k_u32 = k as u32;
 
             let cb = self.queue.new_command_buffer();
@@ -185,7 +190,7 @@ impl MetalMatmul {
             enc.set_bytes(3, 4, (&m_u32 as *const u32).cast());
             enc.set_bytes(4, 4, (&n_u32 as *const u32).cast());
             enc.set_bytes(5, 4, (&k_u32 as *const u32).cast());
-            
+
             let w = self.pso.thread_execution_width() as u64;
             let h = self.pso.max_total_threads_per_threadgroup() as u64 / w;
             let tg = MTLSize { width: w, height: h, depth: 1 };
@@ -233,6 +238,20 @@ kernel void silu_mul_f32_inplace(
         float silu = x / (1.0f + exp(-x));
         a[gid] = silu * b[gid];
     }
+}
+
+kernel void gelu_tanh_mul_f32_inplace(
+    device float* gate [[buffer(0)]],
+    device const float* up  [[buffer(1)]],
+    constant uint& n        [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    float x = gate[gid];
+    // tanh-approximated GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+    float c = 0.7978845608f;
+    float v = c * (x + 0.044715f * x * x * x);
+    gate[gid] = 0.5f * x * (1.0f + tanh(v)) * up[gid];
 }
 
 kernel void rms_norm_f16w(
@@ -534,7 +553,7 @@ kernel void mv_q1_0_g128(
         uchar d_high = row_ptr[1];
         ushort d_bits = ((ushort)d_high << 8) | (ushort)d_low;
         float d = (float)as_type<half>(d_bits);
-        
+
         device const uchar* bits = row_ptr + 2;
         for (uint b = 0; b < 16; ++b) {
             uchar bb = bits[b];
@@ -566,6 +585,7 @@ pub struct MetalOps {
     pub pso_mv2_i8: ComputePipelineState,
     pub pso_add_f32: ComputePipelineState,
     pub pso_silu_mul_f32: ComputePipelineState,
+    pub pso_gelu_mul_f32: ComputePipelineState,
     pub pso_mv_q1: ComputePipelineState,
     x_buf: Mutex<Option<Buffer>>,
     out_buf: Mutex<Option<Buffer>>,
@@ -590,6 +610,7 @@ impl Clone for MetalOps {
             pso_mv2_i8: self.pso_mv2_i8.clone(),
             pso_add_f32: self.pso_add_f32.clone(),
             pso_silu_mul_f32: self.pso_silu_mul_f32.clone(),
+            pso_gelu_mul_f32: self.pso_gelu_mul_f32.clone(),
             pso_mv_q1: self.pso_mv_q1.clone(),
             x_buf: Mutex::new(None), // New scratch for new clone
             out_buf: Mutex::new(None),
@@ -601,14 +622,31 @@ impl Clone for MetalOps {
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub struct MetalOps;
 
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+impl MetalOps {
+    pub fn encode_gelu_tanh_mul_f32_inplace(&self, _enc: &(), _gate: &(), _up: &(), _n: usize) {}
+    pub fn encode_rms_norm_f16w_at(&self, _enc: &(), _x: &(), _xo: u64, _w: &(), _out: &(), _oo: u64, _n: usize, _eps: f32, _add: bool) {}
+}
+
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 impl MetalOps {
     pub fn create() -> anyhow::Result<Self> {
         let device = Device::system_default().ok_or_else(|| anyhow::anyhow!("No Metal device"))?;
         let queue = device.new_command_queue();
-        let options = metal::CompileOptions::new();
-        let lib = device.new_library_with_source(ELEM_OPS_SHADER, &options).map_err(|e| anyhow::anyhow!("Compile failed: {e:?}"))?;
-        
+        let lib = {
+            let mut guard = ELEM_OPS_LIB_CACHE.lock().unwrap();
+            if guard.is_none() {
+                let options = metal::CompileOptions::new();
+                options.set_fast_math_enabled(true);
+                *guard = Some(
+                    device
+                        .new_library_with_source(ELEM_OPS_SHADER, &options)
+                        .map_err(|e| anyhow::anyhow!("Compile failed: {e:?}"))?
+                );
+            }
+            guard.as_ref().unwrap().clone()
+        };
+
         let pso_rms_norm = build_pso_ops(&device, &lib, "rms_norm_f16w")?;
         let pso_rope_adj = build_pso_ops(&device, &lib, "rope_adj_f32")?;
         let pso_rope_half = build_pso_ops(&device, &lib, "rope_half_f32")?;
@@ -620,12 +658,13 @@ impl MetalOps {
         let pso_mv2_i8 = build_pso_ops(&device, &lib, "mv2_i8")?;
         let pso_add_f32 = build_pso_ops(&device, &lib, "add_f32_inplace")?;
         let pso_silu_mul_f32 = build_pso_ops(&device, &lib, "silu_mul_f32_inplace")?;
+        let pso_gelu_mul_f32 = build_pso_ops(&device, &lib, "gelu_tanh_mul_f32_inplace")?;
         let pso_mv_q1 = build_pso_ops(&device, &lib, "mv_q1_0_g128")?;
 
         Ok(Self {
-            device, queue, _lib: lib,
+            device, queue, _lib: lib.clone(),
             pso_rms_norm, pso_rope_adj, pso_rope_half, pso_mv_f16, pso_mv_i8, pso_mv_qkv_f16, pso_mv_qkv_i8, pso_mv2_f16, pso_mv2_i8,
-            pso_add_f32, pso_silu_mul_f32, pso_mv_q1,
+            pso_add_f32, pso_silu_mul_f32, pso_gelu_mul_f32, pso_mv_q1,
             x_buf: Mutex::new(None), out_buf: Mutex::new(None),
             tensor_cache: Mutex::new(HashMap::new()),
         })
@@ -805,6 +844,57 @@ impl MetalOps {
         enc.dispatch_threads(MTLSize { width: n as u64, height: 1, depth: 1 }, MTLSize { width: w.min(n as u64), height: 1, depth: 1 });
     }
 
+    /// GELU(gate)*up in-place — Gemma's activation function.
+    pub fn encode_gelu_tanh_mul_f32_inplace(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        gate: &metal::BufferRef,
+        up: &metal::BufferRef,
+        n: usize,
+    ) {
+        let n32 = n as u32;
+        enc.set_compute_pipeline_state(&self.pso_gelu_mul_f32);
+        enc.set_buffer(0, Some(gate), 0);
+        enc.set_buffer(1, Some(up), 0);
+        enc.set_bytes(2, 4, (&n32 as *const u32).cast());
+        let w = self.pso_gelu_mul_f32.thread_execution_width() as u64;
+        enc.dispatch_threads(
+            MTLSize { width: n as u64, height: 1, depth: 1 },
+            MTLSize { width: w.min(n as u64), height: 1, depth: 1 },
+        );
+    }
+
+    /// RMSNorm with byte-offset into x and out — used for per-head Q/K norms in
+    /// Gemma where one weight vector is applied independently to each head's slice.
+    pub fn encode_rms_norm_f16w_at(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        x: &metal::BufferRef,
+        x_byte_offset: u64,
+        w: &metal::BufferRef,
+        out: &metal::BufferRef,
+        out_byte_offset: u64,
+        n: usize,
+        eps: f32,
+        w_add_one: bool,
+    ) {
+        let n32 = n as u32;
+        let add = w_add_one as u32;
+        enc.set_compute_pipeline_state(&self.pso_rms_norm);
+        enc.set_buffer(10, Some(x), x_byte_offset);
+        enc.set_buffer(1, Some(w), 0);
+        enc.set_buffer(2, Some(out), out_byte_offset);
+        enc.set_bytes(3, 4, (&n32 as *const u32).cast());
+        enc.set_bytes(4, 4, (&eps as *const f32).cast());
+        enc.set_bytes(5, 4, (&add as *const u32).cast());
+        let tgsize: u64 = 256;
+        enc.set_threadgroup_memory_length(0, tgsize * 4);
+        enc.dispatch_thread_groups(
+            MTLSize { width: 1, height: 1, depth: 1 },
+            MTLSize { width: tgsize, height: 1, depth: 1 },
+        );
+    }
+
     pub fn logits_qkv_f16(&self, x: &[f32], q_w: &[u16], k_w: &[u16], v_w: &[u16], q_dim: usize, k_dim: usize, v_dim: usize, hidden: usize, q_key: &str, k_key: &str, v_key: &str, q_out: &mut [f32], k_out: &mut [f32], v_out: &mut [f32]) -> anyhow::Result<()> {
         self.logits_f16(x, q_w, q_dim, hidden, q_key, q_out)?;
         self.logits_f16(x, k_w, k_dim, hidden, k_key, k_out)?;
@@ -855,7 +945,7 @@ impl MetalOps {
         });
         read_f32(ob, out)
     }
-    
+
     pub fn logits_q1(&self, x: &[f32], embed_q1: &[u8], vocab: usize, hidden: usize, cache_key: &str, out: &mut [f32]) -> anyhow::Result<()> {
         if !self.tensor_cache.lock().unwrap().contains_key(cache_key) {
             self.tensor_cache.lock().unwrap().insert(cache_key.to_string(), upload_i8(&self.device, unsafe { std::slice::from_raw_parts(embed_q1.as_ptr() as *const i8, embed_q1.len()) })?);

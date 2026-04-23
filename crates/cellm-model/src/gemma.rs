@@ -11,6 +11,7 @@ use half::f16;
 use rayon::prelude::*;
 
 use crate::{CellmFile, ModelConfig};
+use crate::gemma_graph::{GemmaGraphLayerSpec, GemmaGraphState};
 use serde_json::Value;
 
 const GEMMA_METAL_LINEAR_MAX_ELEMS: usize = 262_144;
@@ -39,6 +40,7 @@ pub struct GemmaRunner {
     metal_strict: bool,
     /// Present when a Metal backend is active; drives rms_norm / rope / logits on GPU.
     metal_ops: Option<MetalOps>,
+    graph_state: Option<GemmaGraphState>,
     use_metal_norm: bool,
     use_metal_rope: bool,
     use_metal_logits: bool,
@@ -205,6 +207,7 @@ impl GemmaRunner {
             gemma4_disable_per_token_embed_scale: std::env::var("CELLM_GEMMA4_DISABLE_PER_TOKEN_EMBED_SCALE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            graph_state: None,
         })
     }
 
@@ -223,7 +226,7 @@ impl GemmaRunner {
     pub fn eos_token_id(&self) -> Option<u32> {
         self.eos_token_id
     }
-    
+
     pub fn is_gemma3_text(&self) -> bool {
         self.is_gemma3_text
     }
@@ -249,12 +252,65 @@ impl GemmaRunner {
     pub fn enable_metal_full_backend(&mut self) -> bool {
         match (MetalKernels::create_matmul(), MetalOps::create()) {
             (Ok(ctx), Ok(ops)) => {
+                // Attempt to build the fused graph for Gemma3 text models.
+                // Gemma4 is excluded because it uses mixed i4 quantization and complex
+                // per-layer features (shared-KV, PLE, layer-output-scale) not yet supported.
+                if self.is_gemma3_text && !self.is_gemma4_text {
+                    let graph_enabled = std::env::var("CELLM_GEMMA_ENABLE_GRAPH")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(true);
+                    if graph_enabled {
+                        let layer_specs: Vec<GemmaGraphLayerSpec> = self.layer_attn.iter().map(|s| {
+                            GemmaGraphLayerSpec {
+                                n_heads:     s.n_heads,
+                                n_kv_heads:  s.n_kv_heads,
+                                head_dim:    s.head_dim,
+                                kv_head_dim: s.kv_head_dim,
+                                q_dim:       s.q_dim,
+                                kv_dim:      s.kv_dim,
+                                ffn_dim:     s.ffn_dim,
+                            }
+                        }).collect();
+
+                        match GemmaGraphState::new(
+                            self.cfg.hidden_size,
+                            self.cfg.vocab_size,
+                            self.max_q_dim,
+                            self.max_kv_dim,
+                            self.max_ffn_dim,
+                            layer_specs,
+                            self.sliding_window,
+                            self.sliding_window_pattern,
+                            true, // is_gemma3
+                            self.rope_theta_sliding,
+                            self.rmsnorm_weight_is_offset,
+                            self.tensor_prefix.clone(),
+                            ops.clone(),
+                        ) {
+                            Ok(mut gs) => {
+                                println!("gemma: preloading weights into fused Metal graph...");
+                                for (name, data) in self.file.all_tensors() {
+                                    let dtype = self.file.tensor_index(name)
+                                        .map(|t| t.dtype.clone())
+                                        .unwrap_or_else(|| "f16".to_string());
+                                    gs.preload_weight(name.to_string(), data, dtype);
+                                }
+                                self.graph_state = Some(gs);
+                                println!("gemma: fused Metal graph enabled (Gemma3, {} layers)",
+                                    self.cfg.num_hidden_layers);
+                            }
+                            Err(e) => {
+                                eprintln!("gemma: fused graph creation failed: {e}");
+                            }
+                        }
+                    }
+                }
+
                 self.linear_backend = GemmaLinearBackend::Metal { ctx };
                 self.metal_ops = Some(ops);
                 self.metal_strict = true;
-                // Full-metal mode must enable all eligible Gemma ops on GPU.
-                self.use_metal_norm = false;  // DIAG: temporarily disabled
-                self.use_metal_rope = false;  // DIAG: temporarily disabled
+                self.use_metal_norm = false;
+                self.use_metal_rope = false;
                 self.use_metal_logits = true;
                 true
             }
@@ -299,6 +355,22 @@ impl GemmaRunner {
         top_k: usize,
     ) -> Result<Vec<(u32, f32)>, CoreError> {
         let per_layer_input = self.prepare_gemma4_per_layer_inputs(None, x0)?;
+        self.step_topk_from_hidden_inner(x0, per_layer_input.as_deref(), pos, page_table, kv_cache, top_k)
+    }
+
+    /// Like `step_topk_from_hidden` but passes the token ID to `prepare_gemma4_per_layer_inputs`
+    /// so text tokens get the correct per-layer embeddings (PLE).  Use this for text tokens that
+    /// go through the hidden-state path (e.g. bidir decode Phase A / Phase C).
+    pub fn step_topk_from_hidden_with_token(
+        &mut self,
+        token: u32,
+        x0: &[f32],
+        pos: usize,
+        page_table: &mut PageTable,
+        kv_cache: &mut KVCache,
+        top_k: usize,
+    ) -> Result<Vec<(u32, f32)>, CoreError> {
+        let per_layer_input = self.prepare_gemma4_per_layer_inputs(Some(token), x0)?;
         self.step_topk_from_hidden_inner(x0, per_layer_input.as_deref(), pos, page_table, kv_cache, top_k)
     }
 
@@ -381,6 +453,76 @@ impl GemmaRunner {
         let mut k_store = vec![0.0f32; layout_kv_dim];
         let mut v_store = vec![0.0f32; layout_kv_dim];
 
+        // ── Fused Metal graph path (Gemma3 only, no per-layer input, no TurboQuant) ──
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let mut disable_graph = false;
+            let graph_logits: Option<Vec<f32>> = 'graph: {
+                if per_layer_input.is_some() {
+                    break 'graph None;
+                }
+                if kv_cache.encoding() == cellm_cache::KvEncodingKind::TurboQuant {
+                    break 'graph None;
+                }
+                if let Some(gs) = &mut self.graph_state {
+                    match gs.step_fused(
+                        x0, &cfg, kv_cache, page_table,
+                        pos, token_off, block_id as u32,
+                        top_k > 0,
+                    ) {
+                        Ok(Some(logits)) => {
+                            if logits.iter().any(|v| !v.is_finite()) {
+                                eprintln!("gemma fused graph: non-finite logits at pos {pos}, disabling");
+                                disable_graph = true;
+                                break 'graph None;
+                            }
+                            break 'graph Some(logits);
+                        }
+                        Ok(None) => break 'graph Some(vec![]),
+                        Err(e) => {
+                            eprintln!("gemma fused graph error at pos {pos}: {e}, disabling");
+                            disable_graph = true;
+                            break 'graph None;
+                        }
+                    }
+                }
+                None
+            };
+            if disable_graph {
+                self.graph_state = None;
+            }
+            if let Some(raw_logits) = graph_logits {
+                if raw_logits.is_empty() {
+                    return Ok(vec![]);
+                }
+                // Apply final-logit softcapping (Gemma4 only; None for Gemma3) + top-k.
+                let vocab = cfg.vocab_size;
+                let k = top_k.max(1).min(vocab);
+                let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
+                let mut min_idx = 0usize;
+                let mut min_val = f32::INFINITY;
+                for (vid, &raw) in raw_logits.iter().enumerate() {
+                    let dot = if let Some(cap) = self.final_logit_softcapping {
+                        if cap > 0.0 { cap * (raw / cap).tanh() } else { raw }
+                    } else {
+                        raw
+                    };
+                    if top.len() < k {
+                        top.push((vid as u32, dot));
+                        if dot < min_val { min_val = dot; min_idx = top.len() - 1; }
+                    } else if dot > min_val {
+                        top[min_idx] = (vid as u32, dot);
+                        min_val = top[0].1; min_idx = 0;
+                        for (i, &(_, s)) in top.iter().enumerate().skip(1) {
+                            if s < min_val { min_val = s; min_idx = i; }
+                        }
+                    }
+                }
+                top.sort_by(|a, b| b.1.total_cmp(&a.1));
+                return Ok(top);
+            }
+        }
+
         for layer in 0..self.max_layers {
             let (is_kv_shared_layer, kv_shared_source_layer) = if self.is_gemma4_text
                 && self.gemma4_shared_kv_layers > 0
@@ -441,7 +583,7 @@ impl GemmaRunner {
                 cfg.rope_theta
             };
 
-            // Attention input norm 
+            // Attention input norm
             let use_metal_norm = self.metal_ops.is_some() && self.use_metal_norm;
             if use_metal_norm {
                 let w = self
@@ -630,7 +772,9 @@ impl GemmaRunner {
                 q_for_attn,
                 n_heads,
                 n_kv_heads,
-                head_dim, None,
+                head_dim,
+                None, // attn_scale
+                None, // soft_cap
                 attn_out_slice,
             )?;
 
@@ -1179,8 +1323,11 @@ impl GemmaRunner {
                 per_token[i] = (per_token[i] + projected[i]) * inv_sqrt2;
             }
         } else {
+            // No token available (e.g. image soft tokens): use only the context projection,
+            // but still apply the 1/sqrt(2) scale to match HF per_layer_input_scale.
+            let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
             for i in 0..per_total_dim {
-                per_token[i] = projected[i];
+                per_token[i] = projected[i] * inv_sqrt2;
             }
         }
         Ok(Some(per_token))
@@ -1241,11 +1388,15 @@ impl GemmaRunner {
             )));
         }
         let dtype = meta.dtype.clone();
-        let _disable_metal_i4 = self.is_gemma4_text
+        // For Gemma 4 text models, Metal linear matmul is disabled by default because
+        // mixed-dtype models (f16 norms, i4 projections) produce incorrect results when
+        // some f16 layers route through Metal while i4 fall back to CPU in the same pass.
+        // Set CELLM_GEMMA4_I4_DISABLE_METAL_LINEAR=0 to override.
+        let disable_metal_linear = self.is_gemma4_text
             && std::env::var("CELLM_GEMMA4_I4_DISABLE_METAL_LINEAR")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true);
-        let use_metal = self.metal_ops.is_some();
+        let use_metal = self.metal_ops.is_some() && !disable_metal_linear;
         if use_metal {
             let ctx = self.metal_ops.as_ref().unwrap();
             match dtype.as_str() {
@@ -1400,7 +1551,14 @@ impl GemmaRunner {
         k_out: &mut [f32],
         v_out: &mut [f32],
     ) -> Result<bool, CoreError> {
-        if self.metal_ops.is_none() {
+        // Gemma 4 text models must not use the Metal QKV fused path: i4-quantized models
+        // have mixed dtypes per layer and the Metal path only handles f16. Routing some
+        // layers through Metal and others through CPU produces inconsistent hidden states.
+        let disable_metal_linear = self.is_gemma4_text
+            && std::env::var("CELLM_GEMMA4_I4_DISABLE_METAL_LINEAR")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+        if self.metal_ops.is_none() || disable_metal_linear {
             return Ok(false);
         }
         if x.len() != in_dim || q_out.len() != q_out_dim || k_out.len() != k_out_dim || v_out.len() != v_out_dim {

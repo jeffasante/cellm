@@ -118,6 +118,7 @@ pub trait DeviceKvStorage: Send + Sync + std::fmt::Debug {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        attn_scale: Option<f32>,
         soft_cap: Option<f32>,
         out: &mut [f32],
     ) -> Result<(), CoreError> {
@@ -152,6 +153,7 @@ pub trait DeviceKvStorage: Send + Sync + std::fmt::Debug {
             n_heads,
             n_kv_heads,
             head_dim,
+            attn_scale,
             soft_cap,
             out,
         )
@@ -339,6 +341,7 @@ impl<'a> KvCacheReadView<'a> {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        attn_scale: Option<f32>,
         soft_cap: Option<f32>,
         out: &mut [f32],
     ) -> Result<(), CoreError> {
@@ -348,6 +351,7 @@ impl<'a> KvCacheReadView<'a> {
             n_heads,
             n_kv_heads,
             head_dim,
+            attn_scale,
             soft_cap,
             out,
         )
@@ -384,6 +388,7 @@ fn attention_single_token_f32_gqa_local(
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    attn_scale: Option<f32>,
     soft_cap: Option<f32>,
     out: &mut [f32],
 ) -> Result<(), CoreError> {
@@ -403,7 +408,7 @@ fn attention_single_token_f32_gqa_local(
     if seq == 0 {
         return Ok(());
     }
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let scale = attn_scale.unwrap_or_else(|| 1.0f32 / (head_dim as f32).sqrt());
     use rayon::prelude::*;
     let group_size = (n_heads / n_kv_heads).max(1);
 

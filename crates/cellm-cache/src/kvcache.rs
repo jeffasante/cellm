@@ -9,6 +9,10 @@ use objc::rc::autoreleasepool;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use std::sync::Mutex;
 
+// Compiled Metal library cache — compiled once per process lifetime.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+static KV_CACHE_LIB_CACHE: Mutex<Option<Library>> = Mutex::new(None);
+
 use crate::BlockAllocator;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -709,6 +713,7 @@ impl DeviceKvStorage for CpuKvStorage {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        attn_scale: Option<f32>,
         soft_cap: Option<f32>,
         out: &mut [f32],
     ) -> Result<(), CoreError> {
@@ -744,7 +749,7 @@ impl DeviceKvStorage for CpuKvStorage {
             }
         }
 
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let scale = attn_scale.unwrap_or_else(|| 1.0f32 / (head_dim as f32).sqrt());
         let group_size = (n_heads / n_kv_heads).max(1);
         let mut scores = vec![0.0f32; seq];
 
@@ -1036,6 +1041,7 @@ impl DeviceKvStorage for CpuTurboQuantKvStorage {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        attn_scale: Option<f32>,
         soft_cap: Option<f32>,
         out: &mut [f32],
     ) -> Result<(), CoreError> {
@@ -1081,7 +1087,7 @@ impl DeviceKvStorage for CpuTurboQuantKvStorage {
             }
         }
 
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let scale = attn_scale.unwrap_or_else(|| 1.0f32 / (head_dim as f32).sqrt());
         let group_size = (n_heads / n_kv_heads).max(1);
         let mut scores = vec![0.0f32; seq];
         let mut q_i8 = vec![0i8; head_dim];
@@ -1390,7 +1396,10 @@ impl MetalKvStorage {
 
             float max_score = -INFINITY;
             float denom = 0.0f;
-            float v_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            // v_acc accumulates partial V sums; each thread covers head_dim/32 elements.
+            // 32 slots supports head_dim up to 1024 (32 threads × 32 slots = 1024).
+            float v_acc[32];
+            for (uint j = 0; j < 32; j++) v_acc[j] = 0.0f;
 
             threadgroup float dots[32];
             threadgroup float shared_score;
@@ -1503,10 +1512,19 @@ impl MetalKvStorage {
             }
         }
         "#;
-        let options = metal::CompileOptions::new();
-        let lib = device
-            .new_library_with_source(src, &options)
-            .map_err(|e| CoreError::Backend(format!("kv cache metal storage: compile failed: {e:?}")))?;
+        let lib = {
+            let mut guard = KV_CACHE_LIB_CACHE.lock().unwrap();
+            if guard.is_none() {
+                let options = metal::CompileOptions::new();
+                options.set_fast_math_enabled(true);
+                *guard = Some(
+                    device
+                        .new_library_with_source(src, &options)
+                        .map_err(|e| CoreError::Backend(format!("kv cache metal storage: compile failed: {e:?}")))?
+                );
+            }
+            guard.as_ref().unwrap().clone()
+        };
         let pso_write_f16 = build_pso(&device, &lib, "kv_write_f16")?;
         let pso_write_f32 = build_pso(&device, &lib, "kv_write_f32")?;
         let pso_read_f16 = build_pso(&device, &lib, "kv_read_f16")?;
@@ -2262,6 +2280,7 @@ impl DeviceKvStorage for MetalKvStorage {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        attn_scale: Option<f32>,
         soft_cap: Option<f32>,
         out: &mut [f32],
     ) -> Result<(), CoreError> {
@@ -2320,7 +2339,7 @@ impl DeviceKvStorage for MetalKvStorage {
         let n_heads_u32 = self.check_u32(n_heads, "n_heads")?;
         let n_kv_heads_u32 = self.check_u32(n_kv_heads, "n_kv_heads")?;
         let head_dim_u32 = self.check_u32(head_dim, "head_dim")?;
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let scale = attn_scale.unwrap_or_else(|| 1.0f32 / (head_dim as f32).sqrt());
         let seq_ptr = (&seq_u32 as *const u32).cast();
         let n_heads_ptr = (&n_heads_u32 as *const u32).cast();
         let n_kv_heads_ptr = (&n_kv_heads_u32 as *const u32).cast();
@@ -2490,10 +2509,10 @@ impl DeviceKvStorage for MetalKvStorage {
             enc.set_buffer(2, Some(&bases_buf), 0);
             enc.set_buffer(3, Some(&q_buf), 0);
             enc.set_buffer(4, Some(&out_buf), 0);
-            enc.set_bytes(5, 4, seq_ptr);
-            enc.set_bytes(6, 4, n_heads_ptr);
-            enc.set_bytes(7, 4, n_kv_heads_ptr);
-            enc.set_bytes(8, 4, head_dim_ptr);
+            enc.set_bytes(5, 4, n_heads_ptr);
+            enc.set_bytes(6, 4, n_kv_heads_ptr);
+            enc.set_bytes(7, 4, head_dim_ptr);
+            enc.set_bytes(8, 4, seq_ptr);
             enc.set_bytes(9, 4, scale_ptr);
             enc.set_bytes(10, 4, soft_cap_ptr);
 
@@ -2844,13 +2863,14 @@ impl MetalKvStorage {
         n_heads: u32,
         n_kv_heads: u32,
         head_dim: u32,
+        attn_scale: Option<f32>,
         soft_cap: Option<f32>,
     ) {
         if self.encoding == KvEncodingKind::TurboQuant {
             eprintln!("[cellm-cache] WARNING: TurboQuant KV cache is not yet supported in the Metal fused graph path. Falling back to non-fused execution (this is much slower). Please use --kv-encoding f16 for maximum GPU performance.");
             return;
         }
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let scale = attn_scale.unwrap_or_else(|| 1.0f32 / (head_dim as f32).sqrt());
         let seq_ptr = (&seq as *const u32).cast();
         let n_heads_ptr = (&n_heads as *const u32).cast();
         let n_kv_heads_ptr = (&n_kv_heads as *const u32).cast();

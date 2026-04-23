@@ -284,7 +284,7 @@ fn main() -> Result<()> {
     let cfg_json: Value =
         serde_json::from_slice(&cfg_bytes).with_context(|| format!("parse {:?}", config_path))?;
 
-    let text_cfg_json = cfg_json.get("text_config").cloned();
+    let text_cfg_json = cfg_json.get("text_config").cloned().or_else(|| Some(cfg_json.clone()));
     let vision_cfg_json = cfg_json.get("vision_config").cloned();
     let projector_cfg_json = cfg_json
         .get("connector_config")
@@ -328,7 +328,8 @@ fn main() -> Result<()> {
         && !(selected.model_type == "llama"
             || selected.model_type == "smollm3"
             || selected.model_type.starts_with("qwen")
-            || selected.model_type.starts_with("gemma"))
+            || selected.model_type.starts_with("gemma")
+            || selected.model_type == "granitemoehybrid")
     {
         anyhow::bail!(
             "--quantize-int8-symmetric is currently supported for llama/smollm3/qwen/gemma text stacks only (detected model_type={}).",
@@ -369,7 +370,7 @@ fn main() -> Result<()> {
     {
         anyhow::bail!("--gemma4-mixed-i8-i4 requires both --quantize-int4-symmetric and --quantize-int8-symmetric");
     }
-    if args.quantize_int4_symmetric && !(selected.model_type.starts_with("qwen") || selected.model_type.starts_with("gemma")) {
+    if args.quantize_int4_symmetric && !(selected.model_type.starts_with("qwen") || selected.model_type.starts_with("gemma") || selected.model_type == "granitemoehybrid") {
         anyhow::bail!(
             "--quantize-int4-symmetric is currently supported for qwen/gemma text stacks only (detected model_type={}).",
             selected.model_type
@@ -3293,6 +3294,16 @@ fn is_text_tensor_name(name: &str) -> bool {
         || name == "model.lm_head.weight"
 }
 
+fn should_quantize_i8_granite_weight(name: &str, shape: &[usize]) -> bool {
+    if shape.len() != 2 || !name.ends_with(".weight") {
+        return false;
+    }
+    if name.contains("embed_tokens") || name.contains("norm") || name.contains("lm_head") {
+        return false;
+    }
+    name.contains(".self_attn.") || name.contains(".shared_mlp.")
+}
+
 fn should_quantize_i8_llama_weight(name: &str, shape: &[usize]) -> bool {
     if shape.len() != 2 || !name.ends_with(".weight") {
         return false;
@@ -3380,6 +3391,16 @@ fn should_quantize_i4_qwen_weight(name: &str, shape: &[usize]) -> bool {
     false
 }
 
+fn should_quantize_i4_granite_weight(name: &str, shape: &[usize]) -> bool {
+    if shape.len() != 2 || !name.ends_with(".weight") {
+        return false;
+    }
+    if name.contains(".shared_mlp.") {
+        return name.starts_with("model.layers.");
+    }
+    false
+}
+
 fn should_quantize_i2_weight(model_type: &str, name: &str, shape: &[usize]) -> bool {
     if !model_type.starts_with("gemma") {
         return false;
@@ -3387,27 +3408,30 @@ fn should_quantize_i2_weight(model_type: &str, name: &str, shape: &[usize]) -> b
     if shape.len() != 2 || !name.ends_with(".weight") {
         return false;
     }
-    let in_gemma_layer = name.contains("model.layers.")
-        || name.contains("model.text_model.layers.")
-        || name.contains("model.language_model.layers.");
-    if !in_gemma_layer {
-        return false;
-    }
+    // Keep normalization-like tensors in f16.
     if name.contains("norm")
         || name.contains("q_norm")
         || name.contains("k_norm")
+        || name.contains("rope_freqs")
+        || name.contains("layer_output_scale")
+        || name.contains("per_layer_proj_norm")
+    {
+        return false;
+    }
+    // Quantize text stack, vision tower, and audio tower tensors.
+    let is_text_stack = name.starts_with("model.layers.")
+        || name.starts_with("model.text_model.layers.")
+        || name.starts_with("model.language_model.layers.")
         || name.contains("embed_tokens")
         || name.contains("lm_head")
         || name.contains("per_layer_token_embd")
         || name.contains("embed_tokens_per_layer")
-        || name.contains("per_layer_model_proj")
-        || name.contains("per_layer_proj_norm")
-        || name.contains("rope_freqs")
-        || name.contains("layer_output_scale")
-    {
-        return false;
-    }
-    name.contains(".self_attn.") || name.contains(".mlp.")
+        || name.contains("per_layer_model_proj");
+    let is_vision_stack = name.starts_with("model.vision_tower.")
+        || name.contains("embed_vision.");
+    let is_audio_stack = name.starts_with("model.audio_tower.")
+        || name.contains("embed_audio.");
+    is_text_stack || is_vision_stack || is_audio_stack
 }
 
 fn should_quantize_fp8_weight(model_type: &str, name: &str, shape: &[usize]) -> bool {
@@ -3444,6 +3468,9 @@ fn should_quantize_i8_weight(
     }
     if model_type.starts_with("qwen") {
         return should_quantize_i8_qwen_weight(name, shape);
+    }
+    if model_type == "granitemoehybrid" {
+        return should_quantize_i8_granite_weight(name, shape);
     }
     if model_type.starts_with("gemma") {
         if model_type.starts_with("gemma4") && gemma4_mixed_i8_i4 {
@@ -3500,6 +3527,9 @@ fn should_quantize_i4_weight(
     if model_type.starts_with("qwen") {
         return should_quantize_i4_qwen_weight(name, shape);
     }
+    if model_type == "granitemoehybrid" {
+        return should_quantize_i4_granite_weight(name, shape);
+    }
     if model_type.starts_with("gemma") {
         if model_type.starts_with("gemma4") && gemma4_aggressive_int4 {
             if shape.len() != 2 || !name.ends_with(".weight") {
@@ -3515,7 +3545,7 @@ fn should_quantize_i4_weight(
             {
                 return false;
             }
-            // Restrict to text stack tensors only.
+            // Quantize text stack, vision tower, and audio tower tensors.
             let is_text_stack = name.starts_with("model.layers.")
                 || name.starts_with("model.language_model.")
                 || name.starts_with("model.text_model.")
@@ -3523,12 +3553,16 @@ fn should_quantize_i4_weight(
                 || name.contains("per_layer_token_embd")
                 || name.contains("per_layer_model_proj")
                 || name.contains("lm_head");
+            let is_vision_stack = name.starts_with("model.vision_tower.")
+                || name.contains("embed_vision.");
+            let is_audio_stack = name.starts_with("model.audio_tower.")
+                || name.contains("embed_audio.");
             if let Some(i) = extract_layer_index(name) {
                 if gemma4_int4_exclude_layers.contains(&i) {
                     return false;
                 }
             }
-            return is_text_stack;
+            return is_text_stack; // Keep vision/audio in f16 for quality
         }
         if model_type.starts_with("gemma4") && gemma4_balanced_int4 {
             if shape.len() != 2 || !name.ends_with(".weight") {

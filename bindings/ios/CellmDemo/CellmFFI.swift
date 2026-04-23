@@ -191,6 +191,7 @@ final class CellmEngine {
 
     func generate(
         prompt: String,
+        system: String? = nil,
         maxNewTokens: Int,
         imageURL: URL? = nil,
         audioURL: URL? = nil,
@@ -218,7 +219,7 @@ final class CellmEngine {
         let uppercaseConstraintTarget = Self.expectedUppercaseTarget(prompt: prompt)
         let processor = ModelDataProcessorFactory.make(tokenizerURL: tokenizer.tokenizerURL, modelURL: modelURL)
         lastPromptStyle = processor.label
-        let promptText = processor.wrapPrompt(prompt)
+        let promptText = processor.wrapPrompt(prompt, system: system)
         let promptTokens = try tokenizer.encode(promptText)
         lastDebugTrace.append("start backend=\(activeBackend) prompt_style=\(lastPromptStyle) prompt_tokens=\(promptTokens.count)")
         Self.debugLog("generate start backend=\(activeBackend) prompt_style=\(lastPromptStyle) prompt_tokens=\(promptTokens.count) max_new_tokens=\(maxNewTokens)")

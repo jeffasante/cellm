@@ -12,7 +12,7 @@
 use cellm_cache::kvcache::{KvEncodingKind, MetalKvStorage};
 use cellm_core::kv_cache::DeviceKvStorage;
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── helpers ────────
 
 fn lcg(seed: u64) -> impl FnMut() -> f32 {
     let mut s = seed;
@@ -34,7 +34,9 @@ fn assert_allclose(a: &[f32], b: &[f32], max_tol: f32, mean_tol: f32, label: &st
     let mut sum_abs = 0.0f32;
     for (&x, &y) in a.iter().zip(b.iter()) {
         let d = (x - y).abs();
-        if d > max_abs { max_abs = d; }
+        if d > max_abs {
+            max_abs = d;
+        }
         sum_abs += d;
     }
     let mean_abs = sum_abs / a.len() as f32;
@@ -79,8 +81,15 @@ fn cpu_gqa_attention(
         // softmax
         let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut denom = 0.0f32;
-        for s in &mut scores { *s = (*s - max_s).exp(); denom += *s; }
-        if denom > 0.0 { for s in &mut scores { *s /= denom; } }
+        for s in &mut scores {
+            *s = (*s - max_s).exp();
+            denom += *s;
+        }
+        if denom > 0.0 {
+            for s in &mut scores {
+                *s /= denom;
+            }
+        }
         // weighted sum
         let oh = &mut out[h * head_dim..(h + 1) * head_dim];
         for (t, &base) in bases.iter().enumerate() {
@@ -137,8 +146,14 @@ fn run_gqa_parity(soft_cap: Option<f32>, label: &str) {
     // CPU reference.
     let mut cpu_out = vec![0.0f32; N_HEADS * HEAD_DIM];
     cpu_gqa_attention(
-        &k_flat, &v_flat, &bases, &q,
-        N_HEADS, N_KV_HEADS, HEAD_DIM, soft_cap,
+        &k_flat,
+        &v_flat,
+        &bases,
+        &q,
+        N_HEADS,
+        N_KV_HEADS,
+        HEAD_DIM,
+        soft_cap,
         &mut cpu_out,
     );
 
@@ -146,7 +161,14 @@ fn run_gqa_parity(soft_cap: Option<f32>, label: &str) {
     let mut metal_out = vec![0.0f32; N_HEADS * HEAD_DIM];
     storage
         .attention_single_token_gqa_f32(
-            &bases, &q, N_HEADS, N_KV_HEADS, HEAD_DIM, soft_cap, &mut metal_out,
+            &bases,
+            &q,
+            N_HEADS,
+            N_KV_HEADS,
+            HEAD_DIM,
+            None,          // attn_scale (default)
+            soft_cap,
+            &mut metal_out,
         )
         .expect("Metal GQA attention failed");
 

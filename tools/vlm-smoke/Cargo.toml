@@ -8,3 +8,15 @@ anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 cellm-sdk = { path = "../../crates/cellm-sdk" }
 
+[[bin]]
+name = "vlm-smoke"
+path = "src/main.rs"
+
+[[bin]]
+name = "vlm-direct"
+path = "src/vlm_direct.rs"
+
+[[bin]]
+name = "audio-direct"
+path = "src/audio_direct.rs"
+

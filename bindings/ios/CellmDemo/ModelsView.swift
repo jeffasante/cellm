@@ -68,6 +68,16 @@ struct ModelsView: View {
             tokenizerUrl: DemoAssetLinks.smolvlmTokenizer,
             tokenizerConfigName: nil,
             tokenizerConfigUrl: nil
+        ),
+        ModelAssetCard(
+            name: "Bonsai 1.7B (1-Bit)",
+            description: "Ultra-low memory 1-bit model (1.125 bpw). Experimental quantization for extreme efficiency.",
+            fileName: DemoAssetLinks.bonsai1B1BitFileName,
+            url: DemoAssetLinks.bonsai1B1Bit,
+            tokenizerName: DemoAssetLinks.bonsai1B1BitTokenizerFileName,
+            tokenizerUrl: DemoAssetLinks.bonsai1B1BitTokenizer,
+            tokenizerConfigName: DemoAssetLinks.bonsai1B1BitTokenizerConfigFileName,
+            tokenizerConfigUrl: DemoAssetLinks.bonsai1B1BitTokenizerConfig
         )
     ]
     

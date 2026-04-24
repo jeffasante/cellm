@@ -9,6 +9,7 @@ pub mod gemma;
 pub mod gemma_graph;
 pub mod qwen;
 pub mod granite;
+pub mod lfm;
 
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
@@ -17,6 +18,7 @@ pub struct ModelConfig {
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
+    pub head_dim: usize,
     pub intermediate_size: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,

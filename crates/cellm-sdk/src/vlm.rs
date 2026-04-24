@@ -147,7 +147,13 @@ pub fn describe_image_with_cellm_timed(
         && file
             .tensor_index("model.embed_vision.embedding_projection.weight")
             .is_some();
-    if !is_gemma4_vision {
+    let is_idefics3_vision = file
+        .tensor_index("model.vision_model.embeddings.patch_embedding.weight")
+        .is_some()
+        && file
+            .tensor_index("model.connector.modality_projection.proj.weight")
+            .is_some();
+    if !is_gemma4_vision && !is_idefics3_vision {
         anyhow::bail!("This model does not support image input");
     }
     let model_type = effective_text_model_type(&file.header);
@@ -3104,18 +3110,18 @@ fn self_attention_full(
     let hidden = num_heads * head_dim;
     let scale = scale_override.unwrap_or(1.0f32 / (head_dim as f32).sqrt());
 
-    if valid_mask.is_none() {
-        if let LinearBackend::Metal { ctx, .. } = backend {
-            if self_attention_full_metal(
-                ctx, q, k, v, seq, num_heads, head_dim, scale, score_buf, prob_buf, out,
-            )
-            .is_ok()
-            {
-                return;
-            }
+    // Try Metal path first (now supports valid_mask)
+    if let LinearBackend::Metal { ctx, .. } = backend {
+        if self_attention_full_metal(
+            ctx, q, k, v, seq, num_heads, head_dim, scale, score_buf, prob_buf, out, valid_mask,
+        )
+        .is_ok()
+        {
+            return;
         }
     }
 
+    // CPU fallback
     if let Some(mask) = valid_mask {
         for h in 0..num_heads {
             let offset = h * head_dim;
@@ -3165,16 +3171,7 @@ fn self_attention_full(
         return;
     }
 
-    if let LinearBackend::Metal { ctx, .. } = backend {
-        if self_attention_full_metal(
-            ctx, q, k, v, seq, num_heads, head_dim, scale, score_buf, prob_buf, out,
-        )
-        .is_ok()
-        {
-            return;
-        }
-    }
-
+    // CPU fallback for non-masked case (should rarely be reached if Metal is available)
     for h in 0..num_heads {
         let offset = h * head_dim;
         for i in 0..seq {
@@ -3225,6 +3222,7 @@ fn self_attention_full_metal(
     score_buf: &mut [f32],
     prob_buf: &mut [f32],
     out: &mut [f32],
+    valid_mask: Option<&[bool]>,
 ) -> Result<()> {
     let hidden = num_heads * head_dim;
     let mut qh = vec![0.0f32; seq * head_dim];
@@ -3250,6 +3248,25 @@ fn self_attention_full_metal(
         ctx.matmul_row_major_f32(&qh, seq, head_dim, &kh_t, seq, &mut scores)?;
         for val in &mut scores {
             *val *= scale;
+        }
+
+        // Apply mask if present: set masked positions to -inf before softmax
+        if let Some(mask) = valid_mask {
+            for i in 0..seq {
+                if !mask[i] {
+                    // Query position is masked: zero out entire row
+                    for j in 0..seq {
+                        scores[i * seq + j] = f32::NEG_INFINITY;
+                    }
+                } else {
+                    // Query is valid, but key positions may be masked
+                    for j in 0..seq {
+                        if !mask[j] {
+                            scores[i * seq + j] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
+            }
         }
 
         for i in 0..seq {

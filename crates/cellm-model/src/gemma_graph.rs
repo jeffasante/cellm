@@ -337,7 +337,7 @@ impl GemmaGraphState {
                     self.ops.encode_rms_norm_f16w_at(
                         enc,
                         &self.q_buf, byte_off,
-                        w_qn,
+                        w_qn, 0,
                         &self.q_buf, byte_off,
                         head_dim, cfg.rms_norm_eps, add_one,
                     );
@@ -352,7 +352,7 @@ impl GemmaGraphState {
                     self.ops.encode_rms_norm_f16w_at(
                         enc,
                         &self.k_buf, byte_off,
-                        w_kn,
+                        w_kn, 0,
                         &self.k_buf, byte_off,
                         kv_head_dim, cfg.rms_norm_eps, add_one,
                     );

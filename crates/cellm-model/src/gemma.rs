@@ -90,6 +90,7 @@ impl GemmaRunner {
             intermediate_size: h.intermediate_size,
             rms_norm_eps: h.rms_norm_eps,
             rope_theta: h.rope_theta,
+            head_dim: h.head_dim.unwrap_or(0),
         };
 
         let tensor_prefix = detect_gemma_prefix(&file)?;
@@ -1466,7 +1467,7 @@ impl GemmaRunner {
                         out_dim
                     )));
                 }
-                cellm_kernels::cpu_kernels::matmul_i4_f32(w, s, out_dim, in_dim, x, out);
+                cellm_kernels::cpu_kernels::matmul_i4_f32(w, s, out_dim, in_dim, in_dim, x, out);
             }
             "i2" => {
                 let w = self.tensor_u8_by_exact_name(&resolved)?;

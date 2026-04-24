@@ -45,6 +45,7 @@ impl LlamaRunner {
             num_hidden_layers: h.num_layers,
             num_attention_heads: h.num_heads,
             num_key_value_heads: h.num_kv_heads,
+            head_dim: h.head_dim.unwrap_or(h.hidden_dim / h.num_heads),
             intermediate_size: h.intermediate_size,
             rms_norm_eps: h.rms_norm_eps,
             rope_theta: h.rope_theta,
@@ -282,7 +283,7 @@ impl LlamaRunner {
         // ... (rest of the function continues below)
         let n_heads = cfg.num_attention_heads;
         let n_kv_heads = cfg.num_key_value_heads;
-        let head_dim = hidden / n_heads;
+        let head_dim = cfg.head_dim;
         if head_dim * n_heads != hidden {
             return Err(CoreError::Backend(
                 "llama: hidden_size must be divisible by num_attention_heads".into(),
@@ -495,7 +496,7 @@ impl LlamaRunner {
 
         // Final norm.
         let use_metal_norm = self.metal_ops.is_some() && self.use_metal_norm;
-        let use_metal_logits = self.metal_ops.is_some();
+        // Note: use_metal_logits is checked after we know the lm dtype; i4/i2 must use CPU path
         let mut x_final = vec![0.0f32; hidden];
         if use_metal_norm {
             let w = self.tensor_f16("model.norm.weight")?;
@@ -532,8 +533,14 @@ impl LlamaRunner {
             .tensor_meta_by_exact_name(&lm_src_resolved)
             .ok_or_else(|| CoreError::Backend(format!("unknown tensor {}", lm_src_resolved)))?;
 
+        let lm_dtype_raw = lm_meta.dtype.clone();
+        let lm_dtype = lm_dtype_raw.trim().to_ascii_lowercase();
+        // Metal logits only supports f16 and i8; i4/i2 must use CPU path
+        let use_metal_logits = self.metal_ops.is_some() 
+            && lm_dtype != "i4" && lm_dtype != "i2";
+
         if use_metal_logits {
-            match lm_meta.dtype.as_str() {
+            match lm_dtype.as_str() {
                 "f16" => {
                     let w = self.tensor_f16_by_exact_name(&lm_src_resolved)?;
                     let w_ptr = w.as_ptr();
@@ -556,23 +563,36 @@ impl LlamaRunner {
                         .logits_i8(&x_final, &w, &s, vocab, hidden, &lm_src_resolved, &mut buf)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                 }
+                "i4" | "i2" => {}
                 other => return Err(CoreError::Backend(format!("unsupported lm dtype {other} for {lm_src_resolved}"))),
             }
-            sanitize_logits_non_finite(&mut buf, "llama metal logits");
-            return Ok(buf);
+            if lm_dtype == "f16" || lm_dtype == "i8" {
+                sanitize_logits_non_finite(&mut buf, "llama metal logits");
+                return Ok(buf);
+            }
         }
 
-        let lm_src_f16 = if lm_meta.dtype == "f16" {
+        let lm_src_f16 = if lm_dtype == "f16" {
             Some(self.tensor_f16_by_exact_name(&lm_src_resolved)?)
         } else {
             None
         };
-        let lm_src_i8 = if lm_meta.dtype == "i8" {
+        let lm_src_i8 = if lm_dtype == "i8" {
             Some(self.tensor_i8_by_exact_name(&lm_src_resolved)?)
         } else {
             None
         };
-        let lm_i8_scales = if lm_meta.dtype == "i8" {
+        let lm_i8_scales = if lm_dtype == "i8" {
+            Some(self.tensor_f16_by_exact_name(&format!("{lm_src_resolved}.qscale"))?)
+        } else {
+            None
+        };
+        let lm_src_i4 = if lm_dtype == "i4" {
+            Some(self.tensor_u8_by_exact_name(&lm_src_resolved)?)
+        } else {
+            None
+        };
+        let lm_i4_scales = if lm_dtype == "i4" {
             Some(self.tensor_f16_by_exact_name(&format!("{lm_src_resolved}.qscale"))?)
         } else {
             None
@@ -587,7 +607,7 @@ impl LlamaRunner {
                 }
                 acc
             } else if let Some(w) = lm_src_i8 {
-                let scales = lm_i8_scales.unwrap();
+                let scales = lm_i8_scales.as_ref().unwrap();
                 let row = &w[vid * hidden..(vid + 1) * hidden];
                 let scale = f16::from_bits(scales[vid]).to_f32();
                 let mut acc = 0.0f32;
@@ -595,10 +615,26 @@ impl LlamaRunner {
                     acc += x_final[i] * ((row[i] as f32) * scale);
                 }
                 acc
+            } else if let (Some(w), Some(scales)) = (&lm_src_i4, &lm_i4_scales) {
+                let row_stride = hidden.div_ceil(2);
+                let row = &w[vid * row_stride..(vid + 1) * row_stride];
+                let scale = f16::from_bits(scales[vid]).to_f32();
+                // Unpack i4 values: each byte holds 2 values
+                let mut acc = 0.0f32;
+                for i in 0..hidden {
+                    let packed = row[i / 2];
+                    let val = if i % 2 == 0 {
+                        ((packed & 0x0F) as i8 - 8) as f32
+                    } else {
+                        ((packed >> 4) as i8 - 8) as f32
+                    };
+                    acc += x_final[i] * val * scale;
+                }
+                acc
             } else {
                 return Err(CoreError::Backend(format!(
                     "unsupported lm dtype {}",
-                    lm_meta.dtype
+                    lm_dtype_raw
                 )));
             };
             if !dot.is_finite() {
@@ -627,18 +663,63 @@ impl LlamaRunner {
         Ok(cast_slice(bytes))
     }
 
+    fn tensor_u8_by_exact_name(&self, resolved: &str) -> Result<&[u8], CoreError> {
+        let bytes = self.file.tensor_bytes(resolved)?;
+        Ok(bytes)
+    }
+
     fn tensor_meta_by_exact_name(&self, resolved: &str) -> Option<&crate::CellmTensorIndex> {
         self.file.tensor_index(resolved)
     }
 
     fn embed_token(&self, token: u32, out: &mut [f32]) -> Result<(), CoreError> {
         let hidden = out.len();
-        let embed = self.tensor_f16("model.embed_tokens.weight")?;
+        let name = "model.embed_tokens.weight";
+        let resolved = self.resolve_name(name)?;
+        let meta = self.tensor_meta_by_exact_name(&resolved).ok_or_else(|| {
+            CoreError::Backend(format!("unknown tensor {resolved}"))
+        })?;
         let vocab = self.cfg.vocab_size;
         let t = (token as usize) % vocab;
-        let row = &embed[t * hidden..(t + 1) * hidden];
-        for i in 0..hidden {
-            out[i] = f16::from_bits(row[i]).to_f32();
+
+        match meta.dtype.as_str() {
+            "f16" => {
+                let embed = self.tensor_f16_by_exact_name(&resolved)?;
+                let row = &embed[t * hidden..(t + 1) * hidden];
+                for i in 0..hidden {
+                    out[i] = f16::from_bits(row[i]).to_f32();
+                }
+            }
+            "i8" => {
+                let embed = self.tensor_i8_by_exact_name(&resolved)?;
+                let scales = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
+                let scale = f16::from_bits(scales[t]).to_f32();
+                let row = &embed[t * hidden..(t + 1) * hidden];
+                for i in 0..hidden {
+                    out[i] = (row[i] as f32) * scale;
+                }
+            }
+            "i4" => {
+                let embed = self.tensor_u8_by_exact_name(&resolved)?;
+                let scales = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
+                let scale = f16::from_bits(scales[t]).to_f32();
+                let row_stride = hidden.div_ceil(2);
+                let row = &embed[t * row_stride..(t + 1) * row_stride];
+                for i in 0..hidden {
+                    let packed = row[i / 2];
+                    let val = if i % 2 == 0 {
+                        ((packed & 0x0F) as i8 - 8) as f32
+                    } else {
+                        ((packed >> 4) as i8 - 8) as f32
+                    };
+                    out[i] = val * scale;
+                }
+            }
+            other => {
+                return Err(CoreError::Backend(format!(
+                    "unsupported embed dtype for {name}: {other}"
+                )));
+            }
         }
         Ok(())
     }
@@ -724,6 +805,22 @@ impl LlamaRunner {
                         .as_mut()
                         .unwrap()
                         .logits_i8(x, w, s, out_dim, in_dim, &resolved, out)
+                        .map_err(|e| CoreError::Backend(e.to_string()))?;
+                    return Ok(());
+                }
+                "i4" => {
+                    let w = self.tensor_u8_by_exact_name(&resolved)?;
+                    let s = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
+                    let w_ptr = w.as_ptr();
+                    let w_len = w.len();
+                    let s_ptr = s.as_ptr();
+                    let s_len = s.len();
+                    let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
+                    let s = unsafe { std::slice::from_raw_parts(s_ptr as *const u16, s_len) };
+                    self.metal_ops
+                        .as_mut()
+                        .unwrap()
+                        .logits_i4(x, w, s, out_dim, in_dim, in_dim, &resolved, out)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                     return Ok(());
                 }
@@ -826,6 +923,12 @@ impl LlamaRunner {
                     )));
                 }
                 cellm_kernels::cpu_kernels::matmul_i8_f32(w, s, out_dim, in_dim, x, out);
+            }
+            "i4" => {
+                let resolved = self.resolve_name(weight_name)?;
+                let w = self.tensor_u8_by_exact_name(&resolved)?;
+                let s = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
+                cellm_kernels::cpu_kernels::matmul_i4_f32(w, s, out_dim, in_dim, in_dim, x, out);
             }
             other => {
                 return Err(CoreError::Backend(format!(
@@ -1000,6 +1103,8 @@ fn detect_llama_prefix(file: &CellmFile) -> Result<String, CoreError> {
         .is_some()
         && file.tensor_index("model.text_model.norm.weight").is_some()
     {
+        // The checkpoint uses the “model.text_model” namespace.
+        // Returning an empty prefix lets the weight‑lookup fallback prepend the correct name.
         return Ok(String::new());
     }
     Err(CoreError::Backend(

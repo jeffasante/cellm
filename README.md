@@ -65,6 +65,11 @@ flowchart LR
 ```
 
 ---
+ 
+## Inference Demo
+
+![Inference Demo](assets/inference_hq.gif)
+
 
 ## Why cellm?
 

@@ -106,18 +106,34 @@ impl LlamaGraphState {
         if let Some(a) = alt {
             if let Some(w) = self.weights.get(a) { return w; }
         }
-        // Fallback: try removing 'model.' prefix if it was added
+        // Fallback: try removing 'model.' prefix if it was added,
+        // and also try the 'model.text_model.' prefix which some converted
+        // checkpoints use (e.g., smolvlm models). This makes the loader robust
+        // to both naming conventions.
         if name.starts_with("model.") {
-            if let Some(w) = self.weights.get(&name[6..]) { return w; }
+            // Strip the leading "model."
+            let stripped = &name[6..];
+            if let Some(w) = self.weights.get(stripped) { return w; }
+            // Try with "model.text_model." prefix added back
+            let txt_name = format!("model.text_model.{}", stripped);
+            if let Some(w) = self.weights.get(&txt_name) { return w; }
         }
         panic!("Weight not found: {} (alt: {:?})", name, alt);
     }
 
     fn try_get_weight(&self, name: &str) -> Option<&Buffer> {
-        self.weights.get(name)
-            .or_else(|| {
-                if name.starts_with("model.") { self.weights.get(&name[6..]) } else { None }
-            })
+        self.weights.get(name).or_else(|| {
+            if name.starts_with("model.") {
+                // Strip the leading "model."
+                let stripped = &name[6..];
+                // First try the raw stripped name
+                if let Some(w) = self.weights.get(stripped) { return Some(w); }
+                // Then try the "model.text_model." prefixed version
+                let txt_name = format!("model.text_model.{}", stripped);
+                return self.weights.get(&txt_name);
+            }
+            None
+        })
     }
 
     pub fn step_fused(

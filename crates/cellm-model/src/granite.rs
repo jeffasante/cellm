@@ -45,6 +45,7 @@ impl GraniteRunner {
             num_hidden_layers: h.num_layers,
             num_attention_heads: h.num_heads,
             num_key_value_heads: h.num_kv_heads,
+            head_dim: h.head_dim.unwrap_or(h.hidden_dim / h.num_heads),
             intermediate_size: h.intermediate_size,
             rms_norm_eps: h.rms_norm_eps,
             rope_theta: h.rope_theta,
@@ -219,7 +220,7 @@ impl GraniteRunner {
         let hidden = cfg.hidden_size;
         let n_heads = cfg.num_attention_heads;
         let n_kv_heads = cfg.num_key_value_heads;
-        let head_dim = hidden / n_heads;
+        let head_dim = cfg.head_dim;
         let kv_dim = n_kv_heads * head_dim;
 
         // Ensure pagetable covers this token position.

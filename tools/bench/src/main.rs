@@ -17,7 +17,7 @@ use anyhow::Result;
 use clap::Parser;
 use cellm_cache::{KVCache, PageTable};
 use cellm_core::KvCacheLayout;
-use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, qwen::QwenRunner, CellmFile};
+use cellm_model::{gemma::GemmaRunner, lfm::LfmRunner, llama::LlamaRunner, qwen::QwenRunner, CellmFile};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
@@ -75,14 +75,16 @@ fn main() -> Result<()> {
         Llama(LlamaRunner),
         Gemma(GemmaRunner),
         Qwen(QwenRunner),
+        Lfm(LfmRunner),
     }
 
     let mut runner = match header.model_type.as_str() {
         "llama" => Runner::Llama(LlamaRunner::load(&args.model)?),
         t if t.starts_with("gemma") => Runner::Gemma(GemmaRunner::load(&args.model)?),
         t if t.starts_with("qwen") => Runner::Qwen(QwenRunner::load(&args.model)?),
+        "lfm" | "lfm2" => Runner::Lfm(LfmRunner::load(&args.model)?),
         _ => anyhow::bail!(
-            "bench supports only llama/gemma/qwen right now (model_type={:?})",
+            "bench supports only llama/gemma/qwen/lfm right now (model_type={:?})",
             header.model_type
         ),
     };
@@ -92,6 +94,7 @@ fn main() -> Result<()> {
             Runner::Llama(r) => r.set_max_layers(n),
             Runner::Gemma(r) => r.set_max_layers(n),
             Runner::Qwen(r) => r.set_max_layers(n),
+            Runner::Lfm(r) => r.set_max_layers(n),
         }
     }
 
@@ -99,6 +102,7 @@ fn main() -> Result<()> {
         Runner::Llama(r) => r.config().clone(),
         Runner::Gemma(r) => r.config().clone(),
         Runner::Qwen(r) => r.config().clone(),
+        Runner::Lfm(r) => r.config().clone(),
     };
 
     let tokenizer = if args.prompt.is_some() {
@@ -126,6 +130,7 @@ fn main() -> Result<()> {
         Runner::Llama(_) => cfg.hidden_size / cfg.num_attention_heads,
         Runner::Gemma(_) => infer_gemma_kv_head_dim(&file)?,
         Runner::Qwen(_) => infer_qwen_kv_head_dim(&file)?,
+        Runner::Lfm(_) => infer_lfm_head_dim(&file)?,
     };
     let total_tokens = seq + args.gen + 8;
     let total_blocks = args
@@ -162,6 +167,7 @@ fn main() -> Result<()> {
             Runner::Llama(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
             Runner::Gemma(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
             Runner::Qwen(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
+            Runner::Lfm(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
         };
         recent.push(tok);
         next = cand[0].0;
@@ -178,6 +184,7 @@ fn main() -> Result<()> {
             Runner::Llama(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
             Runner::Gemma(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
             Runner::Qwen(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
+            Runner::Lfm(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
         };
         cur = cand[0].0;
         recent.push(cur);
@@ -214,6 +221,26 @@ fn infer_gemma_kv_head_dim(file: &CellmFile) -> Result<usize> {
         }
     }
     anyhow::bail!("unable to infer gemma KV head_dim (no self_attn.k_proj.weight found in tensor list)")
+}
+
+fn infer_lfm_head_dim(file: &CellmFile) -> Result<usize> {
+    let h = &file.header;
+    // First check if head_dim is explicitly stored
+    if let Some(hd) = h.head_dim {
+        return Ok(hd);
+    }
+    // Otherwise infer from k_proj tensor shape
+    let kv_heads = h.num_kv_heads.max(1);
+    for t in &h.tensors {
+        if t.name.contains(".self_attn.k_proj.weight") && t.shape.len() == 2 {
+            let kv_dim = t.shape[0];
+            if kv_dim % kv_heads == 0 {
+                return Ok(kv_dim / kv_heads);
+            }
+        }
+    }
+    // Fallback: use hidden / num_heads
+    Ok(h.hidden_dim / h.num_heads)
 }
 
 fn load_tokenizer(path: &std::path::Path) -> Result<Tokenizer> {

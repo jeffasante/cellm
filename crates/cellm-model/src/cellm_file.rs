@@ -30,6 +30,7 @@ pub struct CellmHeader {
     pub num_layers: usize,
     pub num_heads: usize,
     pub num_kv_heads: usize,
+    pub head_dim: Option<usize>,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub bos_token_id: Option<u32>,
@@ -141,5 +142,9 @@ impl CellmFile {
         let start = t.offset_bytes as usize;
         let end = start + t.nbytes as usize;
         Ok(&self.mmap[start..end])
+    }
+
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
     }
 }

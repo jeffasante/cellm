@@ -129,6 +129,7 @@ struct HfConfigRoot {
     num_hidden_layers: Option<usize>,
     num_attention_heads: Option<usize>,
     num_key_value_heads: Option<usize>,
+    head_dim: Option<usize>,
     rms_norm_eps: Option<f32>,
     rope_theta: Option<f32>,
     bos_token_id: Option<Value>,
@@ -155,6 +156,7 @@ struct HfTextConfig {
     num_hidden_layers: Option<usize>,
     num_attention_heads: Option<usize>,
     num_key_value_heads: Option<usize>,
+    head_dim: Option<usize>,
     rms_norm_eps: Option<f32>,
     rope_theta: Option<f32>,
     bos_token_id: Option<u32>,
@@ -201,6 +203,7 @@ struct CellmHeader {
     num_layers: usize,
     num_heads: usize,
     num_kv_heads: usize,
+    head_dim: Option<usize>,
     rms_norm_eps: f32,
     rope_theta: f32,
     bos_token_id: Option<u32>,
@@ -319,7 +322,10 @@ fn main() -> Result<()> {
         .and_then(|q| q.mode.as_deref());
     let has_4bit_affine = matches!((quant_bits, quant_mode), (Some(4), Some("affine")));
 
-    if has_4bit_affine && !args.dequant_4bit_affine {
+    // LFM models use pre-quantized 4-bit weights with .scales/.biases suffixes - handle them specially
+    let is_lfm = selected.model_type == "lfm2" || selected.model_type == "lfm";
+    
+    if has_4bit_affine && !args.dequant_4bit_affine && !is_lfm {
         anyhow::bail!(
             "input appears to be 4-bit affine quantized (uint32 weights + scales/biases). Re-run with --dequant-4bit-affine to expand weights to f16."
         );
@@ -329,7 +335,8 @@ fn main() -> Result<()> {
             || selected.model_type == "smollm3"
             || selected.model_type.starts_with("qwen")
             || selected.model_type.starts_with("gemma")
-            || selected.model_type == "granitemoehybrid")
+            || selected.model_type == "granitemoehybrid"
+            || selected.model_type == "lfm2")
     {
         anyhow::bail!(
             "--quantize-int8-symmetric is currently supported for llama/smollm3/qwen/gemma text stacks only (detected model_type={}).",
@@ -370,7 +377,7 @@ fn main() -> Result<()> {
     {
         anyhow::bail!("--gemma4-mixed-i8-i4 requires both --quantize-int4-symmetric and --quantize-int8-symmetric");
     }
-    if args.quantize_int4_symmetric && !(selected.model_type.starts_with("qwen") || selected.model_type.starts_with("gemma") || selected.model_type == "granitemoehybrid") {
+    if args.quantize_int4_symmetric && !(selected.model_type.starts_with("qwen") || selected.model_type.starts_with("gemma") || selected.model_type == "granitemoehybrid" || selected.model_type == "lfm2") {
         anyhow::bail!(
             "--quantize-int4-symmetric is currently supported for qwen/gemma text stacks only (detected model_type={}).",
             selected.model_type
@@ -425,6 +432,7 @@ fn main() -> Result<()> {
         num_layers: selected.num_hidden_layers,
         num_heads: selected.num_attention_heads,
         num_kv_heads: selected.num_key_value_heads,
+        head_dim: selected.head_dim,
         rms_norm_eps: selected.rms_norm_eps,
         rope_theta: selected.rope_theta,
         bos_token_id: selected.bos_token_id,
@@ -891,6 +899,7 @@ struct GgufMeta {
     feed_forward_length: Option<usize>,
     head_count: Option<usize>,
     head_count_kv: Option<usize>,
+    head_dim: Option<usize>,
     rms_norm_eps: Option<f32>,
     rope_freq_base: Option<f32>,
     context_length: Option<usize>,
@@ -1354,6 +1363,7 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
         num_layers,
         num_heads,
         num_kv_heads,
+        head_dim: parsed.meta.head_dim,
         rms_norm_eps,
         rope_theta,
         bos_token_id: parsed.meta.bos_token_id,
@@ -3380,15 +3390,12 @@ fn should_quantize_i4_qwen_weight(name: &str, shape: &[usize]) -> bool {
     if shape.len() != 2 || !name.ends_with(".weight") {
         return false;
     }
-    // Mixed strategy for Qwen: quantize MLP linears, keep attention projections
-    // and embeddings in f16 for better generation quality at modest size.
-    if name.contains(".mlp.") {
-        return name.starts_with("model.layers.")
-            || name.starts_with("model.language_model.")
-            || name.starts_with("language_model.model.")
-            || name.starts_with("model.text_model.");
-    }
-    false
+    // Aggressive strategy for Qwen: quantize everything to hit size targets.
+    // normalizations are typically 1D and caught by shape.len() != 2.
+    name.contains(".mlp.")
+        || name.contains(".self_attn.")
+        || name.contains("embed_tokens")
+        || name.contains("lm_head")
 }
 
 fn should_quantize_i4_granite_weight(name: &str, shape: &[usize]) -> bool {
@@ -4070,6 +4077,7 @@ struct SelectedTextConfig {
     num_hidden_layers: usize,
     num_attention_heads: usize,
     num_key_value_heads: usize,
+    head_dim: Option<usize>,
     rms_norm_eps: f32,
     rope_theta: f32,
     bos_token_id: Option<u32>,
@@ -4124,6 +4132,7 @@ fn select_text_config(cfg: &HfConfigRoot) -> Result<SelectedTextConfig> {
             .or_else(|| nested.and_then(|t| t.num_key_value_heads)),
         "num_key_value_heads",
     )?;
+    let head_dim = cfg.head_dim.or_else(|| nested.and_then(|t| t.head_dim));
 
     let rms_norm_eps = cfg
         .rms_norm_eps
@@ -4189,6 +4198,7 @@ fn select_text_config(cfg: &HfConfigRoot) -> Result<SelectedTextConfig> {
         num_hidden_layers,
         num_attention_heads,
         num_key_value_heads,
+        head_dim,
         rms_norm_eps,
         rope_theta,
         bos_token_id: parse_token_id(cfg.bos_token_id.as_ref())

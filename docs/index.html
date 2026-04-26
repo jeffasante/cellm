@@ -820,7 +820,13 @@
                             contentView.querySelectorAll(`[${attr}]`).forEach(el => {
                                 const val = el.getAttribute(attr);
                                 if (val && !val.startsWith('http') && !val.startsWith('/') && !val.startsWith('#') && !val.startsWith('data:')) {
-                                    el.setAttribute(attr, baseDir + val);
+                                    // For links, we want them to stay relative to the root for navigation
+                                    // unless they are internal anchors
+                                    if (attr === 'href' && val.endsWith('.md')) {
+                                        el.setAttribute(attr, baseDir + val);
+                                    } else if (attr !== 'href') {
+                                        el.setAttribute(attr, baseDir + val);
+                                    }
                                 }
                             });
                         };

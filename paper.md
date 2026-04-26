@@ -656,19 +656,19 @@ hf download Qwen/Qwen3.5-0.8B --local-dir models/hf/qwen3.5-0.8b
 # f16
 ./target/release/convert \
   --input models/hf/qwen3.5-0.8b \
-  --output models/to-huggingface/qwen3.5-0.8b-f16-v1/qwen3.5-0.8b-f16-v1.cellm \
+  --output models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-f16.cellm \
   --dtype f16
 
 # int4
 ./target/release/convert \
   --input models/hf/qwen3.5-0.8b \
-  --output models/to-huggingface/qwen3.5-0.8b-i4-v1/qwen3.5-0.8b-i4-v1.cellm \
+  --output models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-i4.cellm \
   --quantize-int4-symmetric
 
 # 1-bit
 ./target/release/convert \
   --input models/hf/qwen3.5-0.8b \
-  --output models/to-huggingface/qwen3.5-0.8b-q1-v1/qwen3.5-0.8b-q1-v1.cellm \
+  --output models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-q1.cellm \
   --quantize-int1-symmetric
 ```
 
@@ -677,8 +677,8 @@ hf download Qwen/Qwen3.5-0.8B --local-dir models/hf/qwen3.5-0.8b
 ```bash
 # CPU
 ./target/release/infer \
-  --model models/to-huggingface/qwen3.5-0.8b-f16-v1/qwen3.5-0.8b-f16-v1.cellm \
-  --tokenizer models/to-huggingface/qwen3.5-0.8b-f16-v1/tokenizer.json \
+  --model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-f16.cellm \
+  --tokenizer models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
   --prompt "Hello, who are you?" \
   --chat --chat-format auto \
   --gen 64 --temperature 0 --backend cpu --kv-encoding f16
@@ -689,8 +689,8 @@ hf download Qwen/Qwen3.5-0.8B --local-dir models/hf/qwen3.5-0.8b
 ```bash
 # CPU
 ./target/release/infer \
-  --model models/to-huggingface/qwen3.5-0.8b-i4-v1/qwen3.5-0.8b-i4-v1.cellm \
-  --tokenizer models/to-huggingface/qwen3.5-0.8b-i4-v1/tokenizer.json \
+  --model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-i4.cellm \
+  --tokenizer models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
   --prompt "Hello, who are you?" \
   --chat --chat-format auto \
   --gen 64 --temperature 0 --backend cpu --kv-encoding f16
@@ -701,8 +701,8 @@ hf download Qwen/Qwen3.5-0.8B --local-dir models/hf/qwen3.5-0.8b
 ```bash
 # CPU (research only, output is incoherent at 0.8B)
 ./target/release/infer \
-  --model models/to-huggingface/qwen3.5-0.8b-q1-v1/qwen3.5-0.8b-q1-v1.cellm \
-  --tokenizer models/to-huggingface/qwen3.5-0.8b-q1-v1/tokenizer.json \
+  --model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-q1.cellm \
+  --tokenizer models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
   --prompt "Hello" \
   --gen 32 --temperature 0 --backend cpu --kv-encoding f16
 ```

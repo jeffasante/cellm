@@ -765,10 +765,15 @@
                     const html = marked.parse(text);
                     contentView.innerHTML = html;
 
-                    // Fixup relative paths for assets if the file is in a different directory
-                    if (hash.includes('/')) {
-                        const baseDir = hash.substring(0, hash.lastIndexOf('/') + 1);
-                        
+                    // Determine base directory for relative assets
+                    let baseDir = '';
+                    if (hash === 'README.md') {
+                        baseDir = '../'; // Main README assets are in the root
+                    } else if (hash.includes('/')) {
+                        baseDir = hash.substring(0, hash.lastIndexOf('/') + 1);
+                    }
+
+                    if (baseDir) {
                         const fixPath = (attr) => {
                             contentView.querySelectorAll(`[${attr}]`).forEach(el => {
                                 const val = el.getAttribute(attr);

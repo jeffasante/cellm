@@ -780,7 +780,7 @@
                     // Determine base directory for relative assets
                     let baseDir = '';
                     if (hash === 'README.md') {
-                        baseDir = '../'; // Main README assets are in the root
+                        baseDir = ''; // Main README is local to docs/ with local assets/
                     } else if (hash.includes('/')) {
                         baseDir = hash.substring(0, hash.lastIndexOf('/') + 1);
                     }

@@ -3481,41 +3481,27 @@ fn should_quantize_q1_weight(model_type: &str, name: &str, shape: &[usize], num_
     if shape.len() != 2 || !name.ends_with(".weight") {
         return false;
     }
-    // Keep norms in f16
+    // Keep norms, embeddings, lm_head in f16
     if name.contains("norm") || name.contains("rope_freqs")
         || name.contains("layer_output_scale") || name.contains("per_layer_proj_norm")
-    {
-        return false;
-    }
-    // Keep embeddings and lm_head in f16 — extremely sensitive at 1-bit
-    if name.contains("embed_tokens") || name.contains("lm_head")
+        || name.contains("embed_tokens") || name.contains("lm_head")
         || name.contains("per_layer_token_embd") || name.contains("embed_tokens_per_layer")
         || name.contains("per_layer_model_proj")
     {
         return false;
     }
-    // Keep first and last 2 layers in f16 for stability
+    // Keep first and last 2 layers entirely in f16
     if let Some(layer_idx) = extract_layer_index(name) {
         if layer_idx < 2 || layer_idx >= num_layers.saturating_sub(2) {
             return false;
         }
     }
-    // Only quantize layer projections
-    name.starts_with("model.layers.")
-        || name.starts_with("model.text_model.layers.")
-        || name.starts_with("model.language_model.layers.")
-}
-
-fn extract_layer_index(name: &str) -> Option<usize> {
-    // Match patterns like "model.layers.5." or "model.text_model.layers.12."
-    for prefix in &["model.layers.", "model.text_model.layers.", "model.language_model.layers."] {
-        if let Some(rest) = name.strip_prefix(prefix) {
-            if let Some(dot_pos) = rest.find('.') {
-                return rest[..dot_pos].parse::<usize>().ok();
-            }
-        }
+    // Keep attention projections in f16 — they're sensitive
+    // Only quantize MLP (gate/up/down) projections to 1-bit
+    if name.contains(".self_attn.") || name.contains("linear_attn.") {
+        return false;
     }
-    None
+    name.contains(".mlp.")
 }
 
 fn should_quantize_fp8_weight(model_type: &str, name: &str, shape: &[usize]) -> bool {

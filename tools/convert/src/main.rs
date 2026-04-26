@@ -3458,50 +3458,40 @@ fn should_quantize_i2_weight(model_type: &str, name: &str, shape: &[usize]) -> b
     {
         return false;
     }
-    // Quantize text stack, vision tower, and audio tower tensors.
-    let is_text_stack = name.starts_with("model.layers.")
+    // Keep embeddings and lm_head in f16 — extremely sensitive at low bits
+    if name.contains("embed_tokens") || name.contains("lm_head")
+        || name.contains("per_layer_token_embd") || name.contains("embed_tokens_per_layer")
+        || name.contains("per_layer_model_proj")
+    {
+        return false;
+    }
+    // Quantize layer projections in text stack
+    name.starts_with("model.layers.")
         || name.starts_with("model.text_model.layers.")
         || name.starts_with("model.language_model.layers.")
-        || name.contains("embed_tokens")
-        || name.contains("lm_head")
-        || name.contains("per_layer_token_embd")
-        || name.contains("embed_tokens_per_layer")
-        || name.contains("per_layer_model_proj");
-    let is_vision_stack = name.starts_with("model.vision_tower.")
-        || name.contains("embed_vision.");
-    let is_audio_stack = name.starts_with("model.audio_tower.")
-        || name.contains("embed_audio.");
-    is_text_stack || is_vision_stack || is_audio_stack
 }
 
-fn should_quantize_q1_weight(model_type: &str, name: &str, shape: &[usize], num_layers: usize) -> bool {
+fn should_quantize_q1_weight(model_type: &str, name: &str, shape: &[usize], _num_layers: usize) -> bool {
     if !model_type.starts_with("gemma") && !model_type.starts_with("qwen") {
         return false;
     }
     if shape.len() != 2 || !name.ends_with(".weight") {
         return false;
     }
-    // Keep norms, embeddings, lm_head in f16
+    // Keep only norms in f16 — everything else gets 1-bit
     if name.contains("norm") || name.contains("rope_freqs")
         || name.contains("layer_output_scale") || name.contains("per_layer_proj_norm")
-        || name.contains("embed_tokens") || name.contains("lm_head")
-        || name.contains("per_layer_token_embd") || name.contains("embed_tokens_per_layer")
-        || name.contains("per_layer_model_proj")
     {
         return false;
     }
-    // Keep first and last 2 layers entirely in f16
-    if let Some(layer_idx) = extract_layer_index(name) {
-        if layer_idx < 2 || layer_idx >= num_layers.saturating_sub(2) {
-            return false;
-        }
-    }
-    // Keep attention projections in f16 — they're sensitive
-    // Only quantize MLP (gate/up/down) projections to 1-bit
-    if name.contains(".self_attn.") || name.contains("linear_attn.") {
-        return false;
-    }
-    name.contains(".mlp.")
+    // Quantize everything: layers, embeddings, lm_head
+    name.starts_with("model.layers.")
+        || name.starts_with("model.text_model.layers.")
+        || name.starts_with("model.language_model.layers.")
+        || name.contains("embed_tokens")
+        || name.contains("lm_head")
+        || name.contains(".mlp.") || name.contains(".self_attn.")
+        || name.contains("linear_attn.")
 }
 
 fn should_quantize_fp8_weight(model_type: &str, name: &str, shape: &[usize]) -> bool {

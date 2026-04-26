@@ -180,6 +180,24 @@ impl LfmRunner {
         self.max_layers = n.min(self.cfg.num_hidden_layers).max(1);
     }
 
+    pub fn enable_metal_full_backend(&mut self) -> bool {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            match MetalOps::create() {
+                Ok(ops) => {
+                    self.metal_ops = Some(ops);
+                    true
+                }
+                Err(e) => {
+                    eprintln!("lfm: failed to enable metal backend: {e}");
+                    false
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        false
+    }
+
     pub fn max_layers(&self) -> usize {
         self.max_layers
     }
@@ -312,20 +330,24 @@ impl LfmRunner {
             let layer_type = self.layer_types.get(layer).map(|s| s.as_str()).unwrap_or("conv");
 
             // Operator norm (replaces input_layernorm)
-            self.rmsnorm_weight(
-                &format!("model.layers.{layer}.operator_norm.weight"),
-                &mut op_norm_w,
-            )?;
-            rms_norm_f32(&x, &op_norm_w, cfg.rms_norm_eps, &mut x_norm);
+            let norm_name = format!("model.layers.{layer}.operator_norm.weight");
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            if let Some(ops) = &self.metal_ops {
+                let w = self.tensor_f16(&norm_name)?;
+                ops.rms_norm_f16w(&x, w, cfg.rms_norm_eps, false, &norm_name, &mut x_norm)
+                    .map_err(|e| CoreError::Backend(e.to_string()))?;
+            } else {
+                self.rmsnorm_weight(&norm_name, &mut op_norm_w)?;
+                rms_norm_f32(&x, &op_norm_w, cfg.rms_norm_eps, &mut x_norm);
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            {
+                self.rmsnorm_weight(&norm_name, &mut op_norm_w)?;
+                rms_norm_f32(&x, &op_norm_w, cfg.rms_norm_eps, &mut x_norm);
+            }
 
             match layer_type {
                 "conv" => {
-                    // ShortConv block (LFM2 style):
-                    //   B, C, x = in_proj(input)
-                    //   x = B * x
-                    //   x = causal_conv1d(x)
-                    //   x = C * x
-                    //   x = out_proj(x)
                     let expanded_dim = hidden * 3;
                     let mut bcx = vec![0.0f32; expanded_dim];
 
@@ -348,40 +370,38 @@ impl LfmRunner {
                         bx[i] = b_part[i] * x_part[i];
                     }
 
-                    // Causal depthwise conv1d with sliding window state.
-                    // conv_states[conv_layer_idx] holds the last kernel_size
-                    // Bx vectors (oldest first). Layout: [slot0 * hidden, slot1 * hidden, ...]
                     let ks = self.conv_kernel_size;
-                    let state = &mut self.conv_states[conv_layer_idx];
-
-                    // Shift state: move slots 1..ks to 0..ks-1, then write current Bx into last slot
-                    if ks > 1 {
-                        state.copy_within(hidden..(ks * hidden), 0);
-                    }
-                    state[(ks - 1) * hidden..ks * hidden].copy_from_slice(&bx);
-
-                    // Load conv kernel: shape [hidden, kernel_size, 1] stored as f16
                     let conv_kernel_name = format!("model.layers.{layer}.conv.conv.weight");
-                    let conv_kernel_bytes = self.file.tensor_bytes(&conv_kernel_name)?;
-                    let conv_kernel_u16: &[u16] = bytemuck::cast_slice(conv_kernel_bytes);
+                    let mut conv_out = vec![0.0f32; hidden];
 
-                    // Depthwise causal conv: for each channel, dot product with kernel
-                    let mut conv_result = vec![0.0f32; hidden];
-                    for i in 0..hidden {
-                        let mut acc = 0.0f32;
-                        let kernel_base = i * ks;
-                        for k in 0..ks {
-                            let s = state[k * hidden + i];
-                            let w = f16::from_bits(conv_kernel_u16[kernel_base + k]).to_f32();
-                            acc += s * w;
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
+                    if let Some(ops) = &self.metal_ops {
+                        let conv_kernel_bytes = self.file.tensor_bytes(&conv_kernel_name)?;
+                        let w: &[u16] = bytemuck::cast_slice(conv_kernel_bytes);
+                        let state = &mut self.conv_states[conv_layer_idx];
+                        ops.lfm_conv(state, &bx, w, ks, hidden, &conv_kernel_name, &mut conv_out)
+                            .map_err(|e| CoreError::Backend(e.to_string()))?;
+                    } else {
+                        // ... CPU ...
+                        let conv_kernel_bytes = self.file.tensor_bytes(&conv_kernel_name)?;
+                        let conv_kernel_u16: &[u16] = bytemuck::cast_slice(conv_kernel_bytes);
+                        let state = &mut self.conv_states[conv_layer_idx];
+                        if ks > 1 { state.copy_within(hidden..(ks * hidden), 0); }
+                        state[(ks - 1) * hidden..ks * hidden].copy_from_slice(&bx);
+                        for i in 0..hidden {
+                            let mut acc = 0.0f32;
+                            let kernel_base = i * ks;
+                            for k in 0..ks {
+                                acc += state[k * hidden + i] * f16::from_bits(conv_kernel_u16[kernel_base + k]).to_f32();
+                            }
+                            conv_out[i] = acc;
                         }
-                        conv_result[i] = acc;
                     }
 
-                    // Second gating: y = C * conv_result
+                    // Second gating: y = C * conv_out
                     let mut y = vec![0.0f32; hidden];
                     for i in 0..hidden {
-                        y[i] = c_part[i] * conv_result[i];
+                        y[i] = c_part[i] * conv_out[i];
                     }
 
                     // out_proj: hidden -> hidden
@@ -396,71 +416,148 @@ impl LfmRunner {
                     conv_layer_idx += 1;
                 }
                 "full_attention" | "attention" => {
-                    // Grouped Query Attention
-                    let fused_qkv = self.linear_qkv_f16_out_in(
-                        &x_norm,
-                        &format!("model.layers.{layer}.self_attn.q_proj.weight"),
-                        attn_dim,
-                        &format!("model.layers.{layer}.self_attn.k_proj.weight"),
-                        kv_dim,
-                        &format!("model.layers.{layer}.self_attn.v_proj.weight"),
-                        kv_dim,
-                        hidden,
-                        &mut q,
-                        &mut k,
-                        &mut v,
-                    )?;
-                    if !fused_qkv {
-                        self.linear_f16_out_in(
+                    let mut qkv_done = false;
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
+                    if let Some(ops) = &self.metal_ops {
+                        let q_name = format!("model.layers.{layer}.self_attn.q_proj.weight");
+                        let k_name = format!("model.layers.{layer}.self_attn.k_proj.weight");
+                        let v_name = format!("model.layers.{layer}.self_attn.v_proj.weight");
+
+                        // ONLY use Metal if weights are f16. If u32 (i4), fallback to CPU.
+                        let q_dtype = self.tensor_dtype(&q_name).unwrap_or_else(|| "f16".to_string());
+                        let k_dtype = self.tensor_dtype(&k_name).unwrap_or_else(|| "f16".to_string());
+                        let v_dtype = self.tensor_dtype(&v_name).unwrap_or_else(|| "f16".to_string());
+
+                        if q_dtype == "f16" && k_dtype == "f16" && v_dtype == "f16" {
+                            let q_w = self.tensor_f16(&q_name)?;
+                            let k_w = self.tensor_f16(&k_name)?;
+                            let v_w = self.tensor_f16(&v_name)?;
+                            ops.logits_qkv_f16(
+                                &x_norm,
+                                q_w, k_w, v_w,
+                                attn_dim, kv_dim, kv_dim, hidden,
+                                &format!("q.{layer}"), &format!("k.{layer}"), &format!("v.{layer}"),
+                                &mut q, &mut k, &mut v
+                            ).map_err(|e| CoreError::Backend(e.to_string()))?;
+                            qkv_done = true;
+                        }
+                    }
+
+                    if !qkv_done {
+                        let fused_qkv = self.linear_qkv_f16_out_in(
                             &x_norm,
                             &format!("model.layers.{layer}.self_attn.q_proj.weight"),
                             attn_dim,
-                            hidden,
-                            &mut q,
-                        )?;
-                        self.linear_f16_out_in(
-                            &x_norm,
                             &format!("model.layers.{layer}.self_attn.k_proj.weight"),
                             kv_dim,
-                            hidden,
-                            &mut k,
-                        )?;
-                        self.linear_f16_out_in(
-                            &x_norm,
                             &format!("model.layers.{layer}.self_attn.v_proj.weight"),
                             kv_dim,
                             hidden,
+                            &mut q,
+                            &mut k,
                             &mut v,
                         )?;
+                        if !fused_qkv {
+                            self.linear_f16_out_in(
+                                &x_norm,
+                                &format!("model.layers.{layer}.self_attn.q_proj.weight"),
+                                attn_dim,
+                                hidden,
+                                &mut q,
+                            )?;
+                            self.linear_f16_out_in(
+                                &x_norm,
+                                &format!("model.layers.{layer}.self_attn.k_proj.weight"),
+                                kv_dim,
+                                hidden,
+                                &mut k,
+                            )?;
+                            self.linear_f16_out_in(
+                                &x_norm,
+                                &format!("model.layers.{layer}.self_attn.v_proj.weight"),
+                                kv_dim,
+                                hidden,
+                                &mut v,
+                            )?;
+                        }
                     }
 
                     // Apply Q/K layernorm (LFM2 specific - applied per-head)
                     let mut q_normed = vec![0.0f32; attn_dim];
                     let mut k_normed = vec![0.0f32; kv_dim];
                     if let Ok(q_norm_w) = self.tensor_f16(&format!("model.layers.{layer}.self_attn.q_layernorm.weight")) {
-                        let q_norm_w_f32: Vec<f32> = q_norm_w.iter().map(|&x| f16::from_bits(x).to_f32()).collect();
-                        // Apply per-head: q is [n_heads * head_dim], norm each head independently
-                        for h in 0..n_heads {
-                            let h_start = h * head_dim;
-                            let h_end = h_start + head_dim;
-                            rms_norm_f32(&q[h_start..h_end], &q_norm_w_f32, cfg.rms_norm_eps, &mut q_normed[h_start..h_end]);
+                        #[cfg(any(target_os = "macos", target_os = "ios"))]
+                        if let Some(ops) = &self.metal_ops {
+                            for h in 0..n_heads {
+                                let h_start = h * head_dim;
+                                let h_end = h_start + head_dim;
+                                ops.rms_norm_f16w(&q[h_start..h_end], q_norm_w, cfg.rms_norm_eps, false, &format!("qnorm.{layer}"), &mut q_normed[h_start..h_end])
+                                    .map_err(|e| CoreError::Backend(e.to_string()))?;
+                            }
+                        } else {
+                            let q_norm_w_f32: Vec<f32> = q_norm_w.iter().map(|&x| f16::from_bits(x).to_f32()).collect();
+                            for h in 0..n_heads {
+                                let h_start = h * head_dim;
+                                let h_end = h_start + head_dim;
+                                rms_norm_f32(&q[h_start..h_end], &q_norm_w_f32, cfg.rms_norm_eps, &mut q_normed[h_start..h_end]);
+                            }
+                        }
+                        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                        {
+                            let q_norm_w_f32: Vec<f32> = q_norm_w.iter().map(|&x| f16::from_bits(x).to_f32()).collect();
+                            for h in 0..n_heads {
+                                let h_start = h * head_dim;
+                                let h_end = h_start + head_dim;
+                                rms_norm_f32(&q[h_start..h_end], &q_norm_w_f32, cfg.rms_norm_eps, &mut q_normed[h_start..h_end]);
+                            }
                         }
                         q.copy_from_slice(&q_normed);
                     }
                     if let Ok(k_norm_w) = self.tensor_f16(&format!("model.layers.{layer}.self_attn.k_layernorm.weight")) {
-                        let k_norm_w_f32: Vec<f32> = k_norm_w.iter().map(|&x| f16::from_bits(x).to_f32()).collect();
-                        // Apply per-head for KV heads
-                        for h in 0..n_kv_heads {
-                            let h_start = h * head_dim;
-                            let h_end = h_start + head_dim;
-                            rms_norm_f32(&k[h_start..h_end], &k_norm_w_f32, cfg.rms_norm_eps, &mut k_normed[h_start..h_end]);
+                        #[cfg(any(target_os = "macos", target_os = "ios"))]
+                        if let Some(ops) = &self.metal_ops {
+                            for h in 0..n_kv_heads {
+                                let h_start = h * head_dim;
+                                let h_end = h_start + head_dim;
+                                ops.rms_norm_f16w(&k[h_start..h_end], k_norm_w, cfg.rms_norm_eps, false, &format!("knorm.{layer}"), &mut k_normed[h_start..h_end])
+                                    .map_err(|e| CoreError::Backend(e.to_string()))?;
+                            }
+                        } else {
+                            let k_norm_w_f32: Vec<f32> = k_norm_w.iter().map(|&x| f16::from_bits(x).to_f32()).collect();
+                            for h in 0..n_kv_heads {
+                                let h_start = h * head_dim;
+                                let h_end = h_start + head_dim;
+                                rms_norm_f32(&k[h_start..h_end], &k_norm_w_f32, cfg.rms_norm_eps, &mut k_normed[h_start..h_end]);
+                            }
+                        }
+                        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                        {
+                            let k_norm_w_f32: Vec<f32> = k_norm_w.iter().map(|&x| f16::from_bits(x).to_f32()).collect();
+                            for h in 0..n_kv_heads {
+                                let h_start = h * head_dim;
+                                let h_end = h_start + head_dim;
+                                rms_norm_f32(&k[h_start..h_end], &k_norm_w_f32, cfg.rms_norm_eps, &mut k_normed[h_start..h_end]);
+                            }
                         }
                         k.copy_from_slice(&k_normed);
                     }
 
                     // Apply RoPE (non-interleaved/split layout for LFM2)
-                    rope_non_interleaved_inplace_f32(&mut q, n_heads, head_dim, head_dim, pos, cfg.rope_theta);
-                    rope_non_interleaved_inplace_f32(&mut k, n_kv_heads, head_dim, head_dim, pos, cfg.rope_theta);
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
+                    if let Some(ops) = &self.metal_ops {
+                        ops.rope_half_f32(&mut q, n_heads, head_dim, head_dim, pos, cfg.rope_theta)
+                            .map_err(|e| CoreError::Backend(e.to_string()))?;
+                        ops.rope_half_f32(&mut k, n_kv_heads, head_dim, head_dim, pos, cfg.rope_theta)
+                            .map_err(|e| CoreError::Backend(e.to_string()))?;
+                    } else {
+                        rope_non_interleaved_inplace_f32(&mut q, n_heads, head_dim, head_dim, pos, cfg.rope_theta);
+                        rope_non_interleaved_inplace_f32(&mut k, n_kv_heads, head_dim, head_dim, pos, cfg.rope_theta);
+                    }
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                    {
+                        rope_non_interleaved_inplace_f32(&mut q, n_heads, head_dim, head_dim, pos, cfg.rope_theta);
+                        rope_non_interleaved_inplace_f32(&mut k, n_kv_heads, head_dim, head_dim, pos, cfg.rope_theta);
+                    }
 
                     // Write K/V to cache
                     {
@@ -515,11 +612,21 @@ impl LfmRunner {
             }
 
             // FFN norm
-            self.rmsnorm_weight(
-                &format!("model.layers.{layer}.ffn_norm.weight"),
-                &mut ffn_norm_w,
-            )?;
-            rms_norm_f32(&x, &ffn_norm_w, cfg.rms_norm_eps, &mut mlp_in);
+            let ffn_norm_name = format!("model.layers.{layer}.ffn_norm.weight");
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            if let Some(ops) = &self.metal_ops {
+                let w = self.tensor_f16(&ffn_norm_name)?;
+                ops.rms_norm_f16w(&x, w, cfg.rms_norm_eps, false, &ffn_norm_name, &mut mlp_in)
+                    .map_err(|e| CoreError::Backend(e.to_string()))?;
+            } else {
+                self.rmsnorm_weight(&ffn_norm_name, &mut ffn_norm_w)?;
+                rms_norm_f32(&x, &ffn_norm_w, cfg.rms_norm_eps, &mut mlp_in);
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            {
+                self.rmsnorm_weight(&ffn_norm_name, &mut ffn_norm_w)?;
+                rms_norm_f32(&x, &ffn_norm_w, cfg.rms_norm_eps, &mut mlp_in);
+            }
 
             // SwiGLU MLP: w1=gate, w3=up, w2=down
             self.linear_f16_out_in(
@@ -561,13 +668,23 @@ impl LfmRunner {
         }
 
         // Final embedding norm
+        let final_norm_name = "model.embedding_norm.weight";
         let mut final_norm_w = vec![0.0f32; hidden];
         let mut x_final = vec![0.0f32; hidden];
-        self.rmsnorm_weight(
-            "model.embedding_norm.weight",
-            &mut final_norm_w,
-        )?;
-        rms_norm_f32(&x, &final_norm_w, cfg.rms_norm_eps, &mut x_final);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some(ops) = &self.metal_ops {
+            let w = self.tensor_f16(final_norm_name)?;
+            ops.rms_norm_f16w(&x, w, cfg.rms_norm_eps, false, final_norm_name, &mut x_final)
+                .map_err(|e| CoreError::Backend(e.to_string()))?;
+        } else {
+            self.rmsnorm_weight(final_norm_name, &mut final_norm_w)?;
+            rms_norm_f32(&x, &final_norm_w, cfg.rms_norm_eps, &mut x_final);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            self.rmsnorm_weight(final_norm_name, &mut final_norm_w)?;
+            rms_norm_f32(&x, &final_norm_w, cfg.rms_norm_eps, &mut x_final);
+        }
 
         if return_logits {
             let mut logits = vec![0.0f32; cfg.vocab_size];
@@ -833,12 +950,19 @@ impl LfmRunner {
         let w = self.tensor_f16(weight_name)?;
 
         // Validate weight shape: [out_dim, in_dim] -> out_dim * in_dim elements
-        let expected_len = out_dim * in_dim * 2; // f16 = 2 bytes
+        let expected_len = out_dim * in_dim; 
         if w.len() != expected_len {
             return Err(CoreError::Backend(format!(
-                "linear_f16_out_in: weight shape mismatch for {weight_name}: got {} bytes, expected {} ({}x{} f16)",
+                "linear_f16_out_in: weight shape mismatch for {weight_name}: got {} elements, expected {} ({}x{} f16)",
                 w.len(), expected_len, out_dim, in_dim
             )));
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some(ops) = &self.metal_ops {
+            ops.logits_f16(input, w, out_dim, in_dim, weight_name, out)
+                .map_err(|e| CoreError::Backend(e.to_string()))?;
+            return Ok(());
         }
 
         // matmul: out[i] = sum_j weight[i,j] * input[j]
@@ -870,7 +994,6 @@ impl LfmRunner {
         let cache_key = (weight_name.to_string(), out_dim, in_dim);
         
         if !self.weight_cache.contains_key(&cache_key) {
-            // Dequantize and cache
             let base_name = weight_name.trim_end_matches(".weight");
             let weight_bytes = self.file.tensor_bytes(weight_name)?;
             let scales_bytes = self.file.tensor_bytes(&format!("{}.scales", base_name))?;
@@ -885,40 +1008,27 @@ impl LfmRunner {
             let packed_in = in_dim / 8;
 
             let mut dequant = vec![0.0f32; out_dim * in_dim];
-
-            for i in 0..out_dim {
+            
+            dequant.par_chunks_exact_mut(in_dim).enumerate().for_each(|(i, row)| {
                 let row_offset = i * packed_in;
-                let out_offset = i * in_dim;
-                
-                for g in 0..groups_per_row {
-                    let g_start = g * group_size;
-                    let g_end = ((g + 1) * group_size).min(in_dim);
+                for j_packed in 0..packed_in {
+                    let packed = weight_u32[row_offset + j_packed];
+                    let g = (j_packed * 8) / group_size;
                     let scale_idx = i * groups_per_row + g;
-                    let scale = scales_f32.get(scale_idx).copied().unwrap_or(1.0);
-                    let bias = biases_f32.get(scale_idx).copied().unwrap_or(0.0);
-                    
-                    for j in g_start..g_end {
-                        let packed_idx = row_offset + (j / 8);
-                        let nibble_pos = j % 8;
-                        
-                        if packed_idx >= weight_u32.len() {
-                            continue;
-                        }
-                        
-                        let packed = weight_u32[packed_idx];
-                        let nibble = ((packed >> (nibble_pos * 4)) & 0xF) as i32;
-                        // MLX uses zero_point=0
-                        let q = nibble as f32;
-                        
-                        dequant[out_offset + j] = q * scale + bias;
+                    let scale = scales_f32[scale_idx];
+                    let bias = biases_f32[scale_idx];
+                    let j_base = j_packed * 8;
+                    for k in 0..8 {
+                        let nibble = ((packed >> (k * 4)) & 0xF) as f32;
+                        row[j_base + k] = nibble * scale + bias;
                     }
                 }
-            }
+            });
             
             // LRU eviction: if at capacity, remove oldest entry
             if self.weight_cache.len() >= MAX_CACHE_ENTRIES {
-                if let Some(oldest_key) = self.lru_order.first().cloned() {
-                    self.weight_cache.remove(&oldest_key);
+                if let Some(old_key) = self.lru_order.first().cloned() {
+                    self.weight_cache.remove(&old_key);
                     self.lru_order.remove(0);
                 }
             }
@@ -933,41 +1043,22 @@ impl LfmRunner {
             }
         }
         
-        // Use cached weights for matmul with 8x unrolled loop + parallel rows
+        // Use cached weights for matmul
         let weights = self.weight_cache.get(&cache_key).unwrap();
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some(ops) = &self.metal_ops {
+            ops.logits_f32(input, weights, out_dim, in_dim, weight_name, out)
+                .map_err(|e| CoreError::Backend(e.to_string()))?;
+            return Ok(());
+        }
         
-        // Parallelize across output rows using rayon
         out.par_iter_mut().enumerate().for_each(|(i, out_val)| {
             let row_start = i * in_dim;
-            let mut acc0 = 0.0f32;
-            let mut acc1 = 0.0f32;
-            let mut acc2 = 0.0f32;
-            let mut acc3 = 0.0f32;
-            let mut acc4 = 0.0f32;
-            let mut acc5 = 0.0f32;
-            let mut acc6 = 0.0f32;
-            let mut acc7 = 0.0f32;
-            
-            // 8x unrolled loop for better instruction-level parallelism
-            let chunks = in_dim / 8;
-            for c in 0..chunks {
-                let offset = row_start + c * 8;
-                acc0 += weights[offset] * input[c * 8];
-                acc1 += weights[offset + 1] * input[c * 8 + 1];
-                acc2 += weights[offset + 2] * input[c * 8 + 2];
-                acc3 += weights[offset + 3] * input[c * 8 + 3];
-                acc4 += weights[offset + 4] * input[c * 8 + 4];
-                acc5 += weights[offset + 5] * input[c * 8 + 5];
-                acc6 += weights[offset + 6] * input[c * 8 + 6];
-                acc7 += weights[offset + 7] * input[c * 8 + 7];
-            }
-            
-            // Handle remainder
-            let mut acc = acc0 + acc1 + acc2 + acc3 + acc4 + acc5 + acc6 + acc7;
-            for j in (chunks * 8)..in_dim {
+            let mut acc = 0.0f32;
+            for j in 0..in_dim {
                 acc += weights[row_start + j] * input[j];
             }
-            
             *out_val = acc;
         });
 

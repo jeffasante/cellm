@@ -20,6 +20,7 @@ Cross-validation of cellm's execution engine against reference GGUF implementati
 
 *   [Comparison: 2026-04-03 20:28:45](runs/llama32_gguf_compare_20260403_202845_summary.md)
 *   [Comparison: 2026-04-03 20:26:56](runs/llama32_gguf_compare_20260403_202656_summary.md)
+*   [Status Report: 2026-04-12](status_report_20260412.md)
 
 ## How to read these reports
 - **Prefill**: The time taken to process the input prompt.

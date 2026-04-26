@@ -572,7 +572,7 @@ kernel void mv_q1_0_g128(
 kernel void lfm_conv(
     device       float*  state      [[buffer(0)]],  // [kernel_size, hidden]
     device const float*  input      [[buffer(1)]],  // [hidden]
-    device const half*   kernel     [[buffer(2)]],  // [hidden, kernel_size]
+    device const half*   weight     [[buffer(2)]],  // [hidden, kernel_size]
     device       float*  out        [[buffer(3)]],  // [hidden]
     constant     uint&   ks         [[buffer(4)]],
     constant     uint&   hidden     [[buffer(5)]],
@@ -587,7 +587,7 @@ kernel void lfm_conv(
     // Depthwise causal conv: dot product over kernel_size
     float acc = 0.0f;
     for (uint k = 0; k < ks; ++k) {
-        acc += state[k * hidden + gid] * float(kernel[gid * ks + k]);
+        acc += state[k * hidden + gid] * float(weight[gid * ks + k]);
     }
     out[gid] = acc;
 }
@@ -616,6 +616,19 @@ kernel void mv_i4(
         acc += v0 * x[i] * s0 + v1 * x[i + 1] * s1;
     }
     o[gid] = acc;
+kernel void mv_f32(
+    device const float* w [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* o [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    constant uint& cols [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= rows) return;
+    device const float* row_ptr = w + gid * cols;
+    float acc = 0.0f;
+    for (uint i = 0; i < cols; ++i) acc += x[i] * row_ptr[i];
+    o[gid] = acc;
 }
 
 "#;
@@ -640,6 +653,7 @@ pub struct MetalOps {
     pub pso_gelu_mul_f32: ComputePipelineState,
     pub pso_mv_q1: ComputePipelineState,
     pub pso_lfm_conv: ComputePipelineState,
+    pub pso_mv_f32: ComputePipelineState,
 
     x_buf: Mutex<Option<Buffer>>,
     out_buf: Mutex<Option<Buffer>>,
@@ -668,9 +682,10 @@ impl Clone for MetalOps {
             pso_gelu_mul_f32: self.pso_gelu_mul_f32.clone(),
             pso_mv_q1: self.pso_mv_q1.clone(),
             pso_lfm_conv: self.pso_lfm_conv.clone(),
-            x_buf: Mutex::new(None), // New scratch for new clone
+            pso_mv_f32: self.pso_mv_f32.clone(),
+            x_buf: Mutex::new(None),
             out_buf: Mutex::new(None),
-            tensor_cache: Mutex::new(HashMap::new()), // Could share, but safer to have own cache
+            tensor_cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -719,33 +734,77 @@ impl MetalOps {
         let pso_gelu_mul_f32 = build_pso_ops(&device, &lib, "gelu_tanh_mul_f32_inplace")?;
         let pso_mv_q1 = build_pso_ops(&device, &lib, "mv_q1_0_g128")?;
         let pso_lfm_conv = build_pso_ops(&device, &lib, "lfm_conv")?;
+        let pso_mv_f32 = build_pso_ops(&device, &lib, "mv_f32")?;
 
         Ok(Self {
             device, queue, _lib: lib.clone(),
             pso_rms_norm, pso_rope_adj, pso_rope_half, pso_mv_f16, pso_mv_i8, pso_mv_i4, pso_mv_qkv_f16, pso_mv_qkv_i8, pso_mv2_f16, pso_mv2_i8,
-            pso_add_f32, pso_silu_mul_f32, pso_gelu_mul_f32, pso_mv_q1, pso_lfm_conv,
+            pso_add_f32, pso_silu_mul_f32, pso_gelu_mul_f32, pso_mv_q1, pso_lfm_conv, pso_mv_f32,
             x_buf: Mutex::new(None), out_buf: Mutex::new(None),
             tensor_cache: Mutex::new(HashMap::new()),
         })
     }
 
+    pub fn lfm_conv(&self, state: &mut [f32], input: &[f32], kernel_f16: &[u16], ks: usize, hidden: usize, cache_key: &str, out: &mut [f32]) -> anyhow::Result<()> {
+        let k_key = format!("lfm.k.{}", cache_key);
+        let mut cache = self.tensor_cache.lock().unwrap();
+        if !cache.contains_key(&k_key) {
+            cache.insert(k_key.clone(), upload_u16(&self.device, kernel_f16)?);
+        }
+        let kb = cache.get(&k_key).unwrap().clone();
+
+        let s_key = format!("lfm.state.{}", cache_key);
+        if !cache.contains_key(&s_key) {
+            cache.insert(s_key.clone(), upload_f32(&self.device, state)?);
+        }
+        let sb = cache.get(&s_key).unwrap().clone();
+        drop(cache);
+
+        // ALWAYS write the current CPU state to the GPU buffer before kernel
+        write_f32(&sb, state)?;
+
+        ensure_buf_f32(&self.device, &mut *self.x_buf.lock().unwrap(), hidden)?;
+        ensure_buf_f32(&self.device, &mut *self.out_buf.lock().unwrap(), hidden)?;
+        let xb_lock = self.x_buf.lock().unwrap();
+        let ob_lock = self.out_buf.lock().unwrap();
+        let xb = xb_lock.as_ref().unwrap();
+        let ob = ob_lock.as_ref().unwrap();
+        
+        write_f32(xb, input)?;
+        autoreleasepool(|| {
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            self.encode_lfm_conv(enc, &sb, xb, &kb, ob, ks, hidden);
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        });
+
+        // Copy state back to CPU
+        let ptr = sb.contents() as *const f32;
+        unsafe { std::ptr::copy_nonoverlapping(ptr, state.as_mut_ptr(), state.len()); }
+        
+        read_f32(ob, out)
+    }
+
     pub fn rms_norm_f16w(&self, x: &[f32], w_f16: &[u16], eps: f32, w_add_one: bool, cache_key: &str, out: &mut [f32]) -> anyhow::Result<()> {
         let n = x.len();
         let w_key = format!("rmsnorm.w.{cache_key}");
-        if !self.tensor_cache.lock().unwrap().contains_key(&w_key) {
-            self.tensor_cache.lock().unwrap().insert(w_key.clone(), upload_u16(&self.device, w_f16)?);
+        let mut cache = self.tensor_cache.lock().unwrap();
+        if !cache.contains_key(&w_key) {
+            cache.insert(w_key.clone(), upload_u16(&self.device, w_f16)?);
         }
-        let cache = self.tensor_cache.lock().unwrap();
-        let wb = cache.get(&w_key).unwrap();
+        let wb = cache.get(&w_key).unwrap().clone();
+        drop(cache);
         ensure_buf_f32(&self.device, &mut *self.x_buf.lock().unwrap(), n)?;
         ensure_buf_f32(&self.device, &mut *self.out_buf.lock().unwrap(), n)?;
         let xb_lock = self.x_buf.lock().unwrap(); let xb = xb_lock.as_ref().unwrap();
         let ob_lock = self.out_buf.lock().unwrap(); let ob = ob_lock.as_ref().unwrap();
         write_f32(xb, x)?;
-               autoreleasepool(|| {
+        autoreleasepool(|| {
             let cb = self.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
-            self.encode_rms_norm_f16w(enc, xb, wb, ob, n, eps, w_add_one);
+            self.encode_rms_norm_f16w(enc, xb, &wb, ob, n, eps, w_add_one);
             enc.end_encoding(); cb.commit(); cb.wait_until_completed();
         });
         read_f32(ob, out)
@@ -1036,6 +1095,38 @@ impl MetalOps {
     pub fn encode_qkv_f16(&self, enc: &metal::ComputeCommandEncoderRef, w_q: &metal::Buffer, w_k: &metal::Buffer, w_v: &metal::Buffer, x_buf: &metal::Buffer, q_out: &metal::Buffer, k_out: &metal::Buffer, v_out: &metal::Buffer, rows_q: usize, rows_kv: usize, cols: usize) {
         self.encode_qkv_f16_bias(enc, w_q, w_k, w_v, x_buf, None, None, None, q_out, k_out, v_out, rows_q, rows_kv, cols);
     }
+    pub fn logits_f32(&self, x: &[f32], weights_f32: &[f32], vocab: usize, hidden: usize, cache_key: &str, out: &mut [f32]) -> anyhow::Result<()> {
+        if !self.tensor_cache.lock().unwrap().contains_key(cache_key) {
+            self.tensor_cache.lock().unwrap().insert(cache_key.to_string(), upload_f32(&self.device, weights_f32)?);
+        }
+        let cache = self.tensor_cache.lock().unwrap();
+        let eb = cache.get(cache_key).unwrap();
+        ensure_buf_f32(&self.device, &mut *self.x_buf.lock().unwrap(), hidden)?;
+        ensure_buf_f32(&self.device, &mut *self.out_buf.lock().unwrap(), vocab)?;
+        let xb_ref = self.x_buf.lock().unwrap(); let xb = xb_ref.as_ref().unwrap();
+        let ob_ref = self.out_buf.lock().unwrap(); let ob = ob_ref.as_ref().unwrap();
+        write_f32(xb, x)?;
+        autoreleasepool(|| {
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            self.encode_mv_f32(enc, eb, xb, ob, vocab, hidden);
+            enc.end_encoding(); cb.commit(); cb.wait_until_completed();
+        });
+        read_f32(ob, out)
+    }
+
+    pub fn encode_mv_f32(&self, enc: &metal::ComputeCommandEncoderRef, w: &Buffer, x: &Buffer, out: &Buffer, rows: usize, cols: usize) {
+        let r = rows as u32; let c = cols as u32;
+        enc.set_compute_pipeline_state(&self.pso_mv_f32);
+        enc.set_buffer(0, Some(w), 0);
+        enc.set_buffer(1, Some(x), 0);
+        enc.set_buffer(2, Some(out), 0);
+        enc.set_bytes(3, 4, (&r as *const u32).cast());
+        enc.set_bytes(4, 4, (&c as *const u32).cast());
+        let w_size = self.pso_mv_f32.thread_execution_width() as u64;
+        enc.dispatch_threads(MTLSize { width: rows as u64, height: 1, depth: 1 }, MTLSize { width: w_size, height: 1, depth: 1 });
+    }
+
 
     pub fn encode_lfm_conv(
         &self,

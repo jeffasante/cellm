@@ -236,8 +236,12 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                     anyhow::bail!("LLM backend: metal requested, but Granite full-metal init failed");
                 }
             }
-            Runner::Lfm(_) => {
-                println!("LLM backend: CPU (LFM Metal support not yet implemented)");
+            Runner::Lfm(r) => {
+                if r.enable_metal_full_backend() {
+                    println!("LLM backend: metal (LFM acceleration enabled)");
+                } else {
+                    println!("LLM backend: CPU (LFM Metal init failed, falling back)");
+                }
             }
         }
         println!("Startup: metal init {:.2}s", t_stage.elapsed().as_secs_f64());

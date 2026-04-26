@@ -553,6 +553,10 @@
                     <div class="project-title">Mixed-Precision Rationale</div>
                     <div class="project-meta">Balancing accuracy and speed with hybrid bit-depths.</div>
                 </a>
+                <a href="LFM_Metal_Acceleration.md" class="project-item">
+                    <div class="project-title">LFM Metal Acceleration <span style="font-size: 0.65rem; background: #000; color: #fff; padding: 2px 6px; border-radius: 10px; margin-left: 8px; vertical-align: middle;">NEW</span></div>
+                    <div class="project-meta">Deep-dive into Metal kernels and performance for Liquid Foundation Models.</div>
+                </a>
                 <a href="metal_inference_fix.md" class="project-item">
                     <div class="project-title">Metal Backend Fixes</div>
                     <div class="project-meta">Resolving stability issues in the Metal execution path.</div>
@@ -599,6 +603,10 @@
                     <div class="project-title">Audio Modalities</div>
                     <div class="project-meta">Direct audio-to-text inference with optimized encoders.</div>
                 </a>
+                <a href="gemma-4-E2B-it-int4-aggr-v2-README.md" class="project-item">
+                    <div class="project-title">Gemma 4 Multimodal INT4</div>
+                    <div class="project-meta">Aggressive 4-bit quantization for full text/vision/audio stacks.</div>
+                </a>
             </div>
         </section>
 
@@ -616,6 +624,10 @@
                 <a href="lessons/kernel_concepts.md" class="project-item">
                     <div class="project-title">Kernel Concepts</div>
                     <div class="project-meta">Fundamental primitives for writing high-performance ML kernels.</div>
+                </a>
+                <a href="lessons/lesson.group-qk.md" class="project-item">
+                    <div class="project-title">Attention: GQA & MQA</div>
+                    <div class="project-meta">Reducing memory footprint with Grouped Query Attention.</div>
                 </a>
                 <a href="benchmarks/README.md" class="project-item">
                     <div class="project-title">Benchmarks</div>
@@ -823,7 +835,10 @@
                                     // For links, we want them to stay relative to the root for navigation
                                     // unless they are internal anchors
                                     if (attr === 'href' && val.endsWith('.md')) {
-                                        el.setAttribute(attr, baseDir + val);
+                                        // Only prefix if it doesn't already start with the baseDir
+                                        if (!val.startsWith(baseDir)) {
+                                            el.setAttribute(attr, baseDir + val);
+                                        }
                                     } else if (attr !== 'href') {
                                         el.setAttribute(attr, baseDir + val);
                                     }

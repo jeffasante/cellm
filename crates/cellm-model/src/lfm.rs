@@ -104,10 +104,11 @@ impl LfmRunner {
         };
 
         // Initialize conv state cache
-        // For each conv layer, we need to store (kernel_size - 1) previous states
+        // For each conv layer, store the last kernel_size Bx vectors for causal conv
         let num_conv_layers = layer_types.iter().filter(|t| *t == "conv").count();
-        let conv_state_size = num_conv_layers * conv_kernel_size * cfg.hidden_size;
-        let conv_states = vec![vec![0.0f32; conv_state_size]];
+        let conv_states: Vec<Vec<f32>> = (0..num_conv_layers)
+            .map(|_| vec![0.0f32; conv_kernel_size * cfg.hidden_size])
+            .collect();
 
         Ok(Self {
             file,
@@ -256,6 +257,7 @@ impl LfmRunner {
         let mut conv_out = vec![0.0f32; hidden];
 
         let mut gather_bases: Vec<usize> = Vec::new();
+        let mut conv_layer_idx = 0usize;
 
         for layer in 0..self.max_layers {
             let layer_type = self.layer_types.get(layer).map(|s| s.as_str()).unwrap_or("conv");
@@ -269,11 +271,15 @@ impl LfmRunner {
 
             match layer_type {
                 "conv" => {
-                    // ShortConv block (LFM2 style)
-                    // in_proj: hidden -> 3*hidden, split into [B, C, x]
+                    // ShortConv block (LFM2 style):
+                    //   B, C, x = in_proj(input)
+                    //   x = B * x
+                    //   x = causal_conv1d(x)
+                    //   x = C * x
+                    //   x = out_proj(x)
                     let expanded_dim = hidden * 3;
                     let mut bcx = vec![0.0f32; expanded_dim];
-                    
+
                     self.linear_f16_out_in(
                         &x_norm,
                         &format!("model.layers.{layer}.conv.in_proj.weight"),
@@ -286,37 +292,47 @@ impl LfmRunner {
                     let b_part = &bcx[0..hidden];
                     let c_part = &bcx[hidden..2*hidden];
                     let x_part = &bcx[2*hidden..3*hidden];
-                    
-                    // Compute Bx = B * x (element-wise)
+
+                    // Compute Bx = B * x (element-wise gating)
                     let mut bx = vec![0.0f32; hidden];
                     for i in 0..hidden {
                         bx[i] = b_part[i] * x_part[i];
                     }
 
-                    // For single-token autoregressive generation, we can't do proper causal conv
-                    // Simplified: just apply conv weights as learned scaling
-                    // Load conv kernel: shape [hidden, kernel_size, 1] stored as f32
+                    // Causal depthwise conv1d with sliding window state.
+                    // conv_states[conv_layer_idx] holds the last kernel_size
+                    // Bx vectors (oldest first). Layout: [slot0 * hidden, slot1 * hidden, ...]
+                    let ks = self.conv_kernel_size;
+                    let state = &mut self.conv_states[conv_layer_idx];
+
+                    // Shift state: move slots 1..ks to 0..ks-1, then write current Bx into last slot
+                    if ks > 1 {
+                        state.copy_within(hidden..(ks * hidden), 0);
+                    }
+                    state[(ks - 1) * hidden..ks * hidden].copy_from_slice(&bx);
+
+                    // Load conv kernel: shape [hidden, kernel_size, 1] stored as f16
                     let conv_kernel_name = format!("model.layers.{layer}.conv.conv.weight");
                     let conv_kernel_bytes = self.file.tensor_bytes(&conv_kernel_name)?;
-                    let conv_kernel_f32: &[f32] = bytemuck::cast_slice(conv_kernel_bytes);
-                    
-                    let mut conv_out = vec![0.0f32; hidden];
+                    let conv_kernel_u16: &[u16] = bytemuck::cast_slice(conv_kernel_bytes);
+
+                    // Depthwise causal conv: for each channel, dot product with kernel
+                    let mut conv_result = vec![0.0f32; hidden];
                     for i in 0..hidden {
-                        // For autoregressive single-token: just use middle kernel weight
-                        // Full implementation would need conv state cache
-                        let kernel_base = i * self.conv_kernel_size;
-                        let mid_kernel_idx = kernel_base + (self.conv_kernel_size / 2);
-                        if mid_kernel_idx < conv_kernel_f32.len() {
-                            conv_out[i] = bx[i] * conv_kernel_f32[mid_kernel_idx];
-                        } else {
-                            conv_out[i] = bx[i];
+                        let mut acc = 0.0f32;
+                        let kernel_base = i * ks;
+                        for k in 0..ks {
+                            let s = state[k * hidden + i];
+                            let w = f16::from_bits(conv_kernel_u16[kernel_base + k]).to_f32();
+                            acc += s * w;
                         }
+                        conv_result[i] = acc;
                     }
 
-                    // y = C * conv_out
+                    // Second gating: y = C * conv_result
                     let mut y = vec![0.0f32; hidden];
                     for i in 0..hidden {
-                        y[i] = c_part[i] * conv_out[i];
+                        y[i] = c_part[i] * conv_result[i];
                     }
 
                     // out_proj: hidden -> hidden
@@ -327,6 +343,8 @@ impl LfmRunner {
                         hidden,
                         &mut attn_proj,
                     )?;
+
+                    conv_layer_idx += 1;
                 }
                 "full_attention" | "attention" => {
                     // Grouped Query Attention

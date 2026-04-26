@@ -121,6 +121,7 @@ def convert_lfm_model(input_dir: Path, output_path: Path):
                 tensors_np[name] = tensor
     
     # Convert tensors to bytes, keeping uint32 weights as-is for runner to dequantize
+    # Keep .scales and .biases as f32 so the runner can read them directly
     print("Converting tensors...")
     for name in list(tensors_np.keys()):
         tensor = tensors_np[name]
@@ -128,10 +129,14 @@ def convert_lfm_model(input_dir: Path, output_path: Path):
             # Keep as uint32 - runner will dequantize
             tensors[name] = tensor.tobytes()
         elif tensor.dtype == np.float32:
-            # Convert norms to f16
-            f16_tensor = tensor.astype(np.float16)
-            tensors[name] = f16_tensor.tobytes()
-            tensors_np[name] = f16_tensor
+            if name.endswith(".scales") or name.endswith(".biases"):
+                # Keep quantization parameters as f32 for accuracy
+                tensors[name] = tensor.tobytes()
+            else:
+                # Convert norms and other f32 weights to f16
+                f16_tensor = tensor.astype(np.float16)
+                tensors[name] = f16_tensor.tobytes()
+                tensors_np[name] = f16_tensor
         elif tensor.dtype == np.float16:
             tensors[name] = tensor.tobytes()
         else:

@@ -638,9 +638,9 @@ python3 tools/convert_lfm.py models/LFM2.5-350M-MLX-4bit models/LFM2.5-350M.cell
 
 ### Performance
 
-- Model size: ~190 MB (4-bit quantized)
-- CPU speed: ~1.5 tok/s (Apple Silicon)
-- Metal backend: not yet implemented
+- Model size: ~211 MB (4-bit quantized, scales kept as f32)
+- CPU speed: ~15 tok/s (Apple Silicon)
+- Metal: not implemented for LFM2 runner (passes --backend metal silently falls back to CPU)
 
 ## Qwen3.5-0.8B
 

@@ -602,7 +602,7 @@
         </section>
 
         <footer>
-            <p>&copy; 2026 <a href="https://jeffasante.github.io/" style="color: inherit; text-decoration: none; border-bottom: 1px solid var(--border); transition: border-color 0.2s ease;">jeff asante</a>. minimalist technical documentation.</p>
+            <p>&copy; 2026  cellm research. <a href="https://jeffasante.github.io/" style="color: inherit; text-decoration: none; border-bottom: 1px solid var(--border); transition: border-color 0.2s ease;">jeff asante</a>. minimalist technical documentation.</p>
         </footer>
     </div>
 
@@ -757,8 +757,20 @@
                 contentView.innerHTML = '<p style="color: #666;">Loading document...</p>';
                 
                 try {
-                    const response = await fetch(hash);
-                    if (!response.ok) throw new Error('File not found');
+                    let fetchUrl = hash;
+                    // Enhanced fallback for Main README to handle various hosting environments
+                    const isMainReadme = hash === 'README.md' || hash === '../README.md';
+                    
+                    let response = await fetch(fetchUrl);
+                    
+                    // Fallback to GitHub Raw if local fetch fails for the main README
+                    if (!response.ok && isMainReadme) {
+                        console.log("Local README fetch failed, trying GitHub raw fallback...");
+                        fetchUrl = 'https://raw.githubusercontent.com/jeffasante/cellm/main/README.md';
+                        response = await fetch(fetchUrl);
+                    }
+
+                    if (!response.ok) throw new Error(`File not found: ${fetchUrl}`);
                     let text = await response.text();
                     
                     // Render Markdown

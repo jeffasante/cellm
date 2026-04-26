@@ -639,6 +639,7 @@ pub struct MetalOps {
     pub pso_silu_mul_f32: ComputePipelineState,
     pub pso_gelu_mul_f32: ComputePipelineState,
     pub pso_mv_q1: ComputePipelineState,
+    pub pso_lfm_conv: ComputePipelineState,
 
     x_buf: Mutex<Option<Buffer>>,
     out_buf: Mutex<Option<Buffer>>,
@@ -666,6 +667,7 @@ impl Clone for MetalOps {
             pso_silu_mul_f32: self.pso_silu_mul_f32.clone(),
             pso_gelu_mul_f32: self.pso_gelu_mul_f32.clone(),
             pso_mv_q1: self.pso_mv_q1.clone(),
+            pso_lfm_conv: self.pso_lfm_conv.clone(),
             x_buf: Mutex::new(None), // New scratch for new clone
             out_buf: Mutex::new(None),
             tensor_cache: Mutex::new(HashMap::new()), // Could share, but safer to have own cache
@@ -680,6 +682,7 @@ pub struct MetalOps;
 impl MetalOps {
     pub fn encode_gelu_tanh_mul_f32_inplace(&self, _enc: &(), _gate: &(), _up: &(), _n: usize) {}
     pub fn encode_rms_norm_f16w_at(&self, _enc: &(), _x: &(), _xo: u64, _w: &(), _wo: u64, _out: &(), _oo: u64, _n: usize, _eps: f32, _add: bool) {}
+    pub fn encode_lfm_conv(&self, _enc: &(), _state: &(), _input: &(), _kernel: &(), _out: &(), _ks: usize, _hidden: usize) {}
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -715,12 +718,12 @@ impl MetalOps {
         let pso_silu_mul_f32 = build_pso_ops(&device, &lib, "silu_mul_f32_inplace")?;
         let pso_gelu_mul_f32 = build_pso_ops(&device, &lib, "gelu_tanh_mul_f32_inplace")?;
         let pso_mv_q1 = build_pso_ops(&device, &lib, "mv_q1_0_g128")?;
-
+        let pso_lfm_conv = build_pso_ops(&device, &lib, "lfm_conv")?;
 
         Ok(Self {
             device, queue, _lib: lib.clone(),
             pso_rms_norm, pso_rope_adj, pso_rope_half, pso_mv_f16, pso_mv_i8, pso_mv_i4, pso_mv_qkv_f16, pso_mv_qkv_i8, pso_mv2_f16, pso_mv2_i8,
-            pso_add_f32, pso_silu_mul_f32, pso_gelu_mul_f32, pso_mv_q1,
+            pso_add_f32, pso_silu_mul_f32, pso_gelu_mul_f32, pso_mv_q1, pso_lfm_conv,
             x_buf: Mutex::new(None), out_buf: Mutex::new(None),
             tensor_cache: Mutex::new(HashMap::new()),
         })
@@ -1032,6 +1035,29 @@ impl MetalOps {
     }
     pub fn encode_qkv_f16(&self, enc: &metal::ComputeCommandEncoderRef, w_q: &metal::Buffer, w_k: &metal::Buffer, w_v: &metal::Buffer, x_buf: &metal::Buffer, q_out: &metal::Buffer, k_out: &metal::Buffer, v_out: &metal::Buffer, rows_q: usize, rows_kv: usize, cols: usize) {
         self.encode_qkv_f16_bias(enc, w_q, w_k, w_v, x_buf, None, None, None, q_out, k_out, v_out, rows_q, rows_kv, cols);
+    }
+
+    pub fn encode_lfm_conv(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        state: &metal::Buffer,
+        input: &metal::Buffer,
+        kernel: &metal::Buffer,
+        out: &metal::Buffer,
+        ks: usize,
+        hidden: usize,
+    ) {
+        let ks32 = ks as u32;
+        let h32 = hidden as u32;
+        enc.set_compute_pipeline_state(&self.pso_lfm_conv);
+        enc.set_buffer(0, Some(state), 0);
+        enc.set_buffer(1, Some(input), 0);
+        enc.set_buffer(2, Some(kernel), 0);
+        enc.set_buffer(3, Some(out), 0);
+        enc.set_bytes(4, 4, (&ks32 as *const u32).cast());
+        enc.set_bytes(5, 4, (&h32 as *const u32).cast());
+        let w = (256u64).min(hidden as u64);
+        enc.dispatch_threads(MTLSize { width: hidden as u64, height: 1, depth: 1 }, MTLSize { width: w, height: 1, depth: 1 });
     }
     pub fn encode_qkv_i8(&self, enc: &metal::ComputeCommandEncoderRef, w_q: &metal::Buffer, s_q: &metal::Buffer, w_k: &metal::Buffer, s_k: &metal::Buffer, w_v: &metal::Buffer, s_v: &metal::Buffer, x_buf: &metal::Buffer, q_out: &metal::Buffer, k_out: &metal::Buffer, v_out: &metal::Buffer, rows_q: usize, rows_kv: usize, cols: usize) {
         self.encode_qkv_i8_bias(enc, w_q, s_q, w_k, s_k, w_v, s_v, x_buf, None, None, None, q_out, k_out, v_out, rows_q, rows_kv, cols);

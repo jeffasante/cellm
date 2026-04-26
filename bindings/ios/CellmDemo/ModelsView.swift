@@ -78,6 +78,26 @@ struct ModelsView: View {
             tokenizerUrl: DemoAssetLinks.bonsai1B1BitTokenizer,
             tokenizerConfigName: DemoAssetLinks.bonsai1B1BitTokenizerConfigFileName,
             tokenizerConfigUrl: DemoAssetLinks.bonsai1B1BitTokenizerConfig
+        ),
+        ModelAssetCard(
+            name: "LFM 2.5 (350M)",
+            description: "Liquid Foundation Model (LFM) optimized for mobile. 4-bit quantization.",
+            fileName: DemoAssetLinks.lfm25FileName,
+            url: DemoAssetLinks.lfm25,
+            tokenizerName: DemoAssetLinks.lfm25TokenizerFileName,
+            tokenizerUrl: DemoAssetLinks.lfm25Tokenizer,
+            tokenizerConfigName: nil,
+            tokenizerConfigUrl: nil
+        ),
+        ModelAssetCard(
+            name: "Qwen 3.5 (0.8B int4)",
+            description: "Latest Qwen 3.5 research model with hybrid attention support.",
+            fileName: DemoAssetLinks.qwen35FileName,
+            url: DemoAssetLinks.qwen35,
+            tokenizerName: DemoAssetLinks.qwen35TokenizerFileName,
+            tokenizerUrl: DemoAssetLinks.qwen35Tokenizer,
+            tokenizerConfigName: nil,
+            tokenizerConfigUrl: nil
         )
     ]
     

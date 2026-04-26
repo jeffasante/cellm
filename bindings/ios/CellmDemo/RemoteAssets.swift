@@ -51,6 +51,18 @@ enum DemoAssetLinks {
     static let bonsai1B1BitFileName = "\(bonsai1B1BitDir)/Bonsai-1.7B_v2.cellm"
     static let bonsai1B1BitTokenizerFileName = "\(bonsai1B1BitDir)/tokenizer.json"
     static let bonsai1B1BitTokenizerConfigFileName = "\(bonsai1B1BitDir)/tokenizer_config.json"
+
+    static let lfm25 = "https://huggingface.co/jeffasante/cellm-models/resolve/main/lfm2.5-350m-v1/lfm2.5-350m-v1.cellm?download=true"
+    static let lfm25Tokenizer = "https://huggingface.co/jeffasante/cellm-models/resolve/main/lfm2.5-350m-v1/tokenizer.json?download=true"
+    static let lfm25Dir = "samples/lfm2.5-350m"
+    static let lfm25FileName = "\(lfm25Dir)/lfm2.5-350m-v1.cellm"
+    static let lfm25TokenizerFileName = "\(lfm25Dir)/tokenizer.json"
+
+    static let qwen35 = "https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen3.5-0.8b-v1/qwen3.5-0.8b-i4.cellm?download=true"
+    static let qwen35Tokenizer = "https://huggingface.co/jeffasante/cellm-models/resolve/main/qwen3.5-0.8b-v1/tokenizer.json?download=true"
+    static let qwen35Dir = "samples/qwen3.5-0.8b"
+    static let qwen35FileName = "\(qwen35Dir)/qwen3.5-0.8b-i4.cellm"
+    static let qwen35TokenizerFileName = "\(qwen35Dir)/tokenizer.json"
 }
 
 enum RemoteAssets {

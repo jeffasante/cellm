@@ -2,6 +2,11 @@
 
 Below is a record of automated profiling runs and backend comparisons performed during development. Each run includes a detailed breakdown of prefill/decode latency, memory usage, and numerical parity checks.
 
+## Full Model Matrix Runs
+Comprehensive performance benchmarks for all research models.
+
+*   [Matrix: 2026-04-26 13:06:36](runs/full_model_matrix_20260426_130636_summary.md)
+
 ## Gemma 4 Mobile Profiles
 Detailed performance profiling for Gemma 4 models on mobile-class hardware.
 

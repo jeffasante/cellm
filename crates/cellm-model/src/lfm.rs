@@ -19,6 +19,8 @@ use rayon::prelude::*;
 use cellm_cache::{KVCache, PageTable};
 use cellm_core::CoreError;
 use cellm_kernels::cpu_kernels::{rms_norm_f32, rope_non_interleaved_inplace_f32};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use cellm_kernels::metal::MetalOps;
 use half::f16;
 use serde_json::Value;
 

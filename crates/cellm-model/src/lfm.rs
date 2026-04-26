@@ -44,6 +44,46 @@ pub struct LfmRunner {
     weight_cache: HashMap<(String, usize, usize), Vec<f32>>,
     /// LRU tracking: list of cache keys in access order (most recent at end)
     lru_order: Vec<(String, usize, usize)>,
+
+    // Metal backend
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    metal_ops: Option<MetalOps>,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    graph_state: Option<LfmGraphState>,
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    metal_ops: (),
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    graph_state: (),
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub struct LfmGraphState {
+    ops: MetalOps,
+    cfg: ModelConfig,
+    layer_types: Vec<String>,
+    /// Preloaded weight buffers: name -> Metal Buffer (f16)
+    weights: HashMap<String, metal::Buffer>,
+    /// Conv state buffers per conv layer
+    conv_states: Vec<metal::Buffer>,
+    /// Conv kernel buffers per conv layer
+    conv_kernels: Vec<metal::Buffer>,
+    /// Activation buffers (reused per step)
+    buf_x: metal::Buffer,
+    buf_x_norm: metal::Buffer,
+    buf_bcx: metal::Buffer,
+    buf_bx: metal::Buffer,
+    buf_y: metal::Buffer,
+    buf_attn_proj: metal::Buffer,
+    buf_q: metal::Buffer,
+    buf_k: metal::Buffer,
+    buf_v: metal::Buffer,
+    buf_attn_out: metal::Buffer,
+    buf_mlp_in: metal::Buffer,
+    buf_gate: metal::Buffer,
+    buf_up: metal::Buffer,
+    buf_down: metal::Buffer,
+    buf_final_norm_w: metal::Buffer,
+    buf_logits: metal::Buffer,
 }
 
 impl LfmRunner {
@@ -112,6 +152,11 @@ impl LfmRunner {
             .map(|_| vec![0.0f32; conv_kernel_size * cfg.hidden_size])
             .collect();
 
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let (metal_ops, graph_state) = (None, None);
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let (metal_ops, graph_state) = ((), ());
+
         Ok(Self {
             file,
             cfg: cfg.clone(),
@@ -122,6 +167,8 @@ impl LfmRunner {
             conv_states,
             weight_cache: HashMap::new(),
             lru_order: Vec::new(),
+            metal_ops,
+            graph_state,
         })
     }
 

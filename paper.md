@@ -667,7 +667,9 @@ Consciousness refers to the ability of an individual to be aware of their though
   --prompt "What is consciousness?" \
   --gen 100 --backend metal
 
-  --- 
+  Decode: 100 tokens in 1.19s
+  ---
+  Consciousness refers to the state of being aware of oneself and one's surroundings.
 ```
 
 

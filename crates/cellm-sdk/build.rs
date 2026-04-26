@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 fn main() {
     println!("cargo:rerun-if-env-changed=LITERT_LM_LIB_PATH");
 

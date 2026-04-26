@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

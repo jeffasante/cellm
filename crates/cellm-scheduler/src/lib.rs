@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 //! cellm-scheduler: Session state machine, queues, and thermal policy.
 
 pub mod session;

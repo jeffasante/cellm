@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use crate::rr::SessionId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

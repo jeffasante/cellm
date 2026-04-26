@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use crate::CoreError;
 
 /// Checkpoint into an arena — lets you restore position after a block of work.

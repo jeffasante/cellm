@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;

@@ -15,7 +15,7 @@ How to run audio-conditioned generation with the Gemma 4 E2B model using the `au
 ## 1. Build
 
 ```bash
-cd /Users/jeff/Desktop/cellm
+cd /cellm
 
 cargo build --release -p cellm-sdk -p vlm-smoke
 ```
@@ -46,7 +46,7 @@ file /tmp/test_audio.wav   # should say: RIFF, Wave audio, Microsoft PCM, 16 bit
 ## 3. Basic inference
 
 ```bash
-cd /Users/jeff/Desktop/cellm
+cd /cellm
 
 ./target/release/audio-direct \
   --model models/to-huggingface/gemma-4-E2B-it-int4-aggr-v5/gemma-4-E2B-it-int4-aggr-v5.cellmd \

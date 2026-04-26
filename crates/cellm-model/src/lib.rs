@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 //! cellm-model: `.cellm` model format + minimal runners.
 
 pub mod cellm_file;

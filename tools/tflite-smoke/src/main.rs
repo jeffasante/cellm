@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use anyhow::{Context, Result};
 use clap::Parser;
 use edgefirst_tflite::{Interpreter, Library, Model};

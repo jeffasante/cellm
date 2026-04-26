@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use anyhow::Result;
 
 fn main() -> Result<()> {

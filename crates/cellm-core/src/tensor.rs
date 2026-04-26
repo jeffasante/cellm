@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use crate::{DType, Shape, StorageHandle};
 use crate::shape::Strides;
 

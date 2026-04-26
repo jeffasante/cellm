@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum EvictionPolicy {
     /// Evict least-recently-used sessions first (requires recency tracking in scheduler).

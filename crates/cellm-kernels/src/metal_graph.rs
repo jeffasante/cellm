@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use metal::{Buffer, CommandBuffer, CommandQueue, ComputeCommandEncoder, ComputePipelineState, Device, Library, MTLResourceOptions, MTLSize};
 

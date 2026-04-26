@@ -18,7 +18,7 @@ The fix came down to four separate bugs, found one at a time by comparing what t
 
 **The fix:** Replaced the stub with a real parallel-reduction RMSNorm. The GPU threads cooperate to sum up the squares of all elements, compute the inverse root-mean-square, then multiply each element by its weight. Standard textbook implementation.
 
-**File:** [metal.rs](file:///Users/jeff/Desktop/cellm/crates/cellm-kernels/src/metal.rs)
+**File:** [metal.rs](file:///cellm/crates/cellm-kernels/src/metal.rs)
 
 ---
 
@@ -40,7 +40,7 @@ This was bad for two reasons. First, it ran on the CPU immediately, but the GPU 
 
 **The fix:** Deleted the line. The GPU handles both buffers correctly through the encoded command sequence.
 
-**File:** [qwen.rs](file:///Users/jeff/Desktop/cellm/crates/cellm-model/src/qwen.rs)
+**File:** [qwen.rs](file:///cellm/crates/cellm-model/src/qwen.rs)
 
 ---
 
@@ -52,7 +52,7 @@ There were also several `println!` statements scattered around both the CPU and 
 
 **The fix:** Removed all the `println!` diagnostics, the early return, and the `DIAG_STOP` error.
 
-**File:** [qwen.rs](file:///Users/jeff/Desktop/cellm/crates/cellm-model/src/qwen.rs)
+**File:** [qwen.rs](file:///cellm/crates/cellm-model/src/qwen.rs)
 
 ---
 
@@ -84,7 +84,7 @@ if name.ends_with(".bias") {
 }
 ```
 
-**File:** [qwen.rs](file:///Users/jeff/Desktop/cellm/crates/cellm-model/src/qwen.rs)
+**File:** [qwen.rs](file:///cellm/crates/cellm-model/src/qwen.rs)
 
 ---
 

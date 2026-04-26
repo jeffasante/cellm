@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 //! cellm-cache: KV block allocator, page table, and eviction policy.
 
 pub mod allocator;

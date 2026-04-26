@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThermalLevel {
     Nominal,

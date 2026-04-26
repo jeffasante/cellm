@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use thiserror::Error;
 
 #[derive(Error, Debug)]

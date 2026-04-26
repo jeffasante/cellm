@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;

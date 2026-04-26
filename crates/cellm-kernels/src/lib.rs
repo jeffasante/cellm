@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 //! cellm-kernels: CPU SIMD, Metal compute shaders, and Vulkan.
 
 pub mod cpu;

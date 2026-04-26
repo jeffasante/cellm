@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use crate::{BlockAllocator, CacheError};
 
 /// Maps a session's token positions → KV block ids.

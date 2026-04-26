@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use cellm_core::{Backend, CoreError, TensorView};
 
 /// Phase 1/2 placeholder backend.

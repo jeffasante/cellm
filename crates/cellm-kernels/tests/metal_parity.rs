@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 #![cfg(target_os = "macos")]
 
 use cellm_kernels::{cpu_kernels, MetalOps};

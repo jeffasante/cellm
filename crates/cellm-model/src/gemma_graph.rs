@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 //! Gemma3 fused Metal graph — single command-buffer decode.
 //!
 //! Handles the 4-norm branch-residual structure, per-head Q/K norms,

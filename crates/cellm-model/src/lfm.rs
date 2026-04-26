@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 //! LFM2 (Liquid Foundation Model 2) runner.
 //!
 //! LFM2.5 uses a hybrid architecture with:

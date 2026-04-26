@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 // use std::process::Command; // Removed as LiteRtProxy (which used it) is gone.

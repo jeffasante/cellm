@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use std::ffi::c_char;
 use std::path::PathBuf;
 

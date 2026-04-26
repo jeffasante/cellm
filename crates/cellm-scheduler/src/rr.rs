@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use std::collections::VecDeque;
 
 pub type SessionId = u64;

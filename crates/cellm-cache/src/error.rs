@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

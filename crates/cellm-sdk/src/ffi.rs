@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr};

@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use cellm_model::CellmFile;
 use std::path::Path;
 

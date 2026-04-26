@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 /// Supported data types for tensor elements.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DType {

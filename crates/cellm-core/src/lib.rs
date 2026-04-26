@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 //! cellm-core: Tensor abstraction, memory arena, and op dispatch.
 
 pub mod arena;

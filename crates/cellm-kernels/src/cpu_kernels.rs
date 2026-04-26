@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use std::f32;
 use rayon::prelude::*;
 use half::f16;

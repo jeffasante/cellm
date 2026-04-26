@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use std::path::Path;
 
 use bytemuck::cast_slice;

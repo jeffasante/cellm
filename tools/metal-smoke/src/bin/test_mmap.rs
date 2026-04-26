@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use metal::{Device, MTLResourceOptions};
 use memmap2::Mmap;
 

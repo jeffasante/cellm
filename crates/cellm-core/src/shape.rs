@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use smallvec::SmallVec;
 use crate::CoreError;
 

@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;

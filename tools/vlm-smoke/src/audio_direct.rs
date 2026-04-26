@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 /// Direct test of describe_audio_with_cellm_timed, bypassing the FFI 16-token limit.
 use std::path::PathBuf;
 use anyhow::Result;

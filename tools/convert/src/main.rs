@@ -1,3 +1,4 @@
+// Author: Jeffrey Asante (https://jeffasante.github.io/)
 //! cellm Model Converter
 //!
 //! Converts HuggingFace checkpoints (safetensors) into a memory-mappable `.cellm`
@@ -57,6 +58,12 @@ struct Args {
     /// This is an extremely aggressive weight-only mode intended for Gemma experiments.
     #[arg(long, default_value_t = false)]
     quantize_int2_symmetric: bool,
+
+    /// Quantize eligible text 2D weights to packed 1-bit rows (q1_0_g128 format).
+    ///
+    /// Each group of 128 weights → f16 scale + 16 bytes packed sign bits.
+    #[arg(long, default_value_t = false)]
+    quantize_int1_symmetric: bool,
 
     /// Quantize eligible text weights to FP8 E4M3.
     ///
@@ -251,6 +258,7 @@ enum TensorOp {
     QuantizeI4Scales { weight_name: String },
     QuantizeI2Data,
     QuantizeI2Scales { weight_name: String },
+    QuantizeQ1Data,
     QuantizeFp8E4M3,
     CopyRaw,
 }
@@ -383,9 +391,15 @@ fn main() -> Result<()> {
             selected.model_type
         );
     }
-    if args.quantize_int2_symmetric && !selected.model_type.starts_with("gemma") {
+    if args.quantize_int2_symmetric && !selected.model_type.starts_with("gemma") && !selected.model_type.starts_with("qwen") {
         anyhow::bail!(
-            "--quantize-int2-symmetric is currently supported for gemma text stacks only (detected model_type={}).",
+            "--quantize-int2-symmetric is currently supported for gemma/qwen text stacks only (detected model_type={}).",
+            selected.model_type
+        );
+    }
+    if args.quantize_int1_symmetric && !selected.model_type.starts_with("gemma") && !selected.model_type.starts_with("qwen") {
+        anyhow::bail!(
+            "--quantize-int1-symmetric is currently supported for gemma/qwen text stacks only (detected model_type={}).",
             selected.model_type
         );
     }
@@ -405,6 +419,7 @@ fn main() -> Result<()> {
         args.quantize_int8_symmetric,
         args.quantize_int4_symmetric,
         args.quantize_int2_symmetric,
+        args.quantize_int1_symmetric,
         args.gemma4_aggressive_int4,
         args.gemma4_balanced_int4,
         args.gemma4_awq_lite_int4,
@@ -631,6 +646,12 @@ fn main() -> Result<()> {
                     format!("tensor {} in {:?}", weight_name, safetensors_paths[p.file_idx])
                 })?;
                 write_quant_i2_scales_per_row_symmetric(t.data(), t.shape(), t.dtype(), &mut w)?;
+            }
+            TensorOp::QuantizeQ1Data => {
+                let t = st.tensor(&p.name).with_context(|| {
+                    format!("tensor {} in {:?}", p.name, safetensors_paths[p.file_idx])
+                })?;
+                write_quant_q1_g128(t.data(), t.shape(), t.dtype(), &mut w)?;
             }
             TensorOp::CopyRaw => {
                 let t = st.tensor(&p.name).with_context(|| {
@@ -3031,6 +3052,7 @@ fn build_tensor_plans(
     quantize_int8_symmetric: bool,
     quantize_int4_symmetric: bool,
     quantize_int2_symmetric: bool,
+    quantize_int1_symmetric: bool,
     gemma4_aggressive_int4: bool,
     gemma4_balanced_int4: bool,
     gemma4_awq_lite_int4: bool,
@@ -3113,6 +3135,11 @@ fn build_tensor_plans(
             {
                 out_dtype = "i4".to_string();
                 TensorOp::QuantizeI4Data
+            } else if quantize_int1_symmetric
+                && should_quantize_i2_weight(model_type, name, &shape)
+            {
+                out_dtype = "q1_0_g128".to_string();
+                TensorOp::QuantizeQ1Data
             } else if quantize_int2_symmetric
                 && should_quantize_i2_weight(model_type, name, &shape)
             {
@@ -3146,6 +3173,12 @@ fn build_tensor_plans(
                 i2_packed_nbytes_for_shape(&out_shape)?
             } else if out_dtype == "i4" {
                 i4_packed_nbytes_for_shape(&out_shape)?
+            } else if out_dtype == "q1_0_g128" {
+                // q1_0_g128: each row has ceil(in_dim/128) blocks of 18 bytes
+                let out_dim = out_shape[0];
+                let in_dim = out_shape[1];
+                let blocks_per_row = in_dim.div_ceil(128);
+                out_dim * blocks_per_row * 18
             } else {
                 numel * 2
             };
@@ -3409,7 +3442,7 @@ fn should_quantize_i4_granite_weight(name: &str, shape: &[usize]) -> bool {
 }
 
 fn should_quantize_i2_weight(model_type: &str, name: &str, shape: &[usize]) -> bool {
-    if !model_type.starts_with("gemma") {
+    if !model_type.starts_with("gemma") && !model_type.starts_with("qwen") {
         return false;
     }
     if shape.len() != 2 || !name.ends_with(".weight") {
@@ -4051,6 +4084,57 @@ fn write_quant_i2_scales_per_row_symmetric(
         let scale = if max_abs > 0.0 { max_abs / 1.5 } else { 1.0 };
         let h = f16::from_f32(scale);
         w.write_all(&h.to_bits().to_le_bytes())?;
+    }
+    Ok(())
+}
+
+/// Quantize a 2D weight tensor to q1_0_g128 format.
+/// Each group of 128 elements → f16 scale (mean of abs values) + 16 bytes packed sign bits.
+/// +1 if bit is set, -1 if not.
+fn write_quant_q1_g128(
+    data: &[u8],
+    shape: &[usize],
+    dtype: Dtype,
+    w: &mut impl Write,
+) -> Result<()> {
+    if shape.len() != 2 {
+        anyhow::bail!("q1 quantization expects 2D weight, got shape={shape:?}");
+    }
+    let out_dim = shape[0];
+    let in_dim = shape[1];
+    let values = tensor_data_to_f32(data, dtype)?;
+    if values.len() != out_dim * in_dim {
+        anyhow::bail!(
+            "q1 quantization data length mismatch: {} vs {}",
+            values.len(),
+            out_dim * in_dim
+        );
+    }
+    let blocks_per_row = in_dim.div_ceil(128);
+    for r in 0..out_dim {
+        let row = &values[r * in_dim..(r + 1) * in_dim];
+        for blk in 0..blocks_per_row {
+            let start = blk * 128;
+            let end = (start + 128).min(in_dim);
+            // Scale = mean of abs values in this block
+            let mut sum_abs = 0.0f32;
+            let count = (end - start) as f32;
+            for i in start..end {
+                sum_abs += row[i].abs();
+            }
+            let scale = if count > 0.0 { sum_abs / count } else { 0.0 };
+            let h = f16::from_f32(scale);
+            w.write_all(&h.to_le_bytes())?;
+            // Pack 128 sign bits into 16 bytes
+            let mut bits = [0u8; 16];
+            for i in start..end {
+                let bit_idx = i - start;
+                if row[i] > 0.0 {
+                    bits[bit_idx / 8] |= 1 << (bit_idx % 8);
+                }
+            }
+            w.write_all(&bits)?;
+        }
     }
     Ok(())
 }

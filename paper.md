@@ -500,7 +500,6 @@ cargo run --release --bin convert -- \
   --image models/test_images/bird.jpg \
   --prompt "What do you see?" \
     --backend metal
-  --tokens 64
 
 
 ```bash

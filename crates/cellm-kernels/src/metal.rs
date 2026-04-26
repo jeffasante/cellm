@@ -540,15 +540,15 @@ kernel void mv2_i8(
     }
 }
 kernel void mv_q1_0_g128(
-    device const uchar*  A        [[buffer(0)]],
-    device const float*  x        [[buffer(1)]],
-    device       float*  out      [[buffer(2)]],
-    constant     uint&   rows     [[buffer(3)]],
-    constant     uint&   cols     [[buffer(4)]],
+    device const uchar*  w     [[buffer(0)]],
+    device const float*  x     [[buffer(1)]],
+    device       float*  out   [[buffer(2)]],
+    constant     uint&   rows  [[buffer(3)]],
+    constant     uint&   cols  [[buffer(4)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= rows) return;
-    device const uchar* row_ptr = A + (uint64_t)gid * (cols / 128 * 18);
+    device const uchar* row_ptr = w + (uint64_t)gid * (cols / 128 * 18);
     float acc = 0.0f;
     for (uint i = 0; i < cols; i += 128) {
         uchar d_low = row_ptr[0];
@@ -565,6 +565,29 @@ kernel void mv_q1_0_g128(
             }
         }
         row_ptr += 18;
+    }
+    out[gid] = acc;
+}
+
+kernel void lfm_conv(
+    device       float*  state      [[buffer(0)]],  // [kernel_size, hidden]
+    device const float*  input      [[buffer(1)]],  // [hidden]
+    device const half*   kernel     [[buffer(2)]],  // [hidden, kernel_size]
+    device       float*  out        [[buffer(3)]],  // [hidden]
+    constant     uint&   ks         [[buffer(4)]],
+    constant     uint&   hidden     [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= hidden) return;
+    // Shift state: slot i <- slot i+1, then write new input into last slot
+    for (uint s = 0; s < ks - 1; ++s) {
+        state[s * hidden + gid] = state[(s + 1) * hidden + gid];
+    }
+    state[(ks - 1) * hidden + gid] = input[gid];
+    // Depthwise causal conv: dot product over kernel_size
+    float acc = 0.0f;
+    for (uint k = 0; k < ks; ++k) {
+        acc += state[k * hidden + gid] * float(kernel[gid * ks + k]);
     }
     out[gid] = acc;
 }

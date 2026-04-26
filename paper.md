@@ -629,13 +629,36 @@ Architecture: 16 layers alternating between conv and attention blocks.
 python3 tools/convert_lfm.py models/LFM2.5-350M-MLX-4bit models/LFM2.5-350M.cellm
 
 ### Inference (CPU)
-
+```bash
 ./target/release/infer \
   --model models/LFM2.5-350M.cellm \
   --tokenizer models/LFM2.5-350M-MLX-4bit/tokenizer.json \
   --prompt "The quick brown fox" \
   --tokens 32 --backend cpu
+```
 
+```bash
+./target/release/infer \
+  --model models/LFM2.5-350M.cellm \
+  --tokenizer models/LFM2.5-350M-MLX-4bit/tokenizer.json \
+  --prompt "The quick brown fox" \
+  --gen 32 --backend cpu
+  ---
+  jumps over the lazy dog, but the slowest ever comes first.
+```
+
+
+```bash
+
+./target/release/infer \
+  --model models/LFM2.5-350M.cellm \
+  --tokenizer models/LFM2.5-350M-MLX-4bit/tokenizer.json \
+  --prompt "What is consciousness?" \
+  --gen 100 --backend cpu
+
+  ---
+Consciousness refers to the ability of an individual to be aware of their thoughts, feelings, and surroundings. It is a fundamental aspect of human experience that allows us to navigate our daily lives with ease.
+```
 ### Performance
 
 - Model size: ~211 MB (4-bit quantized, scales kept as f32)

@@ -593,110 +593,110 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                 &mut rng,
             )?;
 
-            // Attempt speculative drafting.
+            // Attempt speculative drafting using batch prefill_topk.
             if let Some(spec) = speculator.as_ref() {
-                // Build draft key without mutating all_ids.
                 let mut draft_key = all_ids.clone();
                 draft_key.push(cur);
                 let draft = spec.draft(&draft_key);
                 if !draft.is_empty() {
                     spec_stats_total += 1;
-                    // Verify draft tokens against the model.
-                    let mut verify_pos = pos + 1;
-                    let mut verify_cur = cur;
-                    let mut accepted: Vec<u32> = Vec::new();
+                    let verify_pos = pos + 1;
+                    // Batch-verify all draft tokens using prefill_topk.
+                    // Tokens to process: [cur, d0, d1, ..., d_{m-1}]
+                    // Results[i] predicts tokens[i+1] = draft[i].
+                    let mut verify_tokens = Vec::with_capacity(1 + draft.len());
+                    verify_tokens.push(cur);
+                    verify_tokens.extend_from_slice(&draft);
 
-                    for &draft_tok in &draft {
-                        let c = match &mut runner {
-                            Runner::Llama(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
-                            Runner::Gemma(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
-                            Runner::Qwen(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
-                            Runner::Granite(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
-                            Runner::Lfm(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
-                            Runner::DeepSeekV4(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
-                        };
+                    let batch_results = match &mut runner {
+                        Runner::Llama(r) => r.prefill_topk(&verify_tokens, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                        Runner::Gemma(r) => r.prefill_topk(&verify_tokens, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                        Runner::Qwen(r) => r.prefill_topk(&verify_tokens, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                        Runner::Granite(r) => r.prefill_topk(&verify_tokens, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                        Runner::Lfm(r) => r.prefill_topk(&verify_tokens, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                        Runner::DeepSeekV4(r) => r.prefill_topk(&verify_tokens, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                    };
+
+                    // Check each batch result against the corresponding draft token.
+                    // KV cache already has entries for all draft tokens from prefill_topk.
+                    // For rejection at position k, we just overwrite position k with
+                    // the model's token via step_topk (no truncation/replay needed).
+                    let mut accepted: Vec<u32> = Vec::new();
+                    let mut rejected_at: Option<usize> = None;
+
+                    for (i, draft_tok) in draft.iter().enumerate() {
+                        if i >= batch_results.len() {
+                            break;
+                        }
                         let model_tok = select_next(
-                            &c,
+                            &batch_results[i],
                             args.temperature,
                             args.repeat_penalty,
                             args.repeat_window,
                             &all_ids,
                             &mut rng,
                         )?;
-                        if model_tok == draft_tok {
-                            // Accept: push the verified token to history.
-                            all_ids.push(verify_cur);
-                            cur_already_pushed = true;
-                            accepted.push(draft_tok);
-                            verify_cur = draft_tok;
-                            verify_pos += 1;
-
-                            // Stop if draft token is EOS.
-                            let eos = match &runner {
-                                Runner::Llama(r) => r.eos_token_id(),
-                                Runner::Gemma(r) => r.eos_token_id(),
-                                Runner::Qwen(r) => r.eos_token_id(),
-                                Runner::Granite(r) => r.eos_token_id(),
-                                Runner::Lfm(r) => r.eos_token_id(),
-                                Runner::DeepSeekV4(r) => r.eos_token_id(),
-                            };
-                            if let Some(eos) = eos {
-                                if draft_tok == eos {
-                                    break;
-                                }
-                            }
-                            if let Some(im_end) = chat_im_end {
-                                if draft_tok == im_end {
-                                    break;
-                                }
-                            }
+                        if model_tok == *draft_tok {
+                            accepted.push(*draft_tok);
                         } else {
-                            // Reject: use model's token, push previous token.
-                            all_ids.push(verify_cur);
-                            cur_already_pushed = true;
                             spec_stats_hits += accepted.len();
                             accepted.push(model_tok);
-                            verify_cur = model_tok;
                             spec_stats_misses += 1;
+                            rejected_at = Some(i);
                             break;
                         }
                     }
 
-                    // If all draft tokens were accepted, generate one more real token
-                    // so we don't stall.
-                    if accepted.len() == draft.len() && !draft.is_empty() {
-                        let c = match &mut runner {
-                            Runner::Llama(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
-                            Runner::Gemma(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
-                            Runner::Qwen(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
-                            Runner::Granite(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
-                            Runner::Lfm(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
-                            Runner::DeepSeekV4(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
-                        };
-                        let extra_tok = select_next(
-                            &c,
-                            args.temperature,
-                            args.repeat_penalty,
-                            args.repeat_window,
-                            &all_ids,
-                            &mut rng,
-                        )?;
-                        all_ids.push(verify_cur);
-                        accepted.push(extra_tok);
-                        verify_cur = extra_tok;
+                    if let Some(idx) = rejected_at {
+                        // KV cache has draft[0..idx] (accepted) + draft[idx] (rejected).
+                        // Overwrite position verify_pos + idx with the model's token.
+                        let overwrite_pos = verify_pos + idx;
+                        let model_tok = accepted[idx]; // the model's token
+                        if overwrite_pos < page_table.token_count() {
+                            // Overwrite by calling step_topk (writes to same KV slot).
+                            let _c = match &mut runner {
+                                Runner::Llama(r) => r.step_topk(model_tok, overwrite_pos, &mut page_table, &mut kv_cache, 1)?,
+                                Runner::Gemma(r) => r.step_topk(model_tok, overwrite_pos, &mut page_table, &mut kv_cache, 1)?,
+                                Runner::Qwen(r) => r.step_topk(model_tok, overwrite_pos, &mut page_table, &mut kv_cache, 1)?,
+                                Runner::Granite(r) => r.step_topk(model_tok, overwrite_pos, &mut page_table, &mut kv_cache, 1)?,
+                                Runner::Lfm(r) => r.step_topk(model_tok, overwrite_pos, &mut page_table, &mut kv_cache, 1)?,
+                                Runner::DeepSeekV4(r) => r.step_topk(model_tok, overwrite_pos, &mut page_table, &mut kv_cache, 1)?,
+                            };
+                        }
+                        // Push accepted draft tokens + the rejected position's predecessor.
+                        for tok in &accepted[..idx] {
+                            all_ids.push(*tok);
+                            cur_already_pushed = true;
+                        }
+                        cur = model_tok;
+                        for tok in accepted.iter().take(idx).skip(1) {
+                            pending_draft.push_back(*tok);
+                        }
+                    } else if accepted.len() == draft.len() && !draft.is_empty() {
+                        // All accepted: generate one more token.
                         spec_stats_hits += draft.len();
-                    }
-
-                    // Queue accepted tokens.
-                    // The first accepted token replaces cur.
-                    // Remaining accepted tokens go into pending_draft.
-                    // all_ids already has all verified tokens.
-                    if !accepted.is_empty() {
-                        cur = accepted[0];
-                        for tok in accepted.iter().skip(1) {
+                        let last_pos = verify_pos + draft.len();
+                        let last_tok = *draft.last().unwrap();
+                        let c = match &mut runner {
+                            Runner::Llama(r) => r.step_topk(last_tok, last_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                            Runner::Gemma(r) => r.step_topk(last_tok, last_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                            Runner::Qwen(r) => r.step_topk(last_tok, last_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                            Runner::Granite(r) => r.step_topk(last_tok, last_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                            Runner::Lfm(r) => r.step_topk(last_tok, last_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                            Runner::DeepSeekV4(r) => r.step_topk(last_tok, last_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                        };
+                        let extra_tok = select_next(&c, args.temperature, args.repeat_penalty, args.repeat_window, &all_ids, &mut rng)?;
+                        accepted.push(extra_tok);
+                        for tok in &accepted[..accepted.len() - 1] {
+                            all_ids.push(*tok);
+                            cur_already_pushed = true;
+                        }
+                        cur = extra_tok;
+                        for tok in accepted.iter().take(accepted.len() - 1).skip(1) {
                             pending_draft.push_back(*tok);
                         }
                     }
+                    // If no accepted tokens and no rejection (empty results), fall through.
                 }
             }
         }

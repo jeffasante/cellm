@@ -34,6 +34,7 @@ fn stats_elapsed_secs(_: &StatsInstant) -> Option<f64> {
 
 pub type SessionId = u64;
 
+pub mod spec_decode;
 pub mod ffi;
 pub mod vlm;
 #[cfg(target_os = "android")]
@@ -95,6 +96,10 @@ struct EngineSession {
     cached_next_pos: usize,
     cached_last_token: Option<u32>,
     cached_recent: Vec<u32>,
+    /// Optional n-gram speculator for speculative decoding.
+    /// When set, the engine will attempt to generate draft tokens from this
+    /// external corpus and verify them against the model.
+    speculator: Option<spec_decode::NgramSpeculator>,
 }
 
 enum Runner {
@@ -429,10 +434,11 @@ impl Engine {
                 pending_out: VecDeque::new(),
                 rng: XorShift64::seeded(self.seed_for_session(id)),
                 cached_prompt: Vec::new(),
-                cached_next_pos: 0,
-                cached_last_token: None,
-                cached_recent: Vec::new(),
-            },
+                    cached_next_pos: 0,
+                    cached_last_token: None,
+                    cached_recent: Vec::new(),
+                    speculator: None,
+                },
         );
         self.session_meta.insert(id, SchedSession::new(id));
         id
@@ -566,6 +572,37 @@ impl Engine {
         self.total_tokens_generated += 1;
         self.tokens_since_snapshot += 1;
         Ok((next, false))
+    }
+
+    /// Enable n-gram speculative decoding for the given session.
+    ///
+    /// * `corpus` - External token buffer to search for n-gram matches.
+    ///   The model never attends to these tokens — they are only used as a
+    ///   pattern-matching dictionary for draft candidate generation.
+    /// * `n` - N-gram key size (e.g. 4). Larger = more specific matches.
+    /// * `m_max` - Maximum draft length (e.g. 5).
+    pub fn session_enable_spec_decode(
+        &mut self,
+        id: SessionId,
+        corpus: Vec<u32>,
+        n: usize,
+        m_max: usize,
+    ) {
+        if let Some(s) = self.sessions.get_mut(&id) {
+            s.speculator = Some(spec_decode::NgramSpeculator::new(corpus, n, m_max));
+        }
+    }
+
+    /// Disable speculative decoding for the given session.
+    pub fn session_disable_spec_decode(&mut self, id: SessionId) {
+        if let Some(s) = self.sessions.get_mut(&id) {
+            s.speculator = None;
+        }
+    }
+
+    /// Returns true if the session has speculative decoding enabled.
+    pub fn session_has_spec_decode(&self, id: SessionId) -> bool {
+        self.sessions.get(&id).map(|s| s.speculator.is_some()).unwrap_or(false)
     }
 
     /// Run a single decode step for the next scheduled session (greedy).
@@ -919,7 +956,208 @@ impl Engine {
         None
     }
 
+    /// Attempt speculative decode: generate draft tokens from the n-gram
+    /// corpus, verify each one against the model, and queue all accepted
+    /// tokens. Falls back to normal decode if no speculator is configured
+    /// or no draft is available.
+    fn decode_one_speculative(&mut self, id: SessionId) -> anyhow::Result<Option<u32>> {
+        let temperature = self.temperature;
+        let repeat_penalty = self.repeat_penalty;
+        let repeat_window = self.repeat_window;
+        let backend = self.backend;
+        let top_k = self.top_k;
+
+        let mut s = match self.sessions.remove(&id) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let mut meta = match self.session_meta.remove(&id) {
+            Some(m) => m,
+            None => {
+                self.sessions.insert(id, s);
+                return Ok(None);
+            }
+        };
+
+        let out = (|| -> anyhow::Result<Option<u32>> {
+            if matches!(meta.state(), SessionState::Suspended | SessionState::Terminal) {
+                return Ok(None);
+            }
+            let Some(cur) = s.last_token else {
+                return Ok(None);
+            };
+
+            // Try to build a draft from the n-gram corpus.
+            let draft = s.speculator.as_ref().and_then(|spec| {
+                let d = spec.draft(&s.recent);
+                if d.is_empty() { None } else { Some(d) }
+            });
+
+            let Some(draft_tokens) = draft else {
+                // No draft available — fall back to normal single-token decode.
+                let pos = s.next_pos;
+                let mut cand = match &mut self.runner {
+                    Runner::Llama(r) => r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
+                    Runner::Gemma(r) => {
+                        let top_k = if r.is_gemma3_text() { top_k.max(8) } else { top_k };
+                        r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?
+                    }
+                    Runner::Qwen(r) => r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
+                    Runner::Lfm(r) => r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
+                    Runner::DeepSeekV4(r) => r.step_topk(cur, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
+                };
+                if let Runner::Gemma(r) = &self.runner {
+                    if r.is_gemma3_text() {
+                        apply_gemma3_stability_candidate_filter(&mut cand, &s.recent, backend);
+                    }
+                }
+                let next = select_next_with_params(
+                    temperature, repeat_penalty, repeat_window, &cand, &s.recent, &mut s.rng,
+                )?;
+                s.recent.push(cur);
+                s.last_token = Some(next);
+                s.next_pos += 1;
+                meta.add_generated_token();
+                if self.runner.is_stop_token(next) {
+                    let _ = meta.transition(SessionState::Terminal);
+                }
+                return Ok(Some(next));
+            };
+
+            // --- Speculative decode path ---
+            // We have a draft. Verify each draft token against the model.
+            // For each draft position i:
+            //   1. Run model on current token → get logits
+            //   2. If model's top-1 == draft[i], accept draft[i]
+            //   3. Otherwise, use model's token and stop
+            let mut accepted: Vec<u32> = Vec::new();
+            let mut current_tok = cur;
+            let mut pos = s.next_pos;
+            let mut rejected = false;
+
+            for &draft_tok in &draft_tokens {
+                let mut cand = match &mut self.runner {
+                    Runner::Llama(r) => r.step_topk(current_tok, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
+                    Runner::Gemma(r) => {
+                        let top_k = if r.is_gemma3_text() { top_k.max(8) } else { top_k };
+                        r.step_topk(current_tok, pos, &mut s.page_table, &mut self.kv_cache, top_k)?
+                    }
+                    Runner::Qwen(r) => r.step_topk(current_tok, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
+                    Runner::Lfm(r) => r.step_topk(current_tok, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
+                    Runner::DeepSeekV4(r) => r.step_topk(current_tok, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
+                };
+                if let Runner::Gemma(r) = &self.runner {
+                    if r.is_gemma3_text() {
+                        apply_gemma3_stability_candidate_filter(&mut cand, &s.recent, backend);
+                    }
+                }
+                let model_tok = select_next_with_params(
+                    temperature, repeat_penalty, repeat_window, &cand, &s.recent, &mut s.rng,
+                )?;
+                s.recent.push(current_tok);
+                pos += 1;
+                meta.add_generated_token();
+
+                if model_tok == draft_tok {
+                    // Accept the draft token.
+                    accepted.push(draft_tok);
+                    current_tok = draft_tok;
+                    if self.runner.is_stop_token(draft_tok) {
+                        if accepted.len() == 1 {
+                            // Only this one token — return it directly.
+                            s.last_token = Some(draft_tok);
+                            s.next_pos = pos;
+                            let _ = meta.transition(SessionState::Terminal);
+                            return Ok(Some(draft_tok));
+                        }
+                        // Queue all accepted including stop token, return first.
+                        break;
+                    }
+                } else {
+                    // Reject: use model's token instead.
+                    accepted.push(model_tok);
+                    current_tok = model_tok;
+                    rejected = true;
+                    if self.runner.is_stop_token(model_tok) {
+                        let _ = meta.transition(SessionState::Terminal);
+                    }
+                    break;
+                }
+            }
+
+            if !rejected && !accepted.is_empty() {
+                // All draft tokens were accepted. Generate one more real token
+                // so we don't stall — the model predicts what comes after the draft.
+                let mut cand = match &mut self.runner {
+                    Runner::Llama(r) => r.step_topk(current_tok, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
+                    Runner::Gemma(r) => {
+                        let top_k = if r.is_gemma3_text() { top_k.max(8) } else { top_k };
+                        r.step_topk(current_tok, pos, &mut s.page_table, &mut self.kv_cache, top_k)?
+                    }
+                    Runner::Qwen(r) => r.step_topk(current_tok, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
+                    Runner::Lfm(r) => r.step_topk(current_tok, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
+                    Runner::DeepSeekV4(r) => r.step_topk(current_tok, pos, &mut s.page_table, &mut self.kv_cache, top_k)?,
+                };
+                if let Runner::Gemma(r) = &self.runner {
+                    if r.is_gemma3_text() {
+                        apply_gemma3_stability_candidate_filter(&mut cand, &s.recent, backend);
+                    }
+                }
+                let extra_tok = select_next_with_params(
+                    temperature, repeat_penalty, repeat_window, &cand, &s.recent, &mut s.rng,
+                )?;
+                s.recent.push(current_tok);
+                pos += 1;
+                meta.add_generated_token();
+                accepted.push(extra_tok);
+                current_tok = extra_tok;
+                if self.runner.is_stop_token(extra_tok) {
+                    let _ = meta.transition(SessionState::Terminal);
+                }
+            }
+
+            // Queue all accepted tokens except the first into pending_out.
+            s.last_token = Some(current_tok);
+            s.next_pos = pos;
+            let first = accepted.first().copied();
+            for tok in accepted.iter().skip(1) {
+                s.pending_out.push_back(*tok);
+            }
+            drop(accepted);
+            Ok(first)
+        })();
+
+        // Increment token counters.
+        if let Ok(Some(_)) = &out {
+            self.total_tokens_generated += 1;
+            self.tokens_since_snapshot += 1;
+        }
+
+        let _speculative_accepted = match &out {
+            Ok(Some(_)) => {
+                let n_pending = s.pending_out.len();
+                if n_pending > 0 {
+                    // We accepted draft tokens. The first was returned,
+                    // the rest are pending.
+                    n_pending
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+
+        self.sessions.insert(id, s);
+        self.session_meta.insert(id, meta);
+        out
+    }
+
     fn decode_one_for_session(&mut self, id: SessionId) -> anyhow::Result<Option<u32>> {
+        // If the session has a speculator configured, use speculative decoding.
+        if self.sessions.get(&id).map(|s| s.speculator.is_some()).unwrap_or(false) {
+            return self.decode_one_speculative(id);
+        }
+
         let temperature = self.temperature;
         let repeat_penalty = self.repeat_penalty;
         let repeat_window = self.repeat_window;

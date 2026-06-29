@@ -84,6 +84,8 @@ enum DemoAssetLinks {
         "https://huggingface.co/jeffasante/cellm-models/resolve/main/LFM2.5-230M/LFM2.5-230M.cellm?download=true"
     static let lfm25230MInt4 =
         "https://huggingface.co/jeffasante/cellm-models/resolve/main/LFM2.5-230M/LFM2.5-230M-int4.cellm?download=true"
+    static let lfm25230MInt4V2 =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/LFM2.5-230M/LFM2.5-230M-int4-v2.cellm?download=true"
     static let lfm25230MTokenizer =
         "https://huggingface.co/jeffasante/cellm-models/resolve/main/LFM2.5-230M/tokenizer.json?download=true"
     static let lfm25230MTokenizerConfig =
@@ -91,6 +93,7 @@ enum DemoAssetLinks {
     static let lfm25230MDir = "samples/lfm2.5-230m"
     static let lfm25230MFileName = "\(lfm25230MDir)/LFM2.5-230M.cellm"
     static let lfm25230MInt4FileName = "\(lfm25230MDir)/LFM2.5-230M-int4.cellm"
+    static let lfm25230MInt4V2FileName = "\(lfm25230MDir)/LFM2.5-230M-int4-v2.cellm"
     static let lfm25230MTokenizerFileName = "\(lfm25230MDir)/tokenizer.json"
     static let lfm25230MTokenizerConfigFileName = "\(lfm25230MDir)/tokenizer_config.json"
 

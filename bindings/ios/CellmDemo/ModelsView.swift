@@ -106,9 +106,9 @@ struct ModelsView: View {
         ModelAssetCard(
             name: "LFM 2.5 (230M int4)",
             description:
-                "LFM2.5-230M quantized to int4 (225 MB). Hybrid LIV conv + GQA architecture.",
-            fileName: DemoAssetLinks.lfm25230MInt4FileName,
-            url: DemoAssetLinks.lfm25230MInt4,
+                "LFM2.5-230M quantized to int4 (137 MB). Embed table also quantized. Hybrid LIV conv + GQA architecture.",
+            fileName: DemoAssetLinks.lfm25230MInt4V2FileName,
+            url: DemoAssetLinks.lfm25230MInt4V2,
             tokenizerName: DemoAssetLinks.lfm25230MTokenizerFileName,
             tokenizerUrl: DemoAssetLinks.lfm25230MTokenizer,
             tokenizerConfigName: DemoAssetLinks.lfm25230MTokenizerConfigFileName,

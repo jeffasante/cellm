@@ -1,10 +1,11 @@
 // Author: Jeffrey Asante (https://jeffasante.github.io/)
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use cellm_cache::{KVCache, KvEncodingKind, PageTable};
 use cellm_core::KvCacheLayout;
@@ -133,6 +134,23 @@ struct Args {
     /// `turboquant` enables an experimental CPU int8+scale packed KV path.
     #[arg(long, value_enum, default_value_t = KvEncodingArg::F16)]
     kv_encoding: KvEncodingArg,
+
+    // --- Speculative decoding ---
+
+    /// Path to a text file whose tokens will be used as the n-gram corpus
+    /// for speculative decoding. Must be used with --tokenizer.
+    /// The corpus tokens are never passed through the model — they are only
+    /// used as a pattern-matching dictionary for draft generation.
+    #[arg(long)]
+    spec_corpus: Option<PathBuf>,
+
+    /// N-gram key size for speculative decoding (default: 4).
+    #[arg(long, default_value_t = 4)]
+    spec_n: usize,
+
+    /// Maximum draft length for speculative decoding (default: 5).
+    #[arg(long, default_value_t = 5)]
+    spec_m_max: usize,
 }
 
 fn main() -> Result<()> {
@@ -512,23 +530,183 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         next
     );
 
+    // --- Speculative decoding setup ---
+    let mut speculator: Option<NgramSpeculator> = None;
+    let mut pending_draft: VecDeque<u32> = VecDeque::new();
+    let mut spec_stats_hits: usize = 0;
+    let mut spec_stats_total: usize = 0;
+    let mut spec_stats_misses: usize = 0;
+
+    if let Some(corpus_path) = args.spec_corpus.as_ref() {
+        let corpus_text = std::fs::read_to_string(corpus_path)
+            .context("failed to read spec-corpus file")?;
+        if let Some(tok) = tokenizer.as_ref() {
+            let enc = tok
+                .encode(corpus_text.as_str(), false)
+                .map_err(|e| anyhow::anyhow!("failed to tokenize spec-corpus: {e}"))?;
+            let corpus_tokens: Vec<u32> = enc.get_ids().to_vec();
+            println!(
+                "Spec decode: corpus={} tokens, n={}, m_max={}",
+                corpus_tokens.len(),
+                args.spec_n,
+                args.spec_m_max
+            );
+            speculator = Some(NgramSpeculator::new(corpus_tokens, args.spec_n, args.spec_m_max));
+        } else {
+            eprintln!("Warning: --spec-corpus requires --tokenizer, skipping");
+        }
+    }
+
     // Decode.
     let t1 = Instant::now();
     let mut cur = next;
     let mut output_buffer = String::with_capacity(256);
     let mut last_flush_step = 0;
+    let mut gen_step = 0;
 
-    for step in 0..args.gen {
-        let pos = seq + step;
-        let cand = match &mut runner {
-            Runner::Llama(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
-            Runner::Gemma(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
-            Runner::Qwen(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
-            Runner::Granite(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
-            Runner::Lfm(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
-            Runner::DeepSeekV4(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
-        };
-        all_ids.push(cur);
+    let mut cur_already_pushed = false;
+    while gen_step < args.gen {
+        // If we have pending draft tokens, output them directly without a model step.
+        // These tokens are already in all_ids from when they were verified.
+        if let Some(draft_tok) = pending_draft.pop_front() {
+            cur = draft_tok;
+            cur_already_pushed = true;
+            // (Counts as a generated token for the output step counter)
+        } else {
+            // Normal model step: get logits, select the next token.
+            let pos = seq + gen_step;
+            let cand = match &mut runner {
+                Runner::Llama(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                Runner::Gemma(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                Runner::Qwen(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                Runner::Granite(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                Runner::Lfm(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                Runner::DeepSeekV4(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
+            };
+
+            cur = select_next(
+                &cand,
+                args.temperature,
+                args.repeat_penalty,
+                args.repeat_window,
+                &all_ids,
+                &mut rng,
+            )?;
+
+            // Attempt speculative drafting.
+            if let Some(spec) = speculator.as_ref() {
+                // Build draft key without mutating all_ids.
+                let mut draft_key = all_ids.clone();
+                draft_key.push(cur);
+                let draft = spec.draft(&draft_key);
+                if !draft.is_empty() {
+                    spec_stats_total += 1;
+                    // Verify draft tokens against the model.
+                    let mut verify_pos = pos + 1;
+                    let mut verify_cur = cur;
+                    let mut accepted: Vec<u32> = Vec::new();
+
+                    for &draft_tok in &draft {
+                        let c = match &mut runner {
+                            Runner::Llama(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                            Runner::Gemma(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                            Runner::Qwen(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                            Runner::Granite(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                            Runner::Lfm(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                            Runner::DeepSeekV4(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                        };
+                        let model_tok = select_next(
+                            &c,
+                            args.temperature,
+                            args.repeat_penalty,
+                            args.repeat_window,
+                            &all_ids,
+                            &mut rng,
+                        )?;
+                        if model_tok == draft_tok {
+                            // Accept: push the verified token to history.
+                            all_ids.push(verify_cur);
+                            cur_already_pushed = true;
+                            accepted.push(draft_tok);
+                            verify_cur = draft_tok;
+                            verify_pos += 1;
+
+                            // Stop if draft token is EOS.
+                            let eos = match &runner {
+                                Runner::Llama(r) => r.eos_token_id(),
+                                Runner::Gemma(r) => r.eos_token_id(),
+                                Runner::Qwen(r) => r.eos_token_id(),
+                                Runner::Granite(r) => r.eos_token_id(),
+                                Runner::Lfm(r) => r.eos_token_id(),
+                                Runner::DeepSeekV4(r) => r.eos_token_id(),
+                            };
+                            if let Some(eos) = eos {
+                                if draft_tok == eos {
+                                    break;
+                                }
+                            }
+                            if let Some(im_end) = chat_im_end {
+                                if draft_tok == im_end {
+                                    break;
+                                }
+                            }
+                        } else {
+                            // Reject: use model's token, push previous token.
+                            all_ids.push(verify_cur);
+                            cur_already_pushed = true;
+                            spec_stats_hits += accepted.len();
+                            accepted.push(model_tok);
+                            verify_cur = model_tok;
+                            spec_stats_misses += 1;
+                            break;
+                        }
+                    }
+
+                    // If all draft tokens were accepted, generate one more real token
+                    // so we don't stall.
+                    if accepted.len() == draft.len() && !draft.is_empty() {
+                        let c = match &mut runner {
+                            Runner::Llama(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                            Runner::Gemma(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                            Runner::Qwen(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                            Runner::Granite(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                            Runner::Lfm(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                            Runner::DeepSeekV4(r) => r.step_topk(verify_cur, verify_pos, &mut page_table, &mut kv_cache, args.top_k)?,
+                        };
+                        let extra_tok = select_next(
+                            &c,
+                            args.temperature,
+                            args.repeat_penalty,
+                            args.repeat_window,
+                            &all_ids,
+                            &mut rng,
+                        )?;
+                        all_ids.push(verify_cur);
+                        accepted.push(extra_tok);
+                        verify_cur = extra_tok;
+                        spec_stats_hits += draft.len();
+                    }
+
+                    // Queue accepted tokens.
+                    // The first accepted token replaces cur.
+                    // Remaining accepted tokens go into pending_draft.
+                    // all_ids already has all verified tokens.
+                    if !accepted.is_empty() {
+                        cur = accepted[0];
+                        for tok in accepted.iter().skip(1) {
+                            pending_draft.push_back(*tok);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !cur_already_pushed {
+            all_ids.push(cur);
+        }
+        cur_already_pushed = false;
+
+        // Output handling.
         if let Some(tok) = tokenizer.as_ref() {
             let mut piece = tok.decode(&[cur], true).unwrap_or_default();
             if piece.is_empty() {
@@ -541,21 +719,21 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             }
             if piece.is_empty() { piece = format!("[ID:{}]", cur); }
 
-            // Buffer output and flush periodically to reduce I/O overhead
             output_buffer.push_str(&piece);
             let should_flush = piece.ends_with(' ') || piece.ends_with('\n') ||
                               piece.ends_with('.') || piece.ends_with(',') ||
                               piece.ends_with('?') || piece.ends_with('!') ||
-                              step - last_flush_step >= 8;
+                              gen_step - last_flush_step >= 8;
 
             if should_flush && !output_buffer.is_empty() {
                 print!("{}", output_buffer);
                 let _ = std::io::stdout().flush();
                 output_buffer.clear();
-                last_flush_step = step;
+                last_flush_step = gen_step;
             }
         }
 
+        // EOS stopping.
         if args.stop_eos {
             let eos = match &runner {
                 Runner::Llama(r) => r.eos_token_id(),
@@ -582,14 +760,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             }
         }
 
-        cur = select_next(
-            &cand,
-            args.temperature,
-            args.repeat_penalty,
-            args.repeat_window,
-            &all_ids,
-            &mut rng,
-        )?;
+        gen_step += 1;
     }
 
     // Flush any remaining buffered output
@@ -603,6 +774,13 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         args.gen,
         t1.elapsed().as_secs_f64()
     );
+
+    if speculator.is_some() {
+        eprintln!(
+            "Spec decode stats: {} draft attempts, {} hits, {} misses",
+            spec_stats_total, spec_stats_hits, spec_stats_misses
+        );
+    }
 
     if let Some(tok) = tokenizer.as_ref() {
         let text = if !prompt_tokens.is_empty() && all_ids.len() >= prompt_tokens.len() {
@@ -620,6 +798,42 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
     Ok(())
 }
 
+
+/// N-gram speculator for speculative decoding.
+/// Draws draft token candidates from an external corpus buffer.
+struct NgramSpeculator {
+    corpus: Vec<u32>,
+    n: usize,
+    m_max: usize,
+}
+
+impl NgramSpeculator {
+    fn new(corpus: Vec<u32>, n: usize, m_max: usize) -> Self {
+        Self { corpus, n: n.max(1), m_max: m_max.max(1) }
+    }
+
+    /// Find draft tokens using the ngram-simple strategy:
+    /// match last `n` generated tokens against the corpus, return next `m_max`.
+    fn draft(&self, generated: &[u32]) -> Vec<u32> {
+        if self.corpus.len() < self.n || generated.len() < self.n {
+            return Vec::new();
+        }
+        let key = &generated[generated.len().saturating_sub(self.n)..];
+        let max_start = self.corpus.len().saturating_sub(self.n);
+        for i in 0..max_start {
+            if self.corpus[i..i + self.n] == *key {
+                let draft_start = i + self.n;
+                let draft_end = (draft_start + self.m_max).min(self.corpus.len());
+                return self.corpus[draft_start..draft_end].to_vec();
+            }
+        }
+        Vec::new()
+    }
+
+    fn corpus(&self) -> &[u32] {
+        &self.corpus
+    }
+}
 
 fn strip_think_blocks(text: &str) -> String {
     let mut out = String::with_capacity(text.len());

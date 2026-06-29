@@ -32,3 +32,6 @@ path = "../../scratch/test_linear_parity.rs"
 name = "test_qwen"
 path = "../../scratch/test_qwen.rs"
 
+[[example]]
+name = "demo_spec_decode"
+path = "../../scratch/demo_spec_decode.rs"

@@ -419,6 +419,34 @@ impl GemmaRunner {
         self.step_topk_from_hidden_inner(&x, per_layer_input.as_deref(), pos, page_table, kv_cache, top_k)
     }
 
+    pub fn prefill_topk(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        page_table: &mut PageTable,
+        kv_cache: &mut KVCache,
+        top_k: usize,
+    ) -> Result<Vec<Vec<(u32, f32)>>, CoreError> {
+        let n = tokens.len();
+        if n <= 1 {
+            return Ok(Vec::new());
+        }
+        let mut results = Vec::with_capacity(n - 1);
+        for (i, &tok) in tokens.iter().enumerate() {
+            let pos = start_pos + i;
+            let mut x = vec![0.0f32; self.cfg.hidden_size];
+            self.embed_token(tok, &mut x)?;
+            let per_layer_input = self.prepare_gemma4_per_layer_inputs(Some(tok), &x)?;
+            let topk = self.step_topk_from_hidden_inner(
+                &x, per_layer_input.as_deref(), pos, page_table, kv_cache, top_k,
+            )?;
+            if i < n - 1 {
+                results.push(topk);
+            }
+        }
+        Ok(results)
+    }
+
     pub fn step_topk_from_hidden(
         &mut self,
         x0: &[f32],

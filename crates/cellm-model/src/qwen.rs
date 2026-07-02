@@ -445,6 +445,36 @@ impl QwenRunner {
         Ok(())
     }
 
+    pub fn prefill_topk(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        page_table: &mut PageTable,
+        kv_cache: &mut KVCache,
+        top_k: usize,
+    ) -> Result<Vec<Vec<(u32, f32)>>, CoreError> {
+        let n = tokens.len();
+        if n <= 1 {
+            return Ok(Vec::new());
+        }
+        let mut results = Vec::with_capacity(n - 1);
+        for (i, &tok) in tokens.iter().enumerate() {
+            let pos = start_pos + i;
+            if pos == page_table.token_count() {
+                page_table.append_token(kv_cache.allocator_mut()).map_err(|e| {
+                    CoreError::Backend(format!("qwen prefill_topk: page_table append_token failed: {e}"))
+                })?;
+            }
+            let mut x = vec![0.0f32; self.cfg.hidden_size];
+            self.embed_token(tok, &mut x)?;
+            let logits = self.step_inner(&x, pos, page_table, kv_cache, true)?;
+            if i < n - 1 {
+                results.push(self.top_k_logits(&logits, top_k));
+            }
+        }
+        Ok(results)
+    }
+
     fn step_inner(
         &mut self,
         x0: &[f32],

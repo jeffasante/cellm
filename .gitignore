@@ -56,3 +56,5 @@ README.md.bak
 # XCFramework binary blobs (rebuild via scripts/build_xcframework.sh)
 bindings/swift/CellmFFI.xcframework/**/*.a
 bindings/swift/CellmFFI.xcframework/**/*.dylib
+
+todos/1.md

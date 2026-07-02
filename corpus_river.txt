@@ -1,0 +1,5 @@
+Farmer needs to cross a river with a wolf, a goat, and a cabbage. The boat can only carry the farmer and one item at a time. The wolf will eat the goat if left alone together. The goat will eat the cabbage if left alone together. The farmer must transport all three items across the river without anything being eaten.
+
+The solution: First, the farmer takes the goat across the river and leaves it on the far side. Then the farmer returns alone. Next, the farmer takes the wolf across the river. But the farmer cannot leave the wolf and goat together, so the farmer brings the goat back. The farmer leaves the goat on the near side and takes the cabbage across. The farmer leaves the cabbage with the wolf on the far side. Finally, the farmer returns alone and takes the goat across. Now all three items are safely across.
+
+Each crossing the boat can carry the farmer and at most one item. The farmer must always be present to operate the boat. The journey requires seven crossings: goat across, return alone, wolf across, goat back, cabbage across, return alone, goat across.

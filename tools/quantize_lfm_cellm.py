@@ -173,9 +173,15 @@ def should_quantize(name: str, shape: list) -> bool:
         if "norm" in name or "layernorm" in name:
             return False
         if name == "model.embed_tokens.weight":
-            return False  # Keep embeddings in f16
+            # Quantize embeddings too — they're 57% of the file
+            return True
         return True
     return False
+
+
+def group_size_for(name: str, shape: list) -> int:
+    """LFM runner hardcodes group_size=64 in linear_i4_out_in."""
+    return 64
 
 
 def main():
@@ -213,8 +219,9 @@ def main():
             # Read f16 data
             f16_arr = np.frombuffer(info["data"], dtype=np.float16).reshape(shape)
 
-            # Quantize to int4 MLX format
-            packed, scales, biases = quantize_weight_2d(f16_arr)
+            # Quantize to int4 MLX format with per-tensor group size
+            gs = group_size_for(name, shape)
+            packed, scales, biases = quantize_weight_2d(f16_arr, group_size=gs)
             out_dim, packed_in = packed.shape
             n_groups = scales.shape[1]
 
@@ -242,9 +249,7 @@ def main():
             total_quant_bytes += quant_bytes
             quantized_count += 1
             ratio = quant_bytes / f16_bytes * 100 if f16_bytes > 0 else 0
-            print(
-                f"  Q {name:55s}  {list(shape)}  f16={f16_bytes // 1024 // 1024 * 1024 // 1024:>4d}MB -> {ratio:5.1f}%"
-            )
+            print(f"  Q {name:55s}  gs={gs:>3d}  {list(shape)}  {ratio:5.1f}%")
         else:
             # Keep as f16
             new_tensors[name] = info["data"]

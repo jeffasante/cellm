@@ -19,6 +19,13 @@ cargo build --release -p cellm-sdk -p vlm-smoke
   --prompt "what's twitch.com?" \
   --chat --gen 64 --temperature 0 --backend cpu --kv-encoding f16
 
+./target/release/infer \
+  --model models/to-huggingface/qwen2.5-0.5b-int8-v1/qwen2.5-0.5b-int8-v1.cellm \
+  --tokenizer models/to-huggingface/qwen2.5-0.5b-int8-v1/tokenizer.json \
+  --prompt "what's twitch.com?" \
+  --chat --gen 100 --backend cpu
+
+  
 # CPU — long philosophical (f16)
 ./target/release/infer \
   --model models/to-huggingface/qwen2.5-0.5b-int8-v1/qwen2.5-0.5b-int8-v1.cellm \
@@ -277,6 +284,12 @@ Qwen3-0.6B-int4.cellm (old int4)	Garbage (pre-fix)
   --tokenizer models/to-huggingface/smollm2-360m-int8-v1/tokenizer.json \
   --prompt "what's sycophancy?" \
   --chat --gen 100 --temperature 0 --backend cpu --kv-encoding f16
+
+  ./target/release/infer \
+    --model models/to-huggingface/smollm2-360m-q1-v1/smollm2-360m-int8-v1.cellm \
+    --tokenizer models/to-huggingface/smollm2-360m-q1-v1/tokenizer.json \
+    --prompt "what's sycophancy?" \
+    --chat --gen 100 --temperature 0 --backend cpu --kv-encoding f16
 
 # Metal
 ./target/release/infer \

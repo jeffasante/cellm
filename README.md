@@ -23,6 +23,7 @@ Not a wrapper around `llama.cpp`. Not a port of `vLLM`. A new runtime designed f
 | **Android Bindings** | [`bindings/kotlin`](bindings/kotlin) |
 | **WASM & WebGPU** | [`docs/wasm-backend.md`](docs/wasm-backend.md) |
 | **Live WASM Demo** | [cellm-wasm (](https://jeffasante.github.io/cellm/wasm/index.html) (Research Preview) |
+| **Docker (CPU tooling)** | [Docker](#docker) below |
 
 ## Quick Start
 
@@ -238,6 +239,42 @@ Then open `http://localhost:8080` and use `engine.try_init_webgpu()` to enable h
 
 ---
 
+## Docker
+
+cellm's whole point is *phone* deployment (iOS/Android via Metal/Vulkan), so Docker can't run the actual mobile targets — there's no GPU passthrough for Apple's Metal API in a Linux container. Where Docker *does* help is the CPU-backend and tooling side of the repo: CI, headless benchmarking, model conversion pipelines, and testing without owning a Mac.
+
+| Image | Backend | Status | Use case |
+|---|---|---|---|
+| `cellm:cpu` | CPU kernels | Planned | CI, headless benchmarking, model conversion, testing without a Mac |
+| `cellm:vulkan` | Vulkan compute | Research | Once the Vulkan backend stabilizes (see Feature Status) |
+| `cellm:metal` | Metal | **Not possible** | No Metal GPU passthrough on Linux containers — Metal only runs on real macOS/iOS hardware |
+
+Unlike `llama.cpp`'s Docker matrix (CUDA/ROCm/Vulkan/SYCL variants for `full`/`light`/`server`), cellm doesn't need a wide backend matrix — this is a mobile-focused research project, not a server deployment target. A single CPU image covers the actual need for reproducible tooling.
+
+Example `Dockerfile` shape:
+```dockerfile
+FROM rust:1.75 AS build
+WORKDIR /app
+COPY . .
+RUN cargo build --release --bin infer --bin convert --bin bench
+
+FROM debian:bookworm-slim AS cpu
+COPY --from=build /app/target/release/infer /app/target/release/convert /app/target/release/bench /usr/local/bin/
+ENTRYPOINT ["infer"]
+```
+
+Usage once built:
+```bash
+docker run -v /path/to/models:/models cellm:cpu \
+  --model /models/smollm2-135m.cellm \
+  --tokenizer /models/hf/smollm2-135m/tokenizer.json \
+  --prompt "Hello" --chat --gen 32
+```
+
+> Not wired up yet — tracked as a follow-up. If you want to help, a `Dockerfile` + GitHub Actions workflow (mirroring `.github/workflows/docker.yml`-style multi-arch builds) for the `cpu` variant is the right first PR.
+
+---
+
 ## Supported Models
 
 | Model | Size | Best For | Notes |
@@ -272,6 +309,7 @@ Sample checkpoints bundled in this repo (via Git LFS):
 - [ ] **Vulkan Support** - Cross-platform compute kernels (research)
 - [ ] **Android Integration** - Kotlin/JNI bindings & tuning (coming soon)
 - [ ] **Qwen iOS Porting** - Optimize Qwen inference for native iOS
+- [ ] **Docker (CPU tooling image)** - Reproducible CI/benchmarking image for `infer`/`convert`/`bench` (see [Docker](#docker))
 
 ---
 

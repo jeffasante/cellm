@@ -666,7 +666,12 @@ impl QwenRunner {
                         cv.write_token(block_id, layer, token_off, &k, &v)?;
                     }
 
-                    let seq = page_table.token_count();
+                    // Use pos+1 instead of page_table.token_count() because during
+                    // prefill, all tokens are appended upfront but K/V for positions
+                    // beyond `pos` haven't been computed yet. Reading uninitialized
+                    // K/V from the cache corrupts attention output.
+                    // During decode, pos+1 always equals page_table.token_count().
+                    let seq = pos + 1;
                     let cr = kv_cache.view();
                     let mut gather_bases = Vec::with_capacity(seq);
                     for tpos in 0..seq {

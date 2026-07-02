@@ -132,6 +132,36 @@ impl DeepSeekV4Runner {
         Ok(indexed)
     }
 
+    pub fn prefill_topk(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        page_table: &mut PageTable,
+        kv_cache: &mut KVCache,
+        top_k: usize,
+    ) -> Result<Vec<Vec<(u32, f32)>>, CoreError> {
+        let n = tokens.len();
+        if n <= 1 {
+            return Ok(Vec::new());
+        }
+        let mut results = Vec::with_capacity(n - 1);
+        for (i, &tok) in tokens.iter().enumerate() {
+            let pos = start_pos + i;
+            let logits = self.forward(tok, pos, page_table, kv_cache)?;
+            if i < n - 1 {
+                let mut indexed: Vec<(u32, f32)> = logits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| (i as u32, v))
+                    .collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                indexed.truncate(top_k);
+                results.push(indexed);
+            }
+        }
+        Ok(results)
+    }
+
     pub fn config(&self) -> &ModelConfig {
         &self.cfg
     }

@@ -6,7 +6,7 @@ use std::path::Path;
 use bytemuck::cast_slice;
 use cellm_cache::{KVCache, PageTable};
 use cellm_core::CoreError;
-use cellm_kernels::cpu_kernels::rms_norm_f32;
+use cellm_kernels::cpu_kernels::{rms_norm_f32, rope_non_interleaved_inplace_f32};
 use cellm_kernels::metal::MetalMatmul;
 use cellm_kernels::{MetalKernels, MetalOps};
 use half::f16;
@@ -649,8 +649,15 @@ impl QwenRunner {
                                 ops.rope_half_f32(&mut k, n_kv_heads, head_dim, rotary_dim, pos, cfg.rope_theta).map_err(|e| CoreError::Backend(e.to_string()))?;
                             }
                         } else {
-                            rope_inplace_f32_partial(&mut q, n_heads, head_dim, rotary_dim, pos, cfg.rope_theta);
-                            rope_inplace_f32_partial(&mut k, n_kv_heads, head_dim, rotary_dim, pos, cfg.rope_theta);
+                            if has_qn {
+                                // Qwen3+: adjacent-pair RoPE (pairs 2i, 2i+1)
+                                rope_inplace_f32_partial(&mut q, n_heads, head_dim, rotary_dim, pos, cfg.rope_theta);
+                                rope_inplace_f32_partial(&mut k, n_kv_heads, head_dim, rotary_dim, pos, cfg.rope_theta);
+                            } else {
+                                // Qwen2/2.5: half-split RoPE (pairs i, half+i)
+                                rope_non_interleaved_inplace_f32(&mut q, n_heads, head_dim, rotary_dim, pos, cfg.rope_theta);
+                                rope_non_interleaved_inplace_f32(&mut k, n_kv_heads, head_dim, rotary_dim, pos, cfg.rope_theta);
+                            }
                         }
                     }
 

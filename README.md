@@ -23,6 +23,7 @@ Not a wrapper around `llama.cpp`. Not a port of `vLLM`. A new runtime designed f
 | **Android Bindings** | [`bindings/kotlin`](bindings/kotlin) |
 | **WASM & WebGPU** | [`docs/wasm-backend.md`](docs/wasm-backend.md) |
 | **Live WASM Demo** | [cellm-wasm (](https://jeffasante.github.io/cellm/wasm/index.html) (Research Preview) |
+| **Git Commit Messages** | [Local LLM commit messages](#commit-messages) below |
 | **Docker (CPU tooling)** | [Docker](#docker) below |
 
 ## Quick Start
@@ -275,6 +276,52 @@ docker run -v /path/to/models:/models cellm:cpu \
 
 ---
 
+## Git Commit Messages
+
+Use cellm's local LLM to generate git commit messages from staged changes.
+All inference runs locally on CPU — no API keys, no data leaves your machine.
+
+### Prerequisites
+- A model converted to `.cellm` format (e.g., Qwen2.5 0.5B int8)
+- The matching `tokenizer.json`
+- `./target/release/infer` built (`cargo build --release`)
+
+### Quick usage
+```bash
+# Stage your changes first
+git add -A
+
+# Generate a commit message from staged diff
+./tools/git-cellm-commit.sh
+
+# Or pipe any diff
+ git diff HEAD~1 | ./tools/git-cellm-commit.sh
+```
+
+### How it works
+1. `git diff --cached` captures your staged changes
+2. The diff is passed as the prompt to Qwen2.5 0.5B int8
+3. The model generates a commit message + summary locally
+4. Output is printed to stdout — pipe it anywhere
+
+### Configuration
+Set these environment variables to use a different model:
+
+| Env var | Default | Description |
+|---|---|---|
+| `CELLM_COMMIT_MODEL` | `models/to-huggingface/qwen2.5-0.5b-int8-v1/qwen2.5-0.5b-int8-v1.cellm` | Path to `.cellm` model |
+| `CELLM_COMMIT_TOKENIZER` | `models/to-huggingface/qwen2.5-0.5b-int8-v1/tokenizer.json` | Path to `tokenizer.json` |
+| `CELLM_COMMIT_INFER` | `./target/release/infer` | Path to the `infer` binary |
+
+Example with the LFM model:
+```bash
+CELLM_COMMIT_MODEL=models/LFM2.5-230M-int4-v2.cellm \
+CELLM_COMMIT_TOKENIZER=models/to-huggingface/LFM2.5-230M/tokenizer.json \
+  ./tools/git-cellm-commit.sh
+```
+
+---
+
 ## Supported Models
 
 | Model | Size | Best For | Notes |
@@ -306,6 +353,7 @@ Sample checkpoints bundled in this repo (via Git LFS):
 - [x] **Accelerated Math** - Metal + WASM SIMD + WebGPU compute kernels
 - [x] **WebAssembly Support** - Run LLMs in the browser with `wasm-bindgen`
 - [x] **High-Performance CLI** - Conversion, benchmarking, debug inference
+- [x] **Git Commit Messages** - Generate commit messages from local LLM via `tools/git-cellm-commit.sh`
 - [ ] **Vulkan Support** - Cross-platform compute kernels (research)
 - [ ] **Android Integration** - Kotlin/JNI bindings & tuning (coming soon)
 - [ ] **Qwen iOS Porting** - Optimize Qwen inference for native iOS

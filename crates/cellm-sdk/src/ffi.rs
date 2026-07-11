@@ -993,6 +993,92 @@ pub extern "C" fn cellm_engine_backend_name(
     n
 }
 
+// ---------------------------------------------------------------------------
+// Thinking mode helpers (FFI)
+// ---------------------------------------------------------------------------
+
+/// Wrap a prompt with thinking prefill for ChatML-style models.
+///
+/// Writes the wrapped prompt to `out_buf` (up to `buf_len-1` bytes, null-terminated).
+/// Returns the number of bytes written (excluding null terminator).
+/// If `out_buf` is null or `buf_len` is 0, returns the required buffer size.
+#[no_mangle]
+pub extern "C" fn cellm_wrap_prompt_with_think(
+    prompt: *const c_char,
+    out_buf: *mut c_char,
+    buf_len: usize,
+) -> usize {
+    if prompt.is_null() {
+        set_last_error("wrap_prompt_with_think: null prompt".to_string());
+        return 0;
+    }
+    let result = (|| {
+        let prompt_str = cstr_to_str(prompt)?;
+        let wrapped = crate::wrap_prompt_with_think(prompt_str);
+        Ok::<String, String>(wrapped)
+    })();
+
+    match result {
+        Ok(wrapped) => {
+            let bytes = wrapped.as_bytes();
+            if out_buf.is_null() || buf_len == 0 {
+                return bytes.len();
+            }
+            let n = bytes.len().min(buf_len.saturating_sub(1));
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf as *mut u8, n);
+                *out_buf.add(n) = 0;
+            }
+            n
+        }
+        Err(e) => {
+            set_last_error(e);
+            0
+        }
+    }
+}
+
+/// Strip thinking blocks from generated text.
+///
+/// Writes the cleaned text to `out_buf` (up to `buf_len-1` bytes, null-terminated).
+/// Returns the number of bytes written (excluding null terminator).
+/// If `out_buf` is null or `buf_len` is 0, returns the required buffer size.
+#[no_mangle]
+pub extern "C" fn cellm_strip_think_blocks(
+    text: *const c_char,
+    out_buf: *mut c_char,
+    buf_len: usize,
+) -> usize {
+    if text.is_null() {
+        set_last_error("strip_think_blocks: null text".to_string());
+        return 0;
+    }
+    let result = (|| {
+        let text_str = cstr_to_str(text)?;
+        let cleaned = crate::strip_think_blocks(text_str);
+        Ok::<String, String>(cleaned)
+    })();
+
+    match result {
+        Ok(cleaned) => {
+            let bytes = cleaned.as_bytes();
+            if out_buf.is_null() || buf_len == 0 {
+                return bytes.len();
+            }
+            let n = bytes.len().min(buf_len.saturating_sub(1));
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf as *mut u8, n);
+                *out_buf.add(n) = 0;
+            }
+            n
+        }
+        Err(e) => {
+            set_last_error(e);
+            0
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cellm_engine_is_litert_proxy(engine: cellm_engine_t) -> u32 {
     if engine == 0 {

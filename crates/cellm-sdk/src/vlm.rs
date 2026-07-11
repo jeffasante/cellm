@@ -234,10 +234,11 @@ pub fn describe_image_with_cellm_timed(
             LinearBackend::Metal {
                 ctx,
                 weight_t_cache: HashMap::new(),
+                int8_cache: HashMap::new(),
             }
         }
-        BackendKind::Cpu => LinearBackend::Cpu,
-        BackendKind::WebGpu => LinearBackend::Cpu, // Vision encoder still on CPU for now
+        BackendKind::Cpu => LinearBackend::Cpu { int8_cache: HashMap::new() },
+        BackendKind::WebGpu => LinearBackend::Cpu { int8_cache: HashMap::new() }, // Vision encoder still on CPU for now
     };
     let (mut image_features, image_seq_len, patch_ms, encoder_ms, encoder_layer_ms) =
         pollster::block_on(run_vision_cellm(
@@ -2744,10 +2745,11 @@ async fn run_audio_cellm_gemma4(
         .map(|ctx| LinearBackend::Metal {
             ctx,
             weight_t_cache: std::collections::HashMap::new(),
+            int8_cache: HashMap::new(),
         })
-        .unwrap_or(LinearBackend::Cpu);
+        .unwrap_or(LinearBackend::Cpu { int8_cache: HashMap::new() });
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    let mut backend = LinearBackend::Cpu;
+    let mut backend = LinearBackend::Cpu { int8_cache: HashMap::new() };
 
     //  A. Subsampling Conv Projection
     // Input mel: [T, 128] → treat as image [B, 1, T, 128] where T=time, 128=mel bins
@@ -3623,6 +3625,7 @@ async fn linear_rows(
     if let LinearBackend::Metal {
         ctx,
         weight_t_cache,
+        int8_cache: _,
     } = backend
     {
         // The Metal matmul kernel (even tiled) is slower than cblas_sgemm
@@ -3766,11 +3769,92 @@ async fn linear_rows_clipped(
     }
 }
 
+/// Cached INT8 weights for quantized GEMV decode
+struct Int8WeightCache {
+    /// INT8 weight data [out_dim * in_dim]
+    weight_i8: Vec<i8>,
+    /// Per-row f16 scales [out_dim]
+    scales_f16: Vec<u16>,
+    /// Dimensions
+    out_dim: usize,
+    in_dim: usize,
+}
+
+/// Load INT8 weights from file into cache for GEMV decode
+fn load_int8_weights_cached(
+    file: &CellmFile,
+    name: &str,
+    cache: &mut HashMap<String, Int8WeightCache>,
+) -> Result<&Int8WeightCache> {
+    if !cache.contains_key(name) {
+        let index = file
+            .tensor_index(name)
+            .ok_or_else(|| anyhow::anyhow!("missing tensor: {name}"))?;
+        
+        if index.dtype.as_str() != "i8" {
+            anyhow::bail!("tensor {name} is not i8 dtype, got {}", index.dtype.as_str());
+        }
+        
+        let shape = &index.shape;
+        if shape.len() != 2 {
+            anyhow::bail!("int8 tensor {name} needs 2D shape, got {shape:?}");
+        }
+        
+        let out_dim = shape[0];
+        let in_dim = shape[1];
+        
+        // Load scales
+        let scale_name = format!("{name}.qscale");
+        let scales = tensor_f16_to_f32(file, &scale_name).with_context(|| {
+            format!("int8 tensor {name} requires per-row {scale_name} scales")
+        })?;
+        
+        if scales.len() != out_dim {
+            anyhow::bail!(
+                "int8 tensor {name} scale length mismatch: {} vs out_dim {}",
+                scales.len(),
+                out_dim
+            );
+        }
+        
+        // Load INT8 weights
+        let bytes = file
+            .tensor_bytes(name)
+            .map_err(|e| anyhow::anyhow!("tensor bytes {name}: {e}"))?;
+        
+        let vals: &[i8] = cast_slice(bytes);
+        if vals.len() != out_dim * in_dim {
+            anyhow::bail!(
+                "int8 tensor {name} data length mismatch: {} vs {}",
+                vals.len(),
+                out_dim * in_dim
+            );
+        }
+        
+        // Convert f32 scales back to f16 for storage
+        let scales_f16: Vec<u16> = scales.iter().map(|&s| half::f16::from_f32(s).to_bits()).collect();
+        
+        cache.insert(name.to_string(), Int8WeightCache {
+            weight_i8: vals.to_vec(),
+            scales_f16,
+            out_dim,
+            in_dim,
+        });
+    }
+    
+    Ok(cache.get(name).unwrap())
+}
+
 enum LinearBackend {
-    Cpu,
+    Cpu {
+        /// INT8 weight cache for quantized GEMV decode
+        int8_cache: HashMap<String, Int8WeightCache>,
+    },
     Metal {
         ctx: MetalMatmul,
         weight_t_cache: HashMap<(usize, usize, usize), MetalBuffer>,
+        /// INT8 weight cache for quantized GEMV decode
+        int8_cache: HashMap<String, Int8WeightCache>,
     },
     #[cfg(feature = "webgpu")]
     WebGpu(VisionWebGpu),

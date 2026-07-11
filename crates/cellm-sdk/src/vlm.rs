@@ -936,8 +936,7 @@ async fn run_decode_cellm_inner(
                 }
                 if let DecodeRunner::Llama(r) = &mut runner {
                     let maybe_logits = r
-                        .prefill_fused_hidden(&x_all, 0, &mut page_table, &mut kv_cache, true).await?
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        .prefill_fused_hidden(&x_all, 0, &mut page_table, &mut kv_cache, true).await?;
                     if let Some(logits) = maybe_logits {
                         let cand = r
                             .topk_from_logits(&logits, cfg.top_k.max(1))

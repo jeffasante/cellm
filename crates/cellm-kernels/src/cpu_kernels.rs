@@ -18,22 +18,79 @@ pub fn rms_norm_f32(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     debug_assert_eq!(x.len(), weight.len());
     debug_assert_eq!(x.len(), out.len());
 
+    let n = x.len();
     let mut mean_sq = 0.0f32;
-    for &v in x {
-        mean_sq += v * v;
+
+    // SIMD-accelerated mean square computation on aarch64
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let mut sum0 = vdupq_n_f32(0.0);
+        let mut sum1 = vdupq_n_f32(0.0);
+        let mut sum2 = vdupq_n_f32(0.0);
+        let mut sum3 = vdupq_n_f32(0.0);
+        let mut i = 0usize;
+        while i + 16 <= n {
+            let v0 = vld1q_f32(x.as_ptr().add(i));
+            let v1 = vld1q_f32(x.as_ptr().add(i + 4));
+            let v2 = vld1q_f32(x.as_ptr().add(i + 8));
+            let v3 = vld1q_f32(x.as_ptr().add(i + 12));
+            sum0 = vmlaq_f32(sum0, v0, v0);
+            sum1 = vmlaq_f32(sum1, v1, v1);
+            sum2 = vmlaq_f32(sum2, v2, v2);
+            sum3 = vmlaq_f32(sum3, v3, v3);
+            i += 16;
+        }
+        let partial = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
+        mean_sq = vgetq_lane_f32(partial, 0) + vgetq_lane_f32(partial, 1) +
+                  vgetq_lane_f32(partial, 2) + vgetq_lane_f32(partial, 3);
+        while i < n {
+            mean_sq += x[i] * x[i];
+            i += 1;
+        }
     }
-    mean_sq /= x.len() as f32;
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for &v in x {
+            mean_sq += v * v;
+        }
+    }
+
+    mean_sq /= n as f32;
     let inv_rms = 1.0f32 / (mean_sq + eps).sqrt();
 
-    // Skip Rayon for small vectors where dispatch overhead dominates.
-    if x.len() < 2048 {
-        for i in 0..x.len() {
-            out[i] = x[i] * inv_rms * weight[i];
+    // SIMD-accelerated output computation on aarch64
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let scale_vec = vdupq_n_f32(inv_rms);
+        let mut i = 0usize;
+        while i + 4 <= n {
+            let xv = vld1q_f32(x.as_ptr().add(i));
+            let wv = vld1q_f32(weight.as_ptr().add(i));
+            let result = vmulq_f32(vmulq_f32(xv, scale_vec), wv);
+            vst1q_f32(out.as_mut_ptr().add(i), result);
+            i += 4;
         }
-    } else {
-        out.par_iter_mut().zip(x.par_iter()).zip(weight.par_iter()).for_each(|((o, &xi), &wi)| {
-            *o = xi * inv_rms * wi;
-        });
+        while i < n {
+            out[i] = x[i] * inv_rms * weight[i];
+            i += 1;
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // Skip Rayon for small vectors where dispatch overhead dominates.
+        if n < 2048 {
+            for i in 0..n {
+                out[i] = x[i] * inv_rms * weight[i];
+            }
+        } else {
+            out.par_iter_mut().zip(x.par_iter()).zip(weight.par_iter()).for_each(|((o, &xi), &wi)| {
+                *o = xi * inv_rms * wi;
+            });
+        }
     }
 }
 

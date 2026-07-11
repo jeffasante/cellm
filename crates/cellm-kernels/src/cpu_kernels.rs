@@ -232,6 +232,189 @@ pub fn matmul_f32(a: &[f32], m: usize, k: usize, b: &[f32], n: usize, out: &mut 
     }
 }
 
+/// Optimized INT8 GEMV (matrix-vector) for single-token decode.
+/// Keeps weights quantized and fuses dequantization into the dot product.
+/// Weight layout: [out_dim, in_dim] row-major INT8 with per-row f16 scales.
+pub fn gemv_i8_f32(
+    weight_i8: &[i8],
+    scales_f16: &[u16],
+    input: &[f32],
+    out: &mut [f32],
+    out_dim: usize,
+    in_dim: usize,
+) {
+    debug_assert_eq!(weight_i8.len(), out_dim * in_dim);
+    debug_assert_eq!(scales_f16.len(), out_dim);
+    debug_assert_eq!(input.len(), in_dim);
+    debug_assert_eq!(out.len(), out_dim);
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        
+        // Process multiple output rows in parallel for better ILP
+        let mut row = 0usize;
+        
+        // Process 4 rows at a time
+        while row + 4 <= out_dim {
+            let w0 = &weight_i8[row * in_dim..(row + 1) * in_dim];
+            let w1 = &weight_i8[(row + 1) * in_dim..(row + 2) * in_dim];
+            let w2 = &weight_i8[(row + 2) * in_dim..(row + 3) * in_dim];
+            let w3 = &weight_i8[(row + 3) * in_dim..(row + 4) * in_dim];
+            
+            let s0 = f16::from_bits(scales_f16[row]).to_f32();
+            let s1 = f16::from_bits(scales_f16[row + 1]).to_f32();
+            let s2 = f16::from_bits(scales_f16[row + 2]).to_f32();
+            let s3 = f16::from_bits(scales_f16[row + 3]).to_f32();
+            
+            let mut acc0 = vdupq_n_f32(0.0);
+            let mut acc1 = vdupq_n_f32(0.0);
+            let mut acc2 = vdupq_n_f32(0.0);
+            let mut acc3 = vdupq_n_f32(0.0);
+            
+            let mut i = 0usize;
+            while i + 16 <= in_dim {
+                // Load input vector (shared across all 4 rows)
+                let xv0 = vld1q_f32(input.as_ptr().add(i));
+                let xv1 = vld1q_f32(input.as_ptr().add(i + 4));
+                let xv2 = vld1q_f32(input.as_ptr().add(i + 8));
+                let xv3 = vld1q_f32(input.as_ptr().add(i + 12));
+                
+                // Load and process weight row 0
+                let wv0 = vld1q_s8(w0.as_ptr().add(i));
+                let w0_16_low = vmovl_s8(vget_low_s8(wv0));
+                let w0_16_high = vmovl_s8(vget_high_s8(wv0));
+                let w0_f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0_16_low)));
+                let w0_f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0_16_low)));
+                let w0_f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0_16_high)));
+                let w0_f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0_16_high)));
+                acc0 = vmlaq_f32(acc0, w0_f0, xv0);
+                acc0 = vmlaq_f32(acc0, w0_f1, xv1);
+                acc0 = vmlaq_f32(acc0, w0_f2, xv2);
+                acc0 = vmlaq_f32(acc0, w0_f3, xv3);
+                
+                // Load and process weight row 1
+                let wv1 = vld1q_s8(w1.as_ptr().add(i));
+                let w1_16_low = vmovl_s8(vget_low_s8(wv1));
+                let w1_16_high = vmovl_s8(vget_high_s8(wv1));
+                let w1_f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1_16_low)));
+                let w1_f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1_16_low)));
+                let w1_f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1_16_high)));
+                let w1_f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1_16_high)));
+                acc1 = vmlaq_f32(acc1, w1_f0, xv0);
+                acc1 = vmlaq_f32(acc1, w1_f1, xv1);
+                acc1 = vmlaq_f32(acc1, w1_f2, xv2);
+                acc1 = vmlaq_f32(acc1, w1_f3, xv3);
+                
+                // Load and process weight row 2
+                let wv2 = vld1q_s8(w2.as_ptr().add(i));
+                let w2_16_low = vmovl_s8(vget_low_s8(wv2));
+                let w2_16_high = vmovl_s8(vget_high_s8(wv2));
+                let w2_f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w2_16_low)));
+                let w2_f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w2_16_low)));
+                let w2_f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w2_16_high)));
+                let w2_f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w2_16_high)));
+                acc2 = vmlaq_f32(acc2, w2_f0, xv0);
+                acc2 = vmlaq_f32(acc2, w2_f1, xv1);
+                acc2 = vmlaq_f32(acc2, w2_f2, xv2);
+                acc2 = vmlaq_f32(acc2, w2_f3, xv3);
+                
+                // Load and process weight row 3
+                let wv3 = vld1q_s8(w3.as_ptr().add(i));
+                let w3_16_low = vmovl_s8(vget_low_s8(wv3));
+                let w3_16_high = vmovl_s8(vget_high_s8(wv3));
+                let w3_f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w3_16_low)));
+                let w3_f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w3_16_low)));
+                let w3_f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w3_16_high)));
+                let w3_f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w3_16_high)));
+                acc3 = vmlaq_f32(acc3, w3_f0, xv0);
+                acc3 = vmlaq_f32(acc3, w3_f1, xv1);
+                acc3 = vmlaq_f32(acc3, w3_f2, xv2);
+                acc3 = vmlaq_f32(acc3, w3_f3, xv3);
+                
+                i += 16;
+            }
+            
+            // Reduce and apply scale
+            let r0 = vaddvq_f32(acc0) * s0;
+            let r1 = vaddvq_f32(acc1) * s1;
+            let r2 = vaddvq_f32(acc2) * s2;
+            let r3 = vaddvq_f32(acc3) * s3;
+            
+            // Handle remaining elements
+            let mut tail0 = 0.0f32;
+            let mut tail1 = 0.0f32;
+            let mut tail2 = 0.0f32;
+            let mut tail3 = 0.0f32;
+            while i < in_dim {
+                let x = input[i];
+                tail0 += (w0[i] as f32) * x;
+                tail1 += (w1[i] as f32) * x;
+                tail2 += (w2[i] as f32) * x;
+                tail3 += (w3[i] as f32) * x;
+                i += 1;
+            }
+            
+            out[row] = r0 + tail0 * s0;
+            out[row + 1] = r1 + tail1 * s1;
+            out[row + 2] = r2 + tail2 * s2;
+            out[row + 3] = r3 + tail3 * s3;
+            
+            row += 4;
+        }
+        
+        // Handle remaining rows
+        while row < out_dim {
+            let w = &weight_i8[row * in_dim..(row + 1) * in_dim];
+            let scale = f16::from_bits(scales_f16[row]).to_f32();
+            
+            let mut acc = vdupq_n_f32(0.0);
+            let mut i = 0usize;
+            while i + 16 <= in_dim {
+                let xv0 = vld1q_f32(input.as_ptr().add(i));
+                let xv1 = vld1q_f32(input.as_ptr().add(i + 4));
+                let xv2 = vld1q_f32(input.as_ptr().add(i + 8));
+                let xv3 = vld1q_f32(input.as_ptr().add(i + 12));
+                
+                let wv = vld1q_s8(w.as_ptr().add(i));
+                let w16_low = vmovl_s8(vget_low_s8(wv));
+                let w16_high = vmovl_s8(vget_high_s8(wv));
+                let wf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16_low)));
+                let wf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16_low)));
+                let wf2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16_high)));
+                let wf3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16_high)));
+                
+                acc = vmlaq_f32(acc, wf0, xv0);
+                acc = vmlaq_f32(acc, wf1, xv1);
+                acc = vmlaq_f32(acc, wf2, xv2);
+                acc = vmlaq_f32(acc, wf3, xv3);
+                i += 16;
+            }
+            
+            let mut sum = vaddvq_f32(acc);
+            while i < in_dim {
+                sum += (w[i] as f32) * input[i];
+                i += 1;
+            }
+            out[row] = sum * scale;
+            row += 1;
+        }
+    }
+    
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for row in 0..out_dim {
+            let w = &weight_i8[row * in_dim..(row + 1) * in_dim];
+            let scale = f16::from_bits(scales_f16[row]).to_f32();
+            let mut sum = 0.0f32;
+            for i in 0..in_dim {
+                sum += (w[i] as f32) * input[i];
+            }
+            out[row] = sum * scale;
+        }
+    }
+}
+
 pub fn matmul_i8_f32(
     a_i8: &[i8],
     a_scales_f16: &[u16],

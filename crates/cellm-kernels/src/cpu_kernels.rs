@@ -244,20 +244,20 @@ pub fn matmul_i8_f32(
     debug_assert_eq!(a_scales_f16.len(), m);
     debug_assert_eq!(out.len(), m);
 
-    out.par_iter_mut().enumerate().for_each(|(i, o)| {
-        let row = &a_i8[i * k..(i + 1) * k];
-        let scale = f16::from_bits(a_scales_f16[i]).to_f32();
+    // For small batch sizes (decode), avoid parallelization overhead
+    if m < 8 {
+        for i in 0..m {
+            let row = &a_i8[i * k..(i + 1) * k];
+            let scale = f16::from_bits(a_scales_f16[i]).to_f32();
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            let mut dot = 0.0f32;
-            let mut i_inner = 0;
+            #[cfg(target_arch = "aarch64")]
             unsafe {
                 use std::arch::aarch64::*;
                 let mut sum0 = vdupq_n_f32(0.0);
                 let mut sum1 = vdupq_n_f32(0.0);
                 let mut sum2 = vdupq_n_f32(0.0);
                 let mut sum3 = vdupq_n_f32(0.0);
+                let mut i_inner = 0;
 
                 while i_inner + 16 <= k {
                     let wv = vld1q_s8(row.as_ptr().add(i_inner));
@@ -281,24 +281,81 @@ pub fn matmul_i8_f32(
                     i_inner += 16;
                 }
                 let res = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
-                dot = vgetq_lane_f32(res, 0) + vgetq_lane_f32(res, 1) + vgetq_lane_f32(res, 2) + vgetq_lane_f32(res, 3);
+                let mut acc = vgetq_lane_f32(res, 0) + vgetq_lane_f32(res, 1) + vgetq_lane_f32(res, 2) + vgetq_lane_f32(res, 3);
+                while i_inner < k {
+                    acc += (row[i_inner] as f32) * b[i_inner];
+                    i_inner += 1;
+                }
+                out[i] = acc * scale;
             }
-            while i_inner < k {
-                dot += (row[i_inner] as f32) * b[i_inner];
-                i_inner += 1;
-            }
-            *o = dot * scale;
-        }
 
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let mut acc = 0.0f32;
-            for kk in 0..k {
-                acc += (row[kk] as f32) * b[kk];
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let mut acc = 0.0f32;
+                for kk in 0..k {
+                    acc += (row[kk] as f32) * b[kk];
+                }
+                out[i] = acc * scale;
             }
-            *o = acc * scale;
         }
-    });
+    } else {
+        // Parallel path for larger batches (prefill)
+        out.par_iter_mut().enumerate().for_each(|(i, o)| {
+            let row = &a_i8[i * k..(i + 1) * k];
+            let scale = f16::from_bits(a_scales_f16[i]).to_f32();
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                let mut dot = 0.0f32;
+                let mut i_inner = 0;
+                unsafe {
+                    use std::arch::aarch64::*;
+                    let mut sum0 = vdupq_n_f32(0.0);
+                    let mut sum1 = vdupq_n_f32(0.0);
+                    let mut sum2 = vdupq_n_f32(0.0);
+                    let mut sum3 = vdupq_n_f32(0.0);
+
+                    while i_inner + 16 <= k {
+                        let wv = vld1q_s8(row.as_ptr().add(i_inner));
+                        let xv0 = vld1q_f32(b.as_ptr().add(i_inner));
+                        let xv1 = vld1q_f32(b.as_ptr().add(i_inner + 4));
+                        let xv2 = vld1q_f32(b.as_ptr().add(i_inner + 8));
+                        let xv3 = vld1q_f32(b.as_ptr().add(i_inner + 12));
+
+                        let wv16_low = vmovl_s8(vget_low_s8(wv));
+                        let wv16_high = vmovl_s8(vget_high_s8(wv));
+
+                        let w_f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(wv16_low)));
+                        let w_f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wv16_low)));
+                        let w_f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(wv16_high)));
+                        let w_f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wv16_high)));
+
+                        sum0 = vmlaq_f32(sum0, w_f0, xv0);
+                        sum1 = vmlaq_f32(sum1, w_f1, xv1);
+                        sum2 = vmlaq_f32(sum2, w_f2, xv2);
+                        sum3 = vmlaq_f32(sum3, w_f3, xv3);
+                        i_inner += 16;
+                    }
+                    let res = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
+                    dot = vgetq_lane_f32(res, 0) + vgetq_lane_f32(res, 1) + vgetq_lane_f32(res, 2) + vgetq_lane_f32(res, 3);
+                }
+                while i_inner < k {
+                    dot += (row[i_inner] as f32) * b[i_inner];
+                    i_inner += 1;
+                }
+                *o = dot * scale;
+            }
+
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let mut acc = 0.0f32;
+                for kk in 0..k {
+                    acc += (row[kk] as f32) * b[kk];
+                }
+                *o = acc * scale;
+            }
+        });
+    }
 }
 
 pub fn matmul_f16_f32(

@@ -343,13 +343,113 @@ pub fn matmul_i4_f32(
         let row = &a_i4[i * row_stride..(i + 1) * row_stride];
         let rs = &a_scales_f16[i * spr..(i + 1) * spr];
         let mut dot = 0.0f32;
-        for j in 0..k {
-            let b_idx = j / 2;
-            let n = if j % 2 == 0 { row[b_idx] & 0xf } else { row[b_idx] >> 4 };
-            let q = (n as i8) - 8;
-            let scale = f16::from_bits(rs[j / gs]).to_f32();
-            dot += (q as f32) * scale * b[j];
+
+        // Precompute scales for this row to avoid repeated f16->f32 conversions
+        let num_groups = (k + gs - 1) / gs;
+        let mut scales_buf = [0.0f32; 512];
+        let scales_to_copy = num_groups.min(512);
+        for g in 0..scales_to_copy {
+            scales_buf[g] = f16::from_bits(rs[g]).to_f32();
         }
+
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            use std::arch::aarch64::*;
+
+            // Accumulate in 4 f32 vectors for better ILP
+            let mut sum0 = vdupq_n_f32(0.0);
+            let mut sum1 = vdupq_n_f32(0.0);
+            let mut sum2 = vdupq_n_f32(0.0);
+            let mut sum3 = vdupq_n_f32(0.0);
+
+            let mut j = 0usize;
+
+            // Process 8 bytes (16 i4 values) at a time
+            // Layout: byte[j/2] contains element j (low nibble) and j+1 (high nibble)
+            while j + 16 <= k {
+                let byte_base = j / 2;
+
+                // Load 8 bytes = 16 i4 values
+                let bytes = vld1_u8(row.as_ptr().add(byte_base));
+
+                // Extract nibbles: low nibble = even indices, high nibble = odd indices
+                let mask_lo = vdup_n_u8(0x0f);
+                let lo_nibbles = vand_u8(bytes, mask_lo);   // elements j, j+2, j+4, ..., j+14
+                let hi_nibbles = vshr_n_u8(bytes, 4);       // elements j+1, j+3, j+5, ..., j+15
+
+                // Convert u8 to i8 by subtracting 8 (zero point)
+                let zero_pt = vdup_n_s8(8);
+                let lo_i8 = vsub_s8(vreinterpret_s8_u8(lo_nibbles), zero_pt);
+                let hi_i8 = vsub_s8(vreinterpret_s8_u8(hi_nibbles), zero_pt);
+
+                // Widen i8 to i16
+                let lo_i16 = vmovl_s8(lo_i8);  // int16x8_t
+                let hi_i16 = vmovl_s8(hi_i8);  // int16x8_t
+
+                // Widen i16 to i32 and convert to f32
+                let lo_f32_0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo_i16)));   // 4 floats: j, j+2, j+4, j+6
+                let lo_f32_1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo_i16)));  // 4 floats: j+8, j+10, j+12, j+14
+                let hi_f32_0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi_i16)));   // 4 floats: j+1, j+3, j+5, j+7
+                let hi_f32_1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi_i16)));  // 4 floats: j+9, j+11, j+13, j+15
+
+                // Load 16 b values and deinterleave
+                let b_0 = vld1q_f32(b.as_ptr().add(j));      // b[j], b[j+1], b[j+2], b[j+3]
+                let b_1 = vld1q_f32(b.as_ptr().add(j + 4));  // b[j+4], b[j+5], b[j+6], b[j+7]
+                let b_2 = vld1q_f32(b.as_ptr().add(j + 8));  // b[j+8], b[j+9], b[j+10], b[j+11]
+                let b_3 = vld1q_f32(b.as_ptr().add(j + 12)); // b[j+12], b[j+13], b[j+14], b[j+15]
+
+                // Deinterleave: even indices go with lo, odd indices go with hi
+                let b_lo_0 = vuzp1q_f32(b_0, b_1);  // b[j], b[j+2], b[j+4], b[j+6]
+                let b_hi_0 = vuzp2q_f32(b_0, b_1);  // b[j+1], b[j+3], b[j+5], b[j+7]
+                let b_lo_1 = vuzp1q_f32(b_2, b_3);  // b[j+8], b[j+10], b[j+12], b[j+14]
+                let b_hi_1 = vuzp2q_f32(b_2, b_3);  // b[j+9], b[j+11], b[j+13], b[j+15]
+
+                // Get scale for this chunk
+                let scale_idx = j / gs;
+                let scale = scales_buf[scale_idx.min(511)];
+                let scale_vec = vdupq_n_f32(scale);
+
+                // Apply scale and accumulate
+                let lo_scaled_0 = vmulq_f32(lo_f32_0, scale_vec);
+                let lo_scaled_1 = vmulq_f32(lo_f32_1, scale_vec);
+                let hi_scaled_0 = vmulq_f32(hi_f32_0, scale_vec);
+                let hi_scaled_1 = vmulq_f32(hi_f32_1, scale_vec);
+
+                sum0 = vmlaq_f32(sum0, lo_scaled_0, b_lo_0);
+                sum1 = vmlaq_f32(sum1, lo_scaled_1, b_lo_1);
+                sum2 = vmlaq_f32(sum2, hi_scaled_0, b_hi_0);
+                sum3 = vmlaq_f32(sum3, hi_scaled_1, b_hi_1);
+
+                j += 16;
+            }
+
+            // Reduce sums
+            let partial = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
+            dot = vgetq_lane_f32(partial, 0) + vgetq_lane_f32(partial, 1) +
+                  vgetq_lane_f32(partial, 2) + vgetq_lane_f32(partial, 3);
+
+            // Handle remaining elements with scalar code
+            while j < k {
+                let b_idx = j / 2;
+                let n = if j % 2 == 0 { row[b_idx] & 0xf } else { row[b_idx] >> 4 };
+                let q = (n as i8) - 8;
+                let scale = scales_buf[(j / gs).min(511)];
+                dot += (q as f32) * scale * b[j];
+                j += 1;
+            }
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for j in 0..k {
+                let b_idx = j / 2;
+                let n = if j % 2 == 0 { row[b_idx] & 0xf } else { row[b_idx] >> 4 };
+                let q = (n as i8) - 8;
+                let scale = scales_buf[(j / gs).min(511)];
+                dot += (q as f32) * scale * b[j];
+            }
+        }
+
         *o = dot;
     });
 }

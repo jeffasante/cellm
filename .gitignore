@@ -58,3 +58,5 @@ bindings/swift/CellmFFI.xcframework/**/*.a
 bindings/swift/CellmFFI.xcframework/**/*.dylib
 
 todos/1.md
+
+research/experimentals

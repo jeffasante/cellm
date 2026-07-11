@@ -289,7 +289,9 @@ Qwen3-0.6B-int4.cellm (old int4)	Garbage (pre-fix)
     --model models/to-huggingface/smollm2-360m-q1-v1/smollm2-360m-int8-v1.cellm \
     --tokenizer models/to-huggingface/smollm2-360m-q1-v1/tokenizer.json \
     --prompt "what's sycophancy?" \
-    --chat --gen 100 --temperature 0 --backend cpu --kv-encoding f16
+    --chat --gen 100 
+    
+    --temperature 0 --backend cpu --kv-encoding f16
 
 # Metal
 ./target/release/infer \
@@ -579,7 +581,13 @@ cargo run --release --bin convert -- \
   --model models/to-huggingface/smolvlm-256m-instruct-f16-full/smolvlm-256m-instruct-f16-full.cellm \
   --image models/test_images/bird.jpg \
   --prompt "What do you see?" \
-  --tokens 64
+  --tokens 64 --backend cpu
+
+  ./target/release/vlm-direct \
+  --model models/to-huggingface/smolvlm-256m-instruct-int8-v1/smolvlm-256m-instruct-int8-v1.cellm\
+  --image models/test_images/bird.jpg \
+  --prompt "What do you see?" \
+  --tokens 64 --backend cpu
 
 # Output: "A black and white owl is staring at the camera."
 # Timings: patch=32.6ms, encoder=4.78s, decode=17.80s, total=23.2s
@@ -886,6 +894,29 @@ hf download Qwen/Qwen3.5-0.8B --local-dir models/hf/qwen3.5-0.8b
   --gen 64 --temperature 0 --backend cpu --kv-encoding f16
 ```
 
+```bash
+# CPU
+./target/release/infer \
+  --model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-i4.cellm \
+  --tokenizer models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
+  --prompt "Hello, who are you?" \
+  --chat --chat-format auto \
+  --gen 64 --backend cpu  
+```
+
+
+```bash
+# Default: thinking enabled
+./target/release/infer \
+--model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-i4.cellm \ --tokenizer  models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
+  --prompt "What is 2+2?" --chat --chat-format auto --gen 100 --backend cpu
+
+# Skip thinking
+./target/release/infer --model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-i4.cellm \ --tokenizer  models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
+  --prompt "What is 2+2?" --chat --chat-format auto --gen 50 --backend cpu --no-think
+
+
+```
 
 ```bash
 # METAL

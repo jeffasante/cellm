@@ -48,6 +48,20 @@ pub struct LlamaRunner {
     f32_weight_cache: HashMap<String, Vec<f32>>,
     #[cfg(feature = "webgpu")]
     pub webgpu_weight_cache: HashMap<String, Buffer>,
+    // Pre-allocated scratch buffers for step_inner (avoids O(hidden) alloc per call)
+    buf_attn_norm_w: Vec<f32>,
+    buf_x_norm: Vec<f32>,
+    buf_q: Vec<f32>,
+    buf_k: Vec<f32>,
+    buf_v: Vec<f32>,
+    buf_attn_out: Vec<f32>,
+    buf_attn_proj: Vec<f32>,
+    buf_post_norm_w: Vec<f32>,
+    buf_mlp_in: Vec<f32>,
+    buf_gate: Vec<f32>,
+    buf_up: Vec<f32>,
+    buf_down: Vec<f32>,
+    buf_gather_bases: Vec<usize>,
 }
 
 enum LlamaLinearBackend {
@@ -82,6 +96,10 @@ impl LlamaRunner {
 
         let tensor_prefix = detect_llama_prefix(&file)?;
 
+        let hidden = cfg.hidden_size;
+        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        let inter = cfg.intermediate_size;
+
         Ok(Self {
             file,
             cfg: cfg.clone(),
@@ -114,6 +132,20 @@ impl LlamaRunner {
             f32_weight_cache: HashMap::new(),
             #[cfg(feature = "webgpu")]
             webgpu_weight_cache: HashMap::new(),
+            // Pre-allocated scratch buffers for step_inner (avoids O(hidden) alloc per call)
+            buf_attn_norm_w: vec![0.0f32; hidden],
+            buf_x_norm: vec![0.0f32; hidden],
+            buf_q: vec![0.0f32; hidden],
+            buf_k: vec![0.0f32; kv_dim],
+            buf_v: vec![0.0f32; kv_dim],
+            buf_attn_out: vec![0.0f32; hidden],
+            buf_attn_proj: vec![0.0f32; hidden],
+            buf_post_norm_w: vec![0.0f32; hidden],
+            buf_mlp_in: vec![0.0f32; hidden],
+            buf_gate: vec![0.0f32; inter],
+            buf_up: vec![0.0f32; inter],
+            buf_down: vec![0.0f32; hidden],
+            buf_gather_bases: Vec::with_capacity(256),
         })
     }
 

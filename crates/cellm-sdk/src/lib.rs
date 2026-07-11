@@ -1206,6 +1206,64 @@ pub struct EngineStats {
     pub scheduling_policy: SchedulingPolicy,
 }
 
+// ---------------------------------------------------------------------------
+// Thinking mode helpers
+// ---------------------------------------------------------------------------
+
+/// Wrap a prompt with thinking prefill for ChatML-style models.
+///
+/// This adds `<|im_start|>assistant\n<think>\n` to the prompt, which triggers
+/// the model to generate thinking content before the actual response.
+///
+/// # Example
+/// ```ignore
+/// let prompt = "What is 2+2?";
+/// let prompt_with_think = wrap_prompt_with_think(prompt);
+/// // prompt_with_think = "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+/// ```
+pub fn wrap_prompt_with_think(prompt: &str) -> String {
+    let mut s = String::with_capacity(prompt.len() + 64);
+    s.push_str("<|im_start|>user\n");
+    s.push_str(prompt);
+    s.push_str("<|im_end|>\n<|im_start|>assistant\n<think>\n");
+    s
+}
+
+/// Strip thinking blocks from generated text.
+///
+/// Removes all content between `<think>` and `</think>` tags (inclusive).
+/// Use this when you want to hide the model's reasoning process from the user.
+///
+/// # Example
+/// ```ignore
+/// let text = "<think>\nLet me think...\n</think>\n\nThe answer is 4.";
+/// let clean = strip_think_blocks(text);
+/// // clean = "\n\nThe answer is 4."
+/// ```
+pub fn strip_think_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut in_think = false;
+    while !rest.is_empty() {
+        if !in_think {
+            if let Some(idx) = rest.find("<think>") {
+                out.push_str(&rest[..idx]);
+                rest = &rest[idx + "<think>".len()..];
+                in_think = true;
+            } else {
+                out.push_str(rest);
+                break;
+            }
+        } else if let Some(end) = rest.find("</think>") {
+            rest = &rest[end + "</think>".len()..];
+            in_think = false;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SamplingParams {
     pub top_k: usize,

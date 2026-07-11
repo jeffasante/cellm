@@ -413,6 +413,40 @@ impl CellmEngine {
     pub fn is_stop_token(&self, token: u32) -> bool {
         self.engine.lock().unwrap().is_stop_token(token)
     }
+
+    // -----------------------------------------------------------------------
+    // Thinking mode helpers
+    // -----------------------------------------------------------------------
+
+    /// Wrap a prompt with thinking prefill for ChatML-style models.
+    ///
+    /// This adds `<|im_start|>assistant\n<think>\n` to the prompt, which triggers
+    /// the model to generate thinking content before the actual response.
+    ///
+    /// # Example (JavaScript)
+    /// ```js
+    /// const prompt = "What is 2+2?";
+    /// const promptWithThink = engine.wrap_prompt_with_think(prompt);
+    /// const tokens = engine.tokenize(promptWithThink);
+    /// ```
+    pub fn wrap_prompt_with_think(&self, prompt: &str) -> String {
+        cellm_sdk::wrap_prompt_with_think(prompt)
+    }
+
+    /// Strip thinking blocks from generated text.
+    ///
+    /// Removes all content between `<think>` and `</think>` tags (inclusive).
+    /// Use this when you want to hide the model's reasoning process from the user.
+    ///
+    /// # Example (JavaScript)
+    /// ```js
+    /// const text = "<think>\nLet me think...\n</think>\n\nThe answer is 4.";
+    /// const clean = engine.strip_think_blocks(text);
+    /// // clean = "\n\nThe answer is 4."
+    /// ```
+    pub fn strip_think_blocks(&self, text: &str) -> String {
+        cellm_sdk::strip_think_blocks(text)
+    }
 }
 
 // ---------------------------------------------------------------------------

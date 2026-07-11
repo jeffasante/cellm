@@ -133,6 +133,10 @@ struct Args {
     /// `turboquant` enables an experimental CPU int8+scale packed KV path.
     #[arg(long, value_enum, default_value_t = KvEncodingArg::F16)]
     kv_encoding: KvEncodingArg,
+
+    /// Disable thinking/reasoning mode (skip think prefill and strip think blocks from output)
+    #[arg(long, default_value_t = false)]
+    no_think: bool,
 }
 
 fn main() -> Result<()> {
@@ -360,6 +364,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             .as_ref()
             .expect("tokenizer path set when prompt set");
         let include_think_prefill = args.chat
+            && !args.no_think
             && effective_chat_format == ChatFormat::Chatml
             && tokenizer_config_contains_think_prefill(tok_path);
         let prompt_text = build_prompt_text(
@@ -611,7 +616,11 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         } else {
             tok.decode(&all_ids, true).unwrap_or_default()
         };
-        let text = sanitize_assistant_text(&strip_think_blocks(&text));
+        let text = if args.no_think {
+            sanitize_assistant_text(&strip_think_blocks(&text))
+        } else {
+            sanitize_assistant_text(&text)
+        };
         println!();
         println!("---");
         println!("{text}");
@@ -743,7 +752,8 @@ fn build_prompt_text(
             s.push_str("<|im_end|>\n");
             s.push_str("<|im_start|>assistant\n");
             if include_think_prefill {
-                s.push_str("<think>\n\n</think>\n\n");
+                // Only open the think block - let the model generate thinking content and close it
+                s.push_str("<think>\n");
             }
             s
         }

@@ -27,6 +27,11 @@ pub struct ModelConfig {
     pub intermediate_size: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    pub rope_scaling_type: Option<String>,
+    pub rope_scaling_factor: Option<f32>,
+    pub rope_scaling_original_max_position_embeddings: Option<usize>,
+    pub rope_scaling_low_freq_factor: Option<f32>,
+    pub rope_scaling_high_freq_factor: Option<f32>,
     pub attention_softcap: f32,
 
     // DeepSeek-V4 specifics
@@ -54,6 +59,11 @@ impl Default for ModelConfig {
             intermediate_size: 0,
             rms_norm_eps: 1e-6,
             rope_theta: 10000.0,
+            rope_scaling_type: None,
+            rope_scaling_factor: None,
+            rope_scaling_original_max_position_embeddings: None,
+            rope_scaling_low_freq_factor: None,
+            rope_scaling_high_freq_factor: None,
             attention_softcap: 0.0,
             hc_mult: None,
             hc_sinkhorn_iters: None,

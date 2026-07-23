@@ -5,7 +5,13 @@ use std::path::Path;
 use bytemuck::cast_slice;
 use cellm_cache::{KVCache, PageTable};
 use cellm_core::CoreError;
-use cellm_kernels::cpu_kernels::{rms_norm_f32, rope_interleaved_inplace_f32, rope_non_interleaved_inplace_f32};
+use cellm_kernels::cpu_kernels::{
+    rms_norm_f32,
+    rope_interleaved_inplace_f32,
+    rope_interleaved_inplace_f32_with_freqs,
+    rope_non_interleaved_inplace_f32,
+    rope_non_interleaved_inplace_f32_with_freqs,
+};
 use cellm_kernels::metal::MetalMatmul;
 use cellm_kernels::{MetalKernels, MetalOps};
 use half::f16;
@@ -46,6 +52,9 @@ pub struct LlamaRunner {
     /// Cached dequantized f32 weights for cblas_sgemm on macOS/iOS
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     f32_weight_cache: HashMap<String, Vec<f32>>,
+    /// Cached pre-dequantized affine i4 weights (f32) for cblas_sgemm
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    affine_f32_weight_cache: HashMap<String, Vec<f32>>,
     #[cfg(feature = "webgpu")]
     pub webgpu_weight_cache: HashMap<String, Buffer>,
     // Pre-allocated scratch buffers for step_inner (avoids O(hidden) alloc per call)
@@ -62,6 +71,24 @@ pub struct LlamaRunner {
     buf_up: Vec<f32>,
     buf_down: Vec<f32>,
     buf_gather_bases: Vec<usize>,
+    cached_inv_freqs: Vec<f32>,
+    /// Pre-cached f32 norm weights (attn + ffn + final) to avoid f16→f32 conversion every step
+    cached_norm_weights: HashMap<String, Vec<f32>>,
+    /// Pre-built layer tensor names to avoid format!() every step
+    cached_layer_names: Vec<LayerNamesCached>,
+}
+
+#[derive(Clone)]
+struct LayerNamesCached {
+    attn_norm: String,
+    q_proj: String,
+    k_proj: String,
+    v_proj: String,
+    o_proj: String,
+    ffn_norm: String,
+    gate_proj: String,
+    up_proj: String,
+    down_proj: String,
 }
 
 enum LlamaLinearBackend {
@@ -90,6 +117,11 @@ impl LlamaRunner {
             intermediate_size: h.intermediate_size,
             rms_norm_eps: h.rms_norm_eps,
             rope_theta: h.rope_theta,
+            rope_scaling_type: h.rope_scaling_type.clone(),
+            rope_scaling_factor: h.rope_scaling_factor,
+            rope_scaling_original_max_position_embeddings: h.rope_scaling_original_max_position_embeddings,
+            rope_scaling_low_freq_factor: h.rope_scaling_low_freq_factor,
+            rope_scaling_high_freq_factor: h.rope_scaling_high_freq_factor,
             attention_softcap: 0.0,
             ..ModelConfig::default()
         };
@@ -99,6 +131,17 @@ impl LlamaRunner {
         let hidden = cfg.hidden_size;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
         let inter = cfg.intermediate_size;
+
+        // Precompute RoPE inv_freqs with optional llama3 scaling
+        let inv_freqs = compute_inv_freqs(
+            cfg.head_dim,
+            cfg.rope_theta,
+            &cfg.rope_scaling_type,
+            cfg.rope_scaling_factor,
+            cfg.rope_scaling_original_max_position_embeddings,
+            cfg.rope_scaling_low_freq_factor,
+            cfg.rope_scaling_high_freq_factor,
+        );
 
         Ok(Self {
             file,
@@ -120,16 +163,18 @@ impl LlamaRunner {
             use_metal_rope: std::env::var("CELLM_LLAMA_USE_METAL_ROPE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
-            // Some HF Llama-family checkpoints (for example SmolLM2) use
-            // non-interleaved rotary embedding layout (rotate_half).
-            // Keep current interleaved default for backwards compatibility.
-            rope_interleaved: std::env::var("CELLM_LLAMA_ROPE_INTERLEAVED")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
+            // Prefer model metadata; retain the environment override for older files.
+            rope_interleaved: h.rope_interleaved.unwrap_or_else(|| {
+                std::env::var("CELLM_LLAMA_ROPE_INTERLEAVED")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+            }),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             graph_state: None,
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             f32_weight_cache: HashMap::new(),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            affine_f32_weight_cache: HashMap::new(),
             #[cfg(feature = "webgpu")]
             webgpu_weight_cache: HashMap::new(),
             // Pre-allocated scratch buffers for step_inner (avoids O(hidden) alloc per call)
@@ -146,7 +191,65 @@ impl LlamaRunner {
             buf_up: vec![0.0f32; inter],
             buf_down: vec![0.0f32; hidden],
             buf_gather_bases: Vec::with_capacity(256),
+            cached_inv_freqs: inv_freqs,
+            cached_norm_weights: HashMap::new(),
+            cached_layer_names: Vec::new(),
         })
+    }
+
+    /// Pre-cache layer tensor names and norm weights to eliminate per-step allocations.
+    /// Called lazily on first step_inner invocation.
+    fn ensure_caches(&mut self) -> Result<(), CoreError> {
+        if !self.cached_layer_names.is_empty() {
+            return Ok(());
+        }
+        let prefix = &self.tensor_prefix;
+        let max_layers = self.max_layers;
+        self.cached_layer_names = (0..max_layers).map(|l| {
+            let base = if prefix.is_empty() {
+                format!("model.layers.{l}")
+            } else {
+                format!("{prefix}model.layers.{l}")
+            };
+            LayerNamesCached {
+                attn_norm: format!("{base}.input_layernorm.weight"),
+                q_proj: format!("{base}.self_attn.q_proj.weight"),
+                k_proj: format!("{base}.self_attn.k_proj.weight"),
+                v_proj: format!("{base}.self_attn.v_proj.weight"),
+                o_proj: format!("{base}.self_attn.o_proj.weight"),
+                ffn_norm: format!("{base}.post_attention_layernorm.weight"),
+                gate_proj: format!("{base}.mlp.gate_proj.weight"),
+                up_proj: format!("{base}.mlp.up_proj.weight"),
+                down_proj: format!("{base}.mlp.down_proj.weight"),
+            }
+        }).collect();
+
+        // Pre-cache all norm weights as f32 to avoid f16→f32 conversion every step
+        let hidden = self.cfg.hidden_size;
+        for l in 0..max_layers {
+            let ln = &self.cached_layer_names[l];
+            for name in [&ln.attn_norm, &ln.ffn_norm] {
+                if !self.cached_norm_weights.contains_key(name.as_str()) {
+                    if let Ok(w_f16) = self.tensor_f16(name) {
+                        let w_f32: Vec<f32> = w_f16.iter().map(|&v| f16::from_bits(v).to_f32()).collect();
+                        self.cached_norm_weights.insert(name.clone(), w_f32);
+                    }
+                }
+            }
+        }
+        // Cache final norm weight
+        let final_norm_name = if self.tensor_prefix.is_empty() {
+            "model.norm.weight".to_string()
+        } else {
+            format!("{}model.norm.weight", self.tensor_prefix)
+        };
+        if !self.cached_norm_weights.contains_key(final_norm_name.as_str()) {
+            if let Ok(w_f16) = self.tensor_f16(&final_norm_name) {
+                let w_f32: Vec<f32> = w_f16.iter().map(|&v| f16::from_bits(v).to_f32()).collect();
+                self.cached_norm_weights.insert(final_norm_name, w_f32);
+            }
+        }
+        Ok(())
     }
 
     pub fn file(&self) -> &CellmFile {
@@ -705,6 +808,9 @@ impl LlamaRunner {
         kv_cache: &mut KVCache,
         return_logits: bool,
     ) -> Result<Vec<f32>, CoreError> {
+        // Ensure caches are populated (lazy init on first call)
+        self.ensure_caches()?;
+
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             let mut disable_graph = false;
@@ -750,18 +856,22 @@ impl LlamaRunner {
                 self.graph_state = None;
             }
         }
-        let cfg = self.cfg.clone();
-        let hidden = cfg.hidden_size;
-        // ... (rest of the function continues below)
-        let n_heads = cfg.num_attention_heads;
-        let n_kv_heads = cfg.num_key_value_heads;
-        let head_dim = cfg.head_dim;
+
+        // Use references to config fields to avoid cloning
+        let hidden = self.cfg.hidden_size;
+        let n_heads = self.cfg.num_attention_heads;
+        let n_kv_heads = self.cfg.num_key_value_heads;
+        let head_dim = self.cfg.head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let inter = self.cfg.intermediate_size;
+        let eps = self.cfg.rms_norm_eps;
+        let rope_theta = self.cfg.rope_theta;
+
         if head_dim * n_heads != hidden {
             return Err(CoreError::Backend(
                 "llama: hidden_size must be divisible by num_attention_heads".into(),
             ));
         }
-        let kv_dim = n_kv_heads * head_dim;
 
         // Ensure pagetable covers this token position.
         if pos == page_table.token_count() {
@@ -789,17 +899,20 @@ impl LlamaRunner {
                 hidden
             )));
         }
-        let mut x = x0.to_vec();
 
-        // Per-layer scratch.
+        // Copy x0 into a working buffer
+        let mut x = vec![0.0f32; hidden];
+        x.copy_from_slice(x0);
+
+        // Per-layer scratch buffers
         let debug_timing = std::env::var("CELLM_STEP_TIMING").is_ok();
         let mut t_linear_ns = 0u64;
         let mut t_attn_ns = 0u64;
         let mut t_norm_ns = 0u64;
         let mut t_rope_ns = 0u64;
-        let mut t_other_ns = 0u64;
         #[cfg(not(target_arch = "wasm32"))]
         let t_step_start = std::time::Instant::now();
+
         let mut attn_norm_w = vec![0.0f32; hidden];
         let mut x_norm = vec![0.0f32; hidden];
         let mut q = vec![0.0f32; hidden];
@@ -807,40 +920,15 @@ impl LlamaRunner {
         let mut v = vec![0.0f32; kv_dim];
         let mut attn_out = vec![0.0f32; hidden];
         let mut attn_proj = vec![0.0f32; hidden];
-
         let mut post_norm_w = vec![0.0f32; hidden];
         let mut mlp_in = vec![0.0f32; hidden];
-        let mut gate = vec![0.0f32; cfg.intermediate_size];
-        let mut up = vec![0.0f32; cfg.intermediate_size];
+        let mut gate = vec![0.0f32; inter];
+        let mut up = vec![0.0f32; inter];
         let mut down = vec![0.0f32; hidden];
+        let mut gather_bases: Vec<usize> = Vec::with_capacity(256);
 
-        let mut gather_bases: Vec<usize> = Vec::new();
-
-        // Precompute all per-layer tensor names to avoid format!/resolve_name per step.
-        struct LayerNames {
-            attn_norm: String,
-            q_proj: String,
-            k_proj: String,
-            v_proj: String,
-            o_proj: String,
-            ffn_norm: String,
-            gate_proj: String,
-            up_proj: String,
-            down_proj: String,
-        }
-        let layer_names: Vec<LayerNames> = (0..self.max_layers).map(|l| {
-            LayerNames {
-                attn_norm: format!("model.layers.{l}.input_layernorm.weight"),
-                q_proj: format!("model.layers.{l}.self_attn.q_proj.weight"),
-                k_proj: format!("model.layers.{l}.self_attn.k_proj.weight"),
-                v_proj: format!("model.layers.{l}.self_attn.v_proj.weight"),
-                o_proj: format!("model.layers.{l}.self_attn.o_proj.weight"),
-                ffn_norm: format!("model.layers.{l}.post_attention_layernorm.weight"),
-                gate_proj: format!("model.layers.{l}.mlp.gate_proj.weight"),
-                up_proj: format!("model.layers.{l}.mlp.up_proj.weight"),
-                down_proj: format!("model.layers.{l}.mlp.down_proj.weight"),
-            }
-        }).collect();
+        // Clone cached layer names to avoid borrow conflicts with mutable self calls
+        let layer_names = self.cached_layer_names.clone();
 
         for layer in 0..self.max_layers {
             let use_metal_norm = self.metal_ops.is_some() && self.use_metal_norm;
@@ -857,14 +945,16 @@ impl LlamaRunner {
                 let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
                 let ck = format!("llama.layer.{layer}.attn_norm");
                 self.metal_ops.as_ref().unwrap()
-                    .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, false, &ck, &mut x_norm)
+                    .rms_norm_f16w(&x, &w, eps, false, &ck, &mut x_norm)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
             } else {
-                self.rmsnorm_weight(
-                    &ln.attn_norm,
-                    &mut attn_norm_w,
-                )?;
-                rms_norm_f32(&x, &attn_norm_w, cfg.rms_norm_eps, &mut x_norm);
+                // Use cached norm weights
+                if let Some(cached_w) = self.cached_norm_weights.get(&ln.attn_norm) {
+                    attn_norm_w.copy_from_slice(cached_w);
+                } else {
+                    self.rmsnorm_weight(&ln.attn_norm, &mut attn_norm_w)?;
+                }
+                rms_norm_f32(&x, &attn_norm_w, eps, &mut x_norm);
             }
             #[cfg(not(target_arch = "wasm32"))]
             {
@@ -901,16 +991,25 @@ impl LlamaRunner {
             let t0 = std::time::Instant::now();
             if use_metal_rope {
                 let ops = self.metal_ops.as_ref().unwrap();
-                ops.rope_adj_f32(&mut q, n_heads, head_dim, pos, cfg.rope_theta)
+                ops.rope_adj_f32(&mut q, n_heads, head_dim, pos, rope_theta)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
-                ops.rope_adj_f32(&mut k, n_kv_heads, head_dim, pos, cfg.rope_theta)
+                ops.rope_adj_f32(&mut k, n_kv_heads, head_dim, pos, rope_theta)
                     .map_err(|e| CoreError::Backend(e.to_string()))?;
+            } else if !self.cached_inv_freqs.is_empty() {
+                // Use precomputed scaled inv_freqs (for llama3-style RoPE scaling)
+                if self.rope_interleaved {
+                    rope_interleaved_inplace_f32_with_freqs(&mut q, n_heads, head_dim, pos, &self.cached_inv_freqs);
+                    rope_interleaved_inplace_f32_with_freqs(&mut k, n_kv_heads, head_dim, pos, &self.cached_inv_freqs);
+                } else {
+                    rope_non_interleaved_inplace_f32_with_freqs(&mut q, n_heads, head_dim, head_dim, pos, &self.cached_inv_freqs);
+                    rope_non_interleaved_inplace_f32_with_freqs(&mut k, n_kv_heads, head_dim, head_dim, pos, &self.cached_inv_freqs);
+                }
             } else if self.rope_interleaved {
-                rope_interleaved_inplace_f32(&mut q, n_heads, head_dim, pos, cfg.rope_theta);
-                rope_interleaved_inplace_f32(&mut k, n_kv_heads, head_dim, pos, cfg.rope_theta);
+                rope_interleaved_inplace_f32(&mut q, n_heads, head_dim, pos, rope_theta);
+                rope_interleaved_inplace_f32(&mut k, n_kv_heads, head_dim, pos, rope_theta);
             } else {
-                rope_non_interleaved_inplace_f32(&mut q, n_heads, head_dim, head_dim, pos, cfg.rope_theta);
-                rope_non_interleaved_inplace_f32(&mut k, n_kv_heads, head_dim, head_dim, pos, cfg.rope_theta);
+                rope_non_interleaved_inplace_f32(&mut q, n_heads, head_dim, head_dim, pos, rope_theta);
+                rope_non_interleaved_inplace_f32(&mut k, n_kv_heads, head_dim, head_dim, pos, rope_theta);
             }
             #[cfg(not(target_arch = "wasm32"))]
             {
@@ -995,19 +1094,16 @@ impl LlamaRunner {
                     }
 
                     if all_f16 {
-                        let inter = cfg.intermediate_size;
-                        let eps = cfg.rms_norm_eps;
-
                         let norm_w_data: Vec<u16>;
                         let w1b_data: Vec<u16>;
                         let w3b_data: Vec<u16>;
                         let w2b_data: Vec<u16>;
 
                         if let (Ok(nw), Ok(w1), Ok(w3), Ok(w2)) = (
-                            self.tensor_f16(&ffn_norm_name),
-                            self.tensor_f16(&gate_name),
-                            self.tensor_f16(&up_name),
-                            self.tensor_f16(&down_name),
+                            self.tensor_f16(ffn_norm_name),
+                            self.tensor_f16(gate_name),
+                            self.tensor_f16(up_name),
+                            self.tensor_f16(down_name),
                         ) {
                             norm_w_data = nw.to_vec();
                             w1b_data = w1.to_vec();
@@ -1023,10 +1119,10 @@ impl LlamaRunner {
                                 && ops.ensure_named_buf("ffn_down", hidden).is_ok()
                             {
                                 if let (Ok(norm_wb), Ok(w1b), Ok(w3b), Ok(w2b)) = (
-                                    ops.ensure_tensor_cached(&ffn_norm_name, &norm_w_data),
-                                    ops.ensure_tensor_cached(&gate_name, &w1b_data),
-                                    ops.ensure_tensor_cached(&up_name, &w3b_data),
-                                    ops.ensure_tensor_cached(&down_name, &w2b_data),
+                                    ops.ensure_tensor_cached(ffn_norm_name, &norm_w_data),
+                                    ops.ensure_tensor_cached(gate_name, &w1b_data),
+                                    ops.ensure_tensor_cached(up_name, &w3b_data),
+                                    ops.ensure_tensor_cached(down_name, &w2b_data),
                                 ) {
                                     if ops.write_named_buf("ffn_x", &x).is_ok() {
                                         if let (Ok(xb), Ok(nb), Ok(gb), Ok(ub), Ok(db)) = (
@@ -1066,17 +1162,22 @@ impl LlamaRunner {
                 #[cfg(not(target_arch = "wasm32"))]
                 let t0 = std::time::Instant::now();
                 if use_metal_norm {
-                    let w = self.tensor_f16(&ffn_norm_name)?;
+                    let w = self.tensor_f16(ffn_norm_name)?;
                     let w_ptr = w.as_ptr();
                     let w_len = w.len();
                     let w = unsafe { std::slice::from_raw_parts(w_ptr, w_len) };
                     let ck = format!("llama.layer.{layer}.mlp_norm");
                     self.metal_ops.as_ref().unwrap()
-                        .rms_norm_f16w(&x, &w, cfg.rms_norm_eps, false, &ck, &mut mlp_in)
+                        .rms_norm_f16w(&x, &w, eps, false, &ck, &mut mlp_in)
                         .map_err(|e| CoreError::Backend(e.to_string()))?;
                 } else {
-                    self.rmsnorm_weight(&ffn_norm_name, &mut post_norm_w)?;
-                    rms_norm_f32(&x, &post_norm_w, cfg.rms_norm_eps, &mut mlp_in);
+                    // Use cached norm weights
+                    if let Some(cached_w) = self.cached_norm_weights.get(ffn_norm_name) {
+                        post_norm_w.copy_from_slice(cached_w);
+                    } else {
+                        self.rmsnorm_weight(ffn_norm_name, &mut post_norm_w)?;
+                    }
+                    rms_norm_f32(&x, &post_norm_w, eps, &mut mlp_in);
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
@@ -1086,8 +1187,8 @@ impl LlamaRunner {
                 // MLP: gate_proj + up_proj -> silu(gate)*up -> down_proj
                 #[cfg(not(target_arch = "wasm32"))]
                 let t0 = std::time::Instant::now();
-                self.linear_f16_out_in(&mlp_in, &gate_name, cfg.intermediate_size, hidden, &mut gate)?;
-                self.linear_f16_out_in(&mlp_in, &up_name, cfg.intermediate_size, hidden, &mut up)?;
+                self.linear_f16_out_in(&mlp_in, gate_name, inter, hidden, &mut gate)?;
+                self.linear_f16_out_in(&mlp_in, up_name, inter, hidden, &mut up)?;
 
                 // silu(gate) in-place: x * sigmoid(x)
                 for g in gate.iter_mut() {
@@ -1098,7 +1199,7 @@ impl LlamaRunner {
                     gate[i] *= up[i];
                 }
 
-                self.linear_f16_out_in(&gate, &down_name, hidden, cfg.intermediate_size, &mut down)?;
+                self.linear_f16_out_in(&gate, down_name, hidden, inter, &mut down)?;
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     t_linear_ns += t0.elapsed().as_nanos() as u64;
@@ -1605,6 +1706,25 @@ impl LlamaRunner {
                 let s = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
                 cellm_kernels::cpu_kernels::matmul_i4_f32(w, s, out_dim, in_dim, in_dim, x, out);
             }
+            "u32" => {
+                // BASE/MLX-style unsigned affine Q4 with per-group f32
+                // scales and biases. The packed bytes are consumed directly;
+                // their u32 dtype records the established affine-i4 convention.
+                let w = self.tensor_u8_by_exact_name(&resolved)?;
+                let base = resolved.strip_suffix(".weight").unwrap_or(&resolved);
+                let scales = self.tensor_f32(&format!("{base}.scales"))?;
+                let biases = self.tensor_f32(&format!("{base}.biases"))?;
+                let groups_per_row = scales.len() / out_dim;
+                if groups_per_row == 0 || scales.len() != biases.len() {
+                    return Err(CoreError::Backend(format!(
+                        "invalid affine-i4 parameters for {weight_name}"
+                    )));
+                }
+                let group_size = in_dim.div_ceil(groups_per_row);
+                cellm_kernels::cpu_kernels::matmul_affine_i4_f32(
+                    w, &scales, &biases, out_dim, in_dim, group_size, x, out,
+                );
+            }
             other => {
                 return Err(CoreError::Backend(format!(
                     "unsupported weight dtype for {weight_name}: {other}"
@@ -1785,4 +1905,52 @@ fn detect_llama_prefix(file: &CellmFile) -> Result<String, CoreError> {
     Err(CoreError::Backend(
         "missing required llama tensors: model.embed_tokens.weight/model.norm.weight".into(),
     ))
+}
+
+/// Precompute RoPE inverse frequencies with optional llama3-style scaling.
+/// Returns empty vec if no scaling is needed.
+pub fn compute_inv_freqs(
+    head_dim: usize,
+    rope_theta: f32,
+    rope_scaling_type: &Option<String>,
+    rope_scaling_factor: Option<f32>,
+    original_max_position_embeddings: Option<usize>,
+    low_freq_factor: Option<f32>,
+    high_freq_factor: Option<f32>,
+) -> Vec<f32> {
+    let needs_scaling = rope_scaling_type
+        .as_deref()
+        .map(|t| t == "llama3")
+        .unwrap_or(false);
+
+    if !needs_scaling {
+        return Vec::new();
+    }
+
+    let factor = rope_scaling_factor.unwrap_or(1.0);
+    let original_max = original_max_position_embeddings.unwrap_or(8192) as f32;
+    let low_freq = low_freq_factor.unwrap_or(1.0);
+    let high_freq = high_freq_factor.unwrap_or(4.0);
+    let low_freq_wavelen = original_max / low_freq;
+    let high_freq_wavelen = original_max / high_freq;
+
+    let half = head_dim / 2;
+    let mut inv_freqs = Vec::with_capacity(half);
+    for i in 0..half {
+        let inv_freq = rope_theta.powf(-(2.0 * i as f32) / head_dim as f32);
+        let wavelen = std::f32::consts::TAU / inv_freq;
+        let scaled = if wavelen < high_freq_wavelen {
+            // High frequency: don't scale
+            inv_freq
+        } else if wavelen > low_freq_wavelen {
+            // Low frequency: scale by factor
+            inv_freq / factor
+        } else {
+            // Transition: smooth interpolation
+            let smooth = (original_max / wavelen - low_freq) / (high_freq - low_freq);
+            (1.0 - smooth) * inv_freq / factor + smooth * inv_freq
+        };
+        inv_freqs.push(scaled);
+    }
+    inv_freqs
 }

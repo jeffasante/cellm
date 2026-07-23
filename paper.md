@@ -25,7 +25,7 @@ cargo build --release -p cellm-sdk -p vlm-smoke
   --prompt "what's twitch.com?" \
   --chat --gen 100 --backend cpu
 
-  
+
 # CPU — long philosophical (f16)
 ./target/release/infer \
   --model models/to-huggingface/qwen2.5-0.5b-int8-v1/qwen2.5-0.5b-int8-v1.cellm \
@@ -136,7 +136,7 @@ Hi Sarah, hope you’re doing well. We met at Accra Tech Summit, and I realized 
 
 Rewrite the base draft." \
   --chat --gen 100 --backend metal
-  
+
 ```
 ---
 
@@ -152,7 +152,7 @@ Rewrite the base draft." \
 
 Qwen3 uses a non-standard attention architecture where `hidden_size != n_heads * head_dim`. For Qwen3-0.6B:
 - hidden_size = 1024
-- n_heads = 16, head_dim = 128  
+- n_heads = 16, head_dim = 128
 - attn_dim = 2048 (separate from hidden)
 
 ### Convert from HuggingFace
@@ -164,7 +164,7 @@ cargo run --release --bin convert -- \
   --output models/Qwen3-0.6B.cellm \
   --dtype f16
 
-# Convert with int4 quantization  
+# Convert with int4 quantization
 cargo run --release --bin convert -- \
   --input models/Qwen3-0.6B \
   --output models/Qwen3-0.6B-int4.cellm \
@@ -289,8 +289,17 @@ Qwen3-0.6B-int4.cellm (old int4)	Garbage (pre-fix)
     --model models/to-huggingface/smollm2-360m-q1-v1/smollm2-360m-int8-v1.cellm \
     --tokenizer models/to-huggingface/smollm2-360m-q1-v1/tokenizer.json \
     --prompt "what's sycophancy?" \
-    --chat --gen 100 
-    
+    --chat --gen 100
+
+
+
+
+
+
+
+
+
+
     --temperature 0 --backend cpu --kv-encoding f16
 
 # Metal
@@ -438,16 +447,16 @@ CELLM_VLM_DEBUG_FEATURE_STATS=1 ./target/release/vlm-direct \
   --image models/test_images/bird.jpg \
   --prompt "What is in this image?" \
   --backend cpu --tokens 16
-  
-  
+
+
   MODEL=models/to-huggingface/gemma-4-E2B-it-int4-aggr-v2/gemma-4-E2B-it-int4-aggr-v2.cellm
-  
+
   ./target/release/vlm-direct \
     --model "$MODEL" \
     --image models/test_images/bird.jpg \
     --prompt "What is in this image?" \
     --backend metal --tokens 16
-    
+
 
 
 
@@ -655,7 +664,7 @@ The 4-bit quantized model () is approximately **356MB**, fitting well within the
 
 Qwen3 uses a non-standard attention architecture where `hidden_size != n_heads * head_dim`. For Qwen3-0.6B:
 - hidden_size = 1024
-- n_heads = 16, head_dim = 128  
+- n_heads = 16, head_dim = 128
 - attn_dim = 2048 (separate from hidden)
 
 ### Convert from HuggingFace
@@ -667,7 +676,7 @@ cargo run --release --bin convert -- \
   --output models/Qwen3-0.6B.cellm \
   --dtype f16
 
-# Convert with int4 quantization  
+# Convert with int4 quantization
 cargo run --release --bin convert -- \
   --input models/Qwen3-0.6B \
   --output models/Qwen3-0.6B-int4.cellm \
@@ -748,6 +757,8 @@ python3 tools/convert_lfm.py models/LFM2.5-350M-MLX-4bit models/to-huggingface/l
   --tokens 32 --backend cpu
 ```
 
+
+
 ```bash
 ./target/release/infer \
   --model models/to-huggingface/lfm2.5-350m-v1/lfm2.5-350m-v1.cellm \
@@ -761,6 +772,24 @@ python3 tools/convert_lfm.py models/LFM2.5-350M-MLX-4bit models/to-huggingface/l
 
 ```bash
 ./target/release/infer \
+  --model models/to-huggingface/LFM2.5-230M/LFM2.5-230M.cellm \
+  --tokenizer models/to-huggingface/LFM2.5-230M/tokenizer.json \
+  --prompt "What is consciousness? in one paragraph" \
+  --gen 100 --backend cpu
+
+#
+  ./target/release/infer \
+  --model models/to-huggingface/LFM2.5-230M/LFM2.5-230M-int4-v2.cellm \
+  --tokenizer models/to-huggingface/LFM2.5-230M/tokenizer.json \
+  --prompt "What is consciousness? in one paragraph" \
+  --gen 300 --backend cpu
+
+  ---
+Consciousness refers to the ability of an individual to be aware of their thoughts, feelings, and surroundings. It is a fundamental aspect of human experience that allows us to navigate our daily lives with ease.
+```
+
+```bash
+./target/release/infer \
   --model models/to-huggingface/lfm2.5-350m-v1/lfm2.5-350m-v1.cellm \
   --tokenizer models/to-huggingface/lfm2.5-350m-v1/tokenizer.json \
   --prompt "What is consciousness? in one paragraph" \
@@ -769,7 +798,6 @@ python3 tools/convert_lfm.py models/LFM2.5-350M-MLX-4bit models/to-huggingface/l
   ---
 Consciousness refers to the ability of an individual to be aware of their thoughts, feelings, and surroundings. It is a fundamental aspect of human experience that allows us to navigate our daily lives with ease.
 ```
-
 
 ```bash
 ./target/release/infer \
@@ -828,6 +856,20 @@ Rewrite the base draft." \
 - CPU speed: ~15 tok/s (Apple Silicon)
 - Metal: not implemented for LFM2 runner (passes --backend metal silently falls back to CPU)
 
+
+
+## Qwen3.0
+
+```bash
+./target/release/infer \
+  --model models/to-huggingface/qwen3-0.6b-v1/qwen3-0.6b-int8.cellm \
+  --tokenizer models/to-huggingface/qwen3-0.6b-v1/tokenizer.json \
+  --prompt "whats the weather like in Accra?" \
+  --gen 64  --backend cpu
+```
+
+
+
 ## Qwen3.5-0.8B
 
 ### Download
@@ -871,6 +913,39 @@ hf download Qwen/Qwen3.5-0.8B --local-dir models/hf/qwen3.5-0.8b
 ```
 
 
+
+```bash
+./target/release/infer \
+  --model models/to-huggingface/qwen3-0.6b-v1/qwen3-0.6b-int8.cellm \
+  --tokenizer models/to-huggingface/qwen3-0.6b-v1/tokenizer.json \
+  --prompt "Hello, who are you?" \
+  --chat --chat-format auto \
+  --gen 64 --temperature 0 --backend cpu --kv-encoding f16
+```
+
+
+```bash
+# CPU
+./target/release/infer \
+  --model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-q1.cellm \
+  --tokenizer models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
+  --prompt "who owns twitch?" \
+  --gen 64 --backend cpu
+```
+
+
+```bash
+# CPU
+./target/release/infer \
+  --model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-q1.cellm \
+  --tokenizer models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
+  --prompt "Hello, who are you?" \
+  --chat --chat-format auto \
+  --gen 64 --temperature 0 --backend cpu --kv-encoding f16
+```
+
+
+
 ```bash
 # metal
 ./target/release/infer \
@@ -901,7 +976,7 @@ hf download Qwen/Qwen3.5-0.8B --local-dir models/hf/qwen3.5-0.8b
   --tokenizer models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
   --prompt "Hello, who are you?" \
   --chat --chat-format auto \
-  --gen 64 --backend cpu  
+  --gen 64 --backend cpu
 ```
 
 
@@ -912,11 +987,30 @@ hf download Qwen/Qwen3.5-0.8B --local-dir models/hf/qwen3.5-0.8b
   --prompt "What is 2+2?" --chat --chat-format auto --gen 100 --backend cpu
 
 # Skip thinking
-./target/release/infer --model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-i4.cellm \ --tokenizer  models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
+./target/release/infer \
+  --model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-i4.cellm \
+  --tokenizer models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
   --prompt "What is 2+2?" --chat --chat-format auto --gen 50 --backend cpu --no-think
 
 
 ```
+
+
+```bash
+# Default: thinking enabled
+./target/release/infer \
+  --model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-q1.cellm \
+  --tokenizer models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
+  --prompt "What is 2+2?" --chat --chat-format auto --gen 100 --backend cpu
+
+# Skip thinking
+./target/release/infer --model models/to-huggingface/qwen3.5-0.8b-v1/qwen3.5-0.8b-q1.cellm \ --tokenizer  models/to-huggingface/qwen3.5-0.8b-v1/tokenizer.json \
+  --prompt "What is 2+2?" --chat --chat-format auto --gen 50 --backend cpu --no-think
+
+
+```
+
+
 
 ```bash
 # METAL
@@ -1041,3 +1135,41 @@ DeepSeek-V4 introduces a high-efficiency architecture featuring:
 - Current runner implementation is CPU-only.
 - Supports MLA with Sinkhorn normalization and MoE expert routing.
 - Optimized for large-scale efficient inference.
+------
+
+## Llama 3.2 3B Instruct Q4 (`.base` to `.cellm`)
+
+### Overview
+
+The BaseRT `base_q4` source uses asymmetric group-wise quantization with groups of 64 values:
+
+```text
+weight = q_unsigned * scale + bias
+```
+
+For this model, scales and biases are stored as `bf16` in row-major group order. The `.base` weights blob begins at the first 64 KiB boundary after the JSON header. Llama 3.2 also requires `llama3` RoPE scaling (`factor=32`, original context 8192, low/high frequency factors 1/4). BaseRT's fixed Q/K permutation uses interleaved (adjacent-pair) rotary layout; the converter records this in the cellm header.
+
+### Convert
+
+```sh
+python3 tools/convert_base_to_cellm.py \
+  --input models/gguf/Llama-3.2-3B-Instruct-Q4.base \
+  --output models/Llama-3.2-3B-Instruct-Q4-affine-v1.cellm \
+  --tokenizer models/Llama-3.2-3B-Instruct \
+  --quantize affine-i4
+```
+
+The resulting model contains 646 tensors and is 2,550,044,032 bytes (2.37 GiB). Embeddings and normalization weights remain `f16`; projection matrices preserve the source unsigned affine Q4 nibbles plus per-group `f32` scales and biases. Do not use row-wise symmetric `i4` for this already-quantized source: collapsing each row's group parameters causes severe quality loss.
+
+### Inference (CPU)
+
+```sh
+./target/release/infer \
+  --model models/Llama-3.2-3B-Instruct-Q4-affine-v1.cellm \
+  --tokenizer models/Llama-3.2-3B-Instruct/tokenizer.json \
+  --prompt "What is the capital of France?" --chat \
+  --gen 32 --temperature 0 --top-k 1 --repeat-penalty 1.0 \
+  --backend cpu --kv-encoding f16
+```
+
+`--chat --chat-format auto` detects the embedded Llama 3 template, and generation stops on `<|eot_id|>`/`<|eom_id|>`. Validated CPU output: `The capital of France is Paris.`

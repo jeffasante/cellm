@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "baseline_id": "llama-3.2-3b-instruct-q4-affine-v1",
+  "artifact": {
+    "path": "models/Llama-3.2-3B-Instruct-Q4-affine-v1.cellm",
+    "sha256": "f408ba787161090b5a9e0aa02248655fd81d8f256f8198cc767add9f3a8ffcad",
+    "expected_file_size": 2550044032,
+    "format": "cellm",
+    "format_version": 1,
+    "tensor_count": 646,
+    "tensor_dtype_counts": {
+      "f16": 58,
+      "f32": 392,
+      "u32": 196
+    }
+  },
+  "source_model": {
+    "path": "models/gguf/Llama-3.2-3B-Instruct-Q4.base",
+    "sha256": "20c803b2eeee70a7dada67ca0ee2d75081d95d0e35bac27d1857f9e3fdd84615",
+    "expected_file_size": 2380601344,
+    "format": "base",
+    "format_version": 1,
+    "source_checkpoint": "src-Llama-3.2-3B-Instruct"
+  },
+  "tokenizer": {
+    "path": "models/Llama-3.2-3B-Instruct/tokenizer.json",
+    "sha256": "6b918bc5f3f1c33371d5ac45a53d565a737a7ff1bdf3a8b8055e09eec6a25ff4",
+    "config_path": "models/Llama-3.2-3B-Instruct/tokenizer_config.json",
+    "config_sha256": "00e9df46f6d2f18d1e44fa2741634f04603ec16a64b5062f7505ebf1700880ff",
+    "chat_template": "llama3",
+    "chat_template_markers": [
+      "<|start_header_id|>",
+      "<|end_header_id|>",
+      "<|eot_id|>"
+    ]
+  },
+  "conversion": {
+    "timestamp_utc": "2026-07-22T23:43:30Z",
+    "command": "python3 tools/convert_base_to_cellm.py --input models/gguf/Llama-3.2-3B-Instruct-Q4.base --output models/Llama-3.2-3B-Instruct-Q4-affine-v1.cellm --tokenizer models/Llama-3.2-3B-Instruct --quantize affine-i4",
+    "quantization_scheme": "unsigned-affine-i4",
+    "group_size": 64,
+    "dequantization_formula": "value = q_unsigned * scale + bias",
+    "converter_path": "tools/convert_base_to_cellm.py",
+    "converter_sha256": "0f5395839bc9f8136de6913f99cf09059cb15e48b840ed52490ac6813b521d79",
+        "converter_commit": "fd47a71b7cafd102a0fc31003a609225a378cb5a",
+    "working_tree_dirty": true
+  },
+  "runtime": {
+    "commit": "fd47a71b7cafd102a0fc31003a609225a378cb5a",
+    "working_tree_dirty": true,
+    "source_sha256": {
+      "crates/cellm-model/src/llama.rs": "d5226ae8915bde650107880421eaa572995b5b0d1ac3430404bd2470c8f8328d",
+      "crates/cellm-model/src/cellm_file.rs": "4e5697a2c6f77cf867ee4200da2eea040e91c38b9cc0a47140e45aba9757e50d",
+      "crates/cellm-kernels/src/cpu_kernels.rs": "6bfa8440e4e59a151836fad2937f180128872bb00c2c096a468dfe050d5a5c70",
+      "tools/infer/src/main.rs": "bbe18febed0da38bc82f786ca7b91409cccf8cb66f34e07c1c534e24606c108c"
+    }
+  },
+  "model_config": {
+    "architecture": "llama",
+    "layers": 28,
+    "hidden_size": 3072,
+    "intermediate_size": 8192,
+    "attention_heads": 24,
+    "kv_heads": 8,
+    "head_dim": 128,
+    "vocab_size": 128256,
+    "rope_theta": 500000.0,
+    "rope_mode": "interleaved",
+    "rope_scaling": {
+      "type": "llama3",
+      "factor": 32.0,
+      "original_max_position_embeddings": 8192,
+      "low_freq_factor": 1.0,
+      "high_freq_factor": 4.0
+    },
+    "bos_token_id": 128000,
+    "eos_token_id": 128001,
+    "stop_token_ids": {
+      "eom_id": 128008,
+      "eot_id": 128009
+    }
+  },
+  "oracle_fixture": "tests/baselines/llama_3_2_3b_affine_v1_oracle.json"
+}

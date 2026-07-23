@@ -18,6 +18,8 @@ enum ChatFormat {
     Auto,
     /// ChatML-style: <|im_start|>role ... <|im_end|>
     Chatml,
+    /// Llama 3-style: <|start_header_id|>role<|end_header_id|> ... <|eot_id|>
+    Llama3,
     /// Gemma turn-style: <start_of_turn>user ... <end_of_turn>
     Gemma,
     /// Gemma 4 turn-style: <|turn>user ... <turn|>
@@ -137,6 +139,10 @@ struct Args {
     /// Disable thinking/reasoning mode (skip think prefill and strip think blocks from output)
     #[arg(long, default_value_t = false)]
     no_think: bool,
+
+    /// Write deterministic token/logit/stop metadata for baseline regression tests.
+    #[arg(long)]
+    oracle_trace: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -335,6 +341,8 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                 if let Some(tok_path) = args.tokenizer.as_ref() {
                     if tokenizer_config_chatml(tok_path) {
                         ChatFormat::Chatml
+                    } else if tokenizer_config_llama3(tok_path) {
+                        ChatFormat::Llama3
                     } else if tokenizer_config_gemma4_turn(tok_path) {
                         ChatFormat::Gemma4
                     } else if tokenizer_config_gemma_turn(tok_path) {
@@ -464,10 +472,21 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
     } else {
         None
     };
+    let chat_eot = if args.chat && effective_chat_format == ChatFormat::Llama3 {
+        find_token_id_by_substring(&added_token_ids, "eot_id")
+    } else {
+        None
+    };
+    let chat_eom = if args.chat && effective_chat_format == ChatFormat::Llama3 {
+        find_token_id_by_substring(&added_token_ids, "eom_id")
+    } else {
+        None
+    };
     // Prefill.
     let t0 = Instant::now();
     let mut next = 0u32;
     let mut all_ids: Vec<u32> = Vec::new();
+    let mut initial_candidates: Vec<(u32, f32)> = Vec::new();
     for (i, &tok) in prompt_tokens.iter().enumerate() {
         let cand = match &mut runner {
             Runner::Llama(r) => {
@@ -501,6 +520,9 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             Runner::DeepSeekV4(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
         };
         all_ids.push(tok);
+        if initial_candidates.is_empty() {
+            initial_candidates = cand.clone();
+        }
         next = select_next(
             &cand,
             args.temperature,
@@ -521,9 +543,43 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
     let t1 = Instant::now();
     let mut cur = next;
     let mut output_buffer = String::with_capacity(256);
+    let mut generated_text = String::with_capacity(256);
+    let mut generated_ids: Vec<u32> = Vec::with_capacity(args.gen);
+    let mut stop_reason = "token_limit";
     let mut last_flush_step = 0;
 
+    let mut decoded_tokens = 0usize;
     for step in 0..args.gen {
+        if args.stop_eos {
+            let eos = match &runner {
+                Runner::Llama(r) => r.eos_token_id(),
+                Runner::Gemma(r) => r.eos_token_id(),
+                Runner::Qwen(r) => r.eos_token_id(),
+                Runner::Granite(r) => r.eos_token_id(),
+                Runner::Lfm(r) => r.eos_token_id(),
+                Runner::DeepSeekV4(r) => r.eos_token_id(),
+            };
+            if Some(cur) == eos {
+                stop_reason = "eos_token_id";
+                break;
+            }
+            if Some(cur) == chat_eot {
+                stop_reason = "eot_id";
+                break;
+            }
+            if Some(cur) == chat_eom {
+                stop_reason = "eom_id";
+                break;
+            }
+            if Some(cur) == chat_im_end {
+                stop_reason = "im_end";
+                break;
+            }
+            if Some(cur) == chat_im_start {
+                stop_reason = "im_start";
+                break;
+            }
+        }
         let pos = seq + step;
         let cand = match &mut runner {
             Runner::Llama(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
@@ -534,6 +590,8 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             Runner::DeepSeekV4(r) => r.step_topk(cur, pos, &mut page_table, &mut kv_cache, args.top_k)?,
         };
         all_ids.push(cur);
+        generated_ids.push(cur);
+        decoded_tokens += 1;
         if let Some(tok) = tokenizer.as_ref() {
             let mut piece = tok.decode(&[cur], true).unwrap_or_default();
             if piece.is_empty() {
@@ -547,6 +605,7 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             if piece.is_empty() { piece = format!("[ID:{}]", cur); }
 
             // Buffer output and flush periodically to reduce I/O overhead
+            generated_text.push_str(&piece);
             output_buffer.push_str(&piece);
             let should_flush = piece.ends_with(' ') || piece.ends_with('\n') ||
                               piece.ends_with('.') || piece.ends_with(',') ||
@@ -558,32 +617,6 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                 let _ = std::io::stdout().flush();
                 output_buffer.clear();
                 last_flush_step = step;
-            }
-        }
-
-        if args.stop_eos {
-            let eos = match &runner {
-                Runner::Llama(r) => r.eos_token_id(),
-                Runner::Gemma(r) => r.eos_token_id(),
-                Runner::Qwen(r) => r.eos_token_id(),
-                Runner::Granite(r) => r.eos_token_id(),
-                Runner::Lfm(r) => r.eos_token_id(),
-                Runner::DeepSeekV4(r) => r.eos_token_id(),
-            };
-            if let Some(eos) = eos {
-                if cur == eos {
-                    break;
-                }
-            }
-            if let Some(im_end) = chat_im_end {
-                if cur == im_end {
-                    break;
-                }
-            }
-            if let Some(im_start) = chat_im_start {
-                if cur == im_start {
-                    break;
-                }
             }
         }
 
@@ -603,27 +636,47 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
         let _ = std::io::stdout().flush();
     }
 
+    let streamed_any = decoded_tokens > 0;
+
     println!(
         "\nDecode: {} tokens in {:.2}s",
-        args.gen,
+        decoded_tokens,
         t1.elapsed().as_secs_f64()
     );
 
-    if let Some(tok) = tokenizer.as_ref() {
-        let text = if !prompt_tokens.is_empty() && all_ids.len() >= prompt_tokens.len() {
-            tok.decode(&all_ids[prompt_tokens.len()..], true)
-                .unwrap_or_default()
-        } else {
-            tok.decode(&all_ids, true).unwrap_or_default()
-        };
+    let final_text = if let Some(tok) = tokenizer.as_ref() {
+        let text = tok.decode(&generated_ids, true).unwrap_or_default();
         let text = if args.no_think {
             sanitize_assistant_text(&strip_think_blocks(&text))
         } else {
             sanitize_assistant_text(&text)
         };
-        println!();
-        println!("---");
-        println!("{text}");
+        // Only print the decoded text again if we didn't already stream it
+        // token-by-token during decode. This avoids duplicating the output
+        // on the terminal when --prompt/--chat is used with a tokenizer.
+        if !streamed_any {
+            println!();
+            println!("---");
+            println!("{text}");
+        }
+        text
+    } else {
+        generated_text
+    };
+
+    if let Some(trace_path) = args.oracle_trace.as_ref() {
+        let trace = serde_json::json!({
+            "schema_version": 1,
+            "prompt_token_ids": prompt_tokens,
+            "initial_top_logits": initial_candidates.iter().map(|(id, logit)| {
+                serde_json::json!({"token_id": id, "logit": logit})
+            }).collect::<Vec<_>>(),
+            "generated_token_ids": generated_ids,
+            "output_text": final_text,
+            "stop_reason": stop_reason,
+            "stop_token_id": cur,
+        });
+        std::fs::write(trace_path, serde_json::to_vec_pretty(&trace)?)?;
     }
 
     Ok(())
@@ -757,6 +810,18 @@ fn build_prompt_text(
             }
             s
         }
+        ChatFormat::Llama3 => {
+            let mut s = String::new();
+            if !sys.is_empty() {
+                s.push_str("<|start_header_id|>system<|end_header_id|>\n\n");
+                s.push_str(sys);
+                s.push_str("<|eot_id|>");
+            }
+            s.push_str("<|start_header_id|>user<|end_header_id|>\n\n");
+            s.push_str(prompt);
+            s.push_str("<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n");
+            s
+        }
         ChatFormat::Gemma => {
             let user_text = if sys.is_empty() {
                 prompt.to_string()
@@ -784,6 +849,21 @@ fn build_prompt_text(
             _ => format!("User: {prompt}\nAssistant:"),
         },
     }
+}
+
+fn tokenizer_config_llama3(tokenizer_json_path: &std::path::Path) -> bool {
+    let Some(dir) = tokenizer_json_path.parent() else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(dir.join("tokenizer_config.json")) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    v.get("chat_template")
+        .and_then(|x| x.as_str())
+        .is_some_and(|tpl| tpl.contains("start_header_id") && tpl.contains("eot_id"))
 }
 
 fn tokenizer_config_chatml(tokenizer_json_path: &std::path::Path) -> bool {

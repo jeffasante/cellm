@@ -251,27 +251,27 @@ pub fn gemv_i8_f32(
     #[cfg(target_arch = "aarch64")]
     unsafe {
         use std::arch::aarch64::*;
-        
+
         // Process multiple output rows in parallel for better ILP
         let mut row = 0usize;
-        
+
         // Process 4 rows at a time
         while row + 4 <= out_dim {
             let w0 = &weight_i8[row * in_dim..(row + 1) * in_dim];
             let w1 = &weight_i8[(row + 1) * in_dim..(row + 2) * in_dim];
             let w2 = &weight_i8[(row + 2) * in_dim..(row + 3) * in_dim];
             let w3 = &weight_i8[(row + 3) * in_dim..(row + 4) * in_dim];
-            
+
             let s0 = f16::from_bits(scales_f16[row]).to_f32();
             let s1 = f16::from_bits(scales_f16[row + 1]).to_f32();
             let s2 = f16::from_bits(scales_f16[row + 2]).to_f32();
             let s3 = f16::from_bits(scales_f16[row + 3]).to_f32();
-            
+
             let mut acc0 = vdupq_n_f32(0.0);
             let mut acc1 = vdupq_n_f32(0.0);
             let mut acc2 = vdupq_n_f32(0.0);
             let mut acc3 = vdupq_n_f32(0.0);
-            
+
             let mut i = 0usize;
             while i + 16 <= in_dim {
                 // Load input vector (shared across all 4 rows)
@@ -279,7 +279,7 @@ pub fn gemv_i8_f32(
                 let xv1 = vld1q_f32(input.as_ptr().add(i + 4));
                 let xv2 = vld1q_f32(input.as_ptr().add(i + 8));
                 let xv3 = vld1q_f32(input.as_ptr().add(i + 12));
-                
+
                 // Load and process weight row 0
                 let wv0 = vld1q_s8(w0.as_ptr().add(i));
                 let w0_16_low = vmovl_s8(vget_low_s8(wv0));
@@ -292,7 +292,7 @@ pub fn gemv_i8_f32(
                 acc0 = vmlaq_f32(acc0, w0_f1, xv1);
                 acc0 = vmlaq_f32(acc0, w0_f2, xv2);
                 acc0 = vmlaq_f32(acc0, w0_f3, xv3);
-                
+
                 // Load and process weight row 1
                 let wv1 = vld1q_s8(w1.as_ptr().add(i));
                 let w1_16_low = vmovl_s8(vget_low_s8(wv1));
@@ -305,7 +305,7 @@ pub fn gemv_i8_f32(
                 acc1 = vmlaq_f32(acc1, w1_f1, xv1);
                 acc1 = vmlaq_f32(acc1, w1_f2, xv2);
                 acc1 = vmlaq_f32(acc1, w1_f3, xv3);
-                
+
                 // Load and process weight row 2
                 let wv2 = vld1q_s8(w2.as_ptr().add(i));
                 let w2_16_low = vmovl_s8(vget_low_s8(wv2));
@@ -318,7 +318,7 @@ pub fn gemv_i8_f32(
                 acc2 = vmlaq_f32(acc2, w2_f1, xv1);
                 acc2 = vmlaq_f32(acc2, w2_f2, xv2);
                 acc2 = vmlaq_f32(acc2, w2_f3, xv3);
-                
+
                 // Load and process weight row 3
                 let wv3 = vld1q_s8(w3.as_ptr().add(i));
                 let w3_16_low = vmovl_s8(vget_low_s8(wv3));
@@ -331,16 +331,16 @@ pub fn gemv_i8_f32(
                 acc3 = vmlaq_f32(acc3, w3_f1, xv1);
                 acc3 = vmlaq_f32(acc3, w3_f2, xv2);
                 acc3 = vmlaq_f32(acc3, w3_f3, xv3);
-                
+
                 i += 16;
             }
-            
+
             // Reduce and apply scale
             let r0 = vaddvq_f32(acc0) * s0;
             let r1 = vaddvq_f32(acc1) * s1;
             let r2 = vaddvq_f32(acc2) * s2;
             let r3 = vaddvq_f32(acc3) * s3;
-            
+
             // Handle remaining elements
             let mut tail0 = 0.0f32;
             let mut tail1 = 0.0f32;
@@ -354,20 +354,20 @@ pub fn gemv_i8_f32(
                 tail3 += (w3[i] as f32) * x;
                 i += 1;
             }
-            
+
             out[row] = r0 + tail0 * s0;
             out[row + 1] = r1 + tail1 * s1;
             out[row + 2] = r2 + tail2 * s2;
             out[row + 3] = r3 + tail3 * s3;
-            
+
             row += 4;
         }
-        
+
         // Handle remaining rows
         while row < out_dim {
             let w = &weight_i8[row * in_dim..(row + 1) * in_dim];
             let scale = f16::from_bits(scales_f16[row]).to_f32();
-            
+
             let mut acc = vdupq_n_f32(0.0);
             let mut i = 0usize;
             while i + 16 <= in_dim {
@@ -375,7 +375,7 @@ pub fn gemv_i8_f32(
                 let xv1 = vld1q_f32(input.as_ptr().add(i + 4));
                 let xv2 = vld1q_f32(input.as_ptr().add(i + 8));
                 let xv3 = vld1q_f32(input.as_ptr().add(i + 12));
-                
+
                 let wv = vld1q_s8(w.as_ptr().add(i));
                 let w16_low = vmovl_s8(vget_low_s8(wv));
                 let w16_high = vmovl_s8(vget_high_s8(wv));
@@ -383,14 +383,14 @@ pub fn gemv_i8_f32(
                 let wf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16_low)));
                 let wf2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16_high)));
                 let wf3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16_high)));
-                
+
                 acc = vmlaq_f32(acc, wf0, xv0);
                 acc = vmlaq_f32(acc, wf1, xv1);
                 acc = vmlaq_f32(acc, wf2, xv2);
                 acc = vmlaq_f32(acc, wf3, xv3);
                 i += 16;
             }
-            
+
             let mut sum = vaddvq_f32(acc);
             while i < in_dim {
                 sum += (w[i] as f32) * input[i];
@@ -400,7 +400,7 @@ pub fn gemv_i8_f32(
             row += 1;
         }
     }
-    
+
     #[cfg(not(target_arch = "aarch64"))]
     {
         for row in 0..out_dim {
@@ -751,6 +751,47 @@ pub fn matmul_i4_f32(
     });
 }
 
+/// Matrix-vector product for unsigned affine Q4 weights.
+///
+/// Each row stores two 4-bit values per byte. Scales and biases are f32,
+/// row-major per group, and dequantization is `q * scale + bias`.
+pub fn matmul_affine_i4_f32(
+    weights: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    x: &[f32],
+    out: &mut [f32],
+) {
+    debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(out.len(), rows);
+    let groups_per_row = cols.div_ceil(group_size);
+    let packed_per_row = groups_per_row * group_size / 2;
+    debug_assert_eq!(weights.len(), rows * packed_per_row);
+    debug_assert_eq!(scales.len(), rows * groups_per_row);
+    debug_assert_eq!(biases.len(), rows * groups_per_row);
+
+    out.par_iter_mut().enumerate().for_each(|(row_idx, value)| {
+        let packed = &weights[row_idx * packed_per_row..(row_idx + 1) * packed_per_row];
+        let params = row_idx * groups_per_row;
+        let mut dot = 0.0f32;
+        for group in 0..groups_per_row {
+            let start = group * group_size;
+            let end = (start + group_size).min(cols);
+            let scale = scales[params + group];
+            let bias = biases[params + group];
+            for col in start..end {
+                let byte = packed[col / 2];
+                let q = if col % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+                dot += (q as f32 * scale + bias) * x[col];
+            }
+        }
+        *value = dot;
+    });
+}
+
 pub fn softmax_f32_inplace(x: &mut [f32]) {
     if x.is_empty() {
         return;
@@ -806,6 +847,61 @@ pub fn rope_interleaved_inplace_f32(x: &mut [f32], _n_heads: usize, head_dim: us
         for i in 0..half {
             let inv_freq = theta.powf(-(2.0 * i as f32) / head_dim as f32);
             let angle = pos as f32 * inv_freq;
+            let (sin, cos) = angle.sin_cos();
+            let x0 = head[2 * i];
+            let x1 = head[2 * i + 1];
+            head[2 * i] = x0 * cos - x1 * sin;
+            head[2 * i + 1] = x1 * cos + x0 * sin;
+        }
+    });
+}
+
+/// Apply RoPE to a buffer using precomputed inverse frequencies (used for llama3-style scaling).
+pub fn rope_non_interleaved_inplace_f32_with_freqs(
+    x: &mut [f32],
+    _n_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    pos: usize,
+    inv_freqs: &[f32],
+) {
+    let half = rotary_dim / 2;
+    if x.len() < 2048 {
+        for head in x.chunks_exact_mut(head_dim) {
+            for i in 0..half {
+                let angle = pos as f32 * inv_freqs[i];
+                let (sin, cos) = angle.sin_cos();
+                let x0 = head[i];
+                let x1 = head[half + i];
+                head[i] = x0 * cos - x1 * sin;
+                head[half + i] = x1 * cos + x0 * sin;
+            }
+        }
+    } else {
+        x.par_chunks_exact_mut(head_dim).for_each(|head| {
+            for i in 0..half {
+                let angle = pos as f32 * inv_freqs[i];
+                let (sin, cos) = angle.sin_cos();
+                let x0 = head[i];
+                let x1 = head[half + i];
+                head[i] = x0 * cos - x1 * sin;
+                head[half + i] = x1 * cos + x0 * sin;
+            }
+        });
+    }
+}
+
+pub fn rope_interleaved_inplace_f32_with_freqs(
+    x: &mut [f32],
+    _n_heads: usize,
+    head_dim: usize,
+    pos: usize,
+    inv_freqs: &[f32],
+) {
+    let half = head_dim / 2;
+    x.par_chunks_exact_mut(head_dim).for_each(|head| {
+        for i in 0..half {
+            let angle = pos as f32 * inv_freqs[i];
             let (sin, cos) = angle.sin_cos();
             let x0 = head[2 * i];
             let x1 = head[2 * i + 1];

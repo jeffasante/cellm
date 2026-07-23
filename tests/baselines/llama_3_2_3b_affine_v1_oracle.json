@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "prompt": "What is the capital of France?",
+  "inference": {
+    "chat": true,
+    "temperature": 0.0,
+    "top_k": 5,
+    "repeat_penalty": 1.0,
+    "max_new_tokens": 32,
+    "backend": "cpu",
+    "kv_encoding": "f16"
+  },
+  "prompt_token_ids": [
+    128000,
+    128006,
+    882,
+    128007,
+    271,
+    3923,
+    374,
+    279,
+    6864,
+    315,
+    9822,
+    30,
+    128009,
+    128006,
+    78191,
+    128007,
+    271
+  ],
+  "initial_top_logits": [
+    {"token_id": 791, "logit": 26.260526657104492},
+    {"token_id": 60704, "logit": 20.569717407226562},
+    {"token_id": 4897, "logit": 18.140857696533203},
+    {"token_id": 32, "logit": 17.450599670410156},
+    {"token_id": 4368, "logit": 17.393539428710938}
+  ],
+  "generated_token_ids": [791, 6864, 315, 9822, 374, 12366, 13],
+  "output_text": "The capital of France is Paris.",
+  "stop_reason": "eot_id",
+  "stop_token_id": 128009
+}

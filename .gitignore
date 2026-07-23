@@ -33,6 +33,7 @@ cellm.md
 # Large local model artifacts (keep out of git history)
 models/*
 !models/test_images/
+!models/*.manifest.json
 
 
 
@@ -60,3 +61,4 @@ bindings/swift/CellmFFI.xcframework/**/*.dylib
 todos/1.md
 
 research/experimentals
+__pycache__/

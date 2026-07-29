@@ -153,6 +153,9 @@ struct HfConfigRoot {
     // Quantization metadata.
     quantization_config: Option<QuantizationConfig>,
     _quantization: Option<Value>,
+
+    // DeepSeek V4 MoE-specific fields
+    moe_intermediate_size: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -332,7 +335,7 @@ fn main() -> Result<()> {
 
     // LFM models use pre-quantized 4-bit weights with .scales/.biases suffixes - handle them specially
     let is_lfm = selected.model_type == "lfm2" || selected.model_type == "lfm";
-    
+
     if has_4bit_affine && !args.dequant_4bit_affine && !is_lfm {
         anyhow::bail!(
             "input appears to be 4-bit affine quantized (uint32 weights + scales/biases). Re-run with --dequant-4bit-affine to expand weights to f16."
@@ -926,6 +929,7 @@ struct GgufMeta {
     context_length: Option<usize>,
     bos_token_id: Option<u32>,
     eos_token_id: Option<u32>,
+    conv_l_cache: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -1006,9 +1010,23 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
             required_qwen3_tensor_names,
             "blk.0.ffn_gate.weight",
         ),
+        "qwen35" => (
+            "qwen3_5_text",
+            "qwen35",
+            map_gguf_qwen3_tensor_name,
+            required_qwen3_tensor_names,
+            "blk.0.ffn_gate.weight",
+        ),
+        "lfm2" => (
+            "lfm2",
+            "lfm2",
+            map_gguf_lfm2_tensor_name,
+            required_lfm2_tensor_names,
+            "blk.0.ffn_gate.weight",
+        ),
         _ => {
             anyhow::bail!(
-                "GGUF architecture {:?} is not supported yet. Current GGUF conversion path supports llama and gemma4.",
+                "GGUF architecture {:?} is not supported yet. Current GGUF conversion path supports llama, gemma4, qwen3, qwen35, and lfm2.",
                 arch
             );
         }
@@ -1082,11 +1100,11 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
         let mut final_out_nbytes = out_nbytes;
 
         // Keep native 1-bit if no re-quantization is requested
-        if src.ggml_type == 41 
-            && !args.quantize_fp8_e4m3 
-            && !args.quantize_int2_symmetric 
-            && !args.quantize_int4_symmetric 
-            && !args.quantize_int8_symmetric 
+        if src.ggml_type == 41
+            && !args.quantize_fp8_e4m3
+            && !args.quantize_int2_symmetric
+            && !args.quantize_int4_symmetric
+            && !args.quantize_int8_symmetric
         {
             out_tensors.push(GgufOutTensor {
                 src_name: src.name.clone(),
@@ -1185,7 +1203,7 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
         {
             // int4 is packed per row, so odd in_dim needs row-wise ceil(in_dim/2).
             final_out_nbytes = i4_packed_nbytes_for_shape(&shape)?;
-            
+
             // Push the main data tensor
             out_tensors.push(GgufOutTensor {
                 src_name: src.name.clone(),
@@ -1361,6 +1379,23 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
     let rms_norm_eps = parsed.meta.rms_norm_eps.unwrap_or(1e-5);
     let rope_theta = parsed.meta.rope_freq_base.unwrap_or(10000.0);
 
+    // LFM2 blocks alternate between short-convolution and full-attention. The runner reads the
+    // per-layer kind from `source_text_config.layer_types`; without it, it silently falls back to
+    // a hardcoded 16-layer pattern.
+    let source_text_config = if arch == "lfm2" {
+        let layer_types = lfm2_layer_types(&mapped_names, num_layers)?;
+        Some(serde_json::json!({
+            "model_type": "lfm2",
+            "layer_types": layer_types,
+            "conv_L_cache": parsed.meta.conv_l_cache.unwrap_or(3),
+            "conv_dim": hidden_dim,
+            "num_attention_heads": num_heads,
+            "num_key_value_heads": num_kv_heads,
+        }))
+    } else {
+        None
+    };
+
     let tie_word_embeddings = Some(by_src_name.get("output.weight").is_none());
     let source_quantization = Some(serde_json::json!({
         "source_format": "gguf",
@@ -1395,7 +1430,7 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
         source_architectures: Some(vec![arch.clone()]),
         source_quantization,
         source_quantization_config: None,
-        source_text_config: None,
+        source_text_config,
         source_vision_config: None,
         source_projector_config: None,
         tensors: Vec::new(),
@@ -1486,7 +1521,7 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
             .iter()
             .try_fold(1usize, |acc, &d| acc.checked_mul(d))
             .ok_or_else(|| anyhow::anyhow!("numel overflow for {}", p.name))?;
-        
+
         match &p.op {
             TensorOp::CopyAsF16 => {
                 write_gguf_tensor_as_f16(src, p.src_type, numel, &mut w)?;
@@ -1539,7 +1574,7 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
                 write_gguf_tensor_as_f16(src, p.src_type, numel, &mut w)?;
             }
         }
-        
+
         pos += p.out_nbytes as u64;
     }
     w.flush()?;
@@ -1971,6 +2006,97 @@ fn required_llama_tensor_names(num_layers: usize) -> Vec<String> {
     out
 }
 
+/// LFM2 is a hybrid architecture: some blocks are short-convolution blocks and some are
+/// full-attention blocks. Only the tensors shared by both block kinds can be required
+/// unconditionally; the per-kind tensors are validated in `validate_lfm2_layer_tensors`.
+fn required_lfm2_tensor_names(num_layers: usize) -> Vec<String> {
+    let mut out = Vec::with_capacity(2 + num_layers * 5);
+    out.push("model.embed_tokens.weight".to_string());
+    out.push("model.embedding_norm.weight".to_string());
+    for i in 0..num_layers {
+        out.push(format!("model.layers.{i}.operator_norm.weight"));
+        out.push(format!("model.layers.{i}.ffn_norm.weight"));
+        out.push(format!("model.layers.{i}.feed_forward.w1.weight"));
+        out.push(format!("model.layers.{i}.feed_forward.w2.weight"));
+        out.push(format!("model.layers.{i}.feed_forward.w3.weight"));
+    }
+    out
+}
+
+/// Classify each LFM2 block as `conv` or `full_attention` from the tensors actually present,
+/// and verify that every block has the complete tensor set for its kind.
+fn lfm2_layer_types(
+    mapped_names: &std::collections::HashSet<&str>,
+    num_layers: usize,
+) -> Result<Vec<String>> {
+    let mut types = Vec::with_capacity(num_layers);
+    for i in 0..num_layers {
+        let has_attn = mapped_names.contains(format!("model.layers.{i}.self_attn.q_proj.weight").as_str());
+        let has_conv = mapped_names.contains(format!("model.layers.{i}.conv.conv.weight").as_str());
+        let required: &[&str] = if has_attn && !has_conv {
+            &["self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.out_proj.weight"]
+        } else if has_conv && !has_attn {
+            &["conv.conv.weight", "conv.in_proj.weight", "conv.out_proj.weight"]
+        } else {
+            anyhow::bail!(
+                "lfm2 layer {} is neither a pure conv block nor a pure attention block \
+                 (has_attn={}, has_conv={})",
+                i,
+                has_attn,
+                has_conv
+            );
+        };
+        for suffix in required {
+            let name = format!("model.layers.{i}.{suffix}");
+            if !mapped_names.contains(name.as_str()) {
+                anyhow::bail!("lfm2 layer {} is missing required tensor {}", i, name);
+            }
+        }
+        types.push(if has_attn { "full_attention".to_string() } else { "conv".to_string() });
+    }
+    Ok(types)
+}
+
+fn map_gguf_lfm2_tensor_name(name: &str) -> Option<(String, bool, Option<usize>)> {
+    match name {
+        "token_embd.weight" => return Some(("model.embed_tokens.weight".to_string(), true, None)),
+        "token_embd_norm.weight" => {
+            return Some(("model.embedding_norm.weight".to_string(), false, None))
+        }
+        _ => {}
+    }
+    let rest = name.strip_prefix("blk.")?;
+    let (layer_s, suffix) = rest.split_once('.')?;
+    let layer_idx: usize = layer_s.parse().ok()?;
+    let mapped = match suffix {
+        // Norm applied before the mixing operator (conv or attention).
+        "attn_norm.weight" => ("operator_norm.weight", false),
+        "ffn_norm.weight" => ("ffn_norm.weight", false),
+        // SwiGLU MLP: gate -> w1, down -> w2, up -> w3.
+        "ffn_gate.weight" => ("feed_forward.w1.weight", true),
+        "ffn_down.weight" => ("feed_forward.w2.weight", true),
+        "ffn_up.weight" => ("feed_forward.w3.weight", true),
+        // Short-convolution blocks. The depthwise kernel is stored [kernel, hidden] in GGUF
+        // and must be transposed to [hidden, kernel] for the runner.
+        "shortconv.conv.weight" => ("conv.conv.weight", true),
+        "shortconv.in_proj.weight" => ("conv.in_proj.weight", true),
+        "shortconv.out_proj.weight" => ("conv.out_proj.weight", true),
+        // Full-attention blocks. Note the runner uses `out_proj`, not `o_proj`.
+        "attn_q.weight" => ("self_attn.q_proj.weight", true),
+        "attn_k.weight" => ("self_attn.k_proj.weight", true),
+        "attn_v.weight" => ("self_attn.v_proj.weight", true),
+        "attn_output.weight" => ("self_attn.out_proj.weight", true),
+        "attn_q_norm.weight" => ("self_attn.q_layernorm.weight", false),
+        "attn_k_norm.weight" => ("self_attn.k_layernorm.weight", false),
+        _ => return None,
+    };
+    Some((
+        format!("model.layers.{layer_idx}.{}", mapped.0),
+        mapped.1,
+        Some(layer_idx),
+    ))
+}
+
 fn required_gemma_tensor_names(num_layers: usize) -> Vec<String> {
     let mut out = Vec::with_capacity(2 + num_layers * 13);
     out.push("model.embed_tokens.weight".to_string());
@@ -2012,22 +2138,20 @@ fn required_qwen3_tensor_names(num_layers: usize) -> Vec<String> {
         "model.embed_tokens.weight".to_string(),
         "model.norm.weight".to_string(),
     ];
-    // Qwen3 often has an explicit lm_head. If missing, it's tied.
-    // We add it to required if it's there? No, we need a better way.
-    // For now, let's assume standard llama-like.
     for i in 0..num_layers {
         out.push(format!("model.layers.{i}.input_layernorm.weight"));
-        out.push(format!("model.layers.{i}.self_attn.q_proj.weight"));
-        out.push(format!("model.layers.{i}.self_attn.k_proj.weight"));
-        out.push(format!("model.layers.{i}.self_attn.v_proj.weight"));
+        out.push(format!("model.layers.{i}.self_attn.qkv_proj.weight"));
         out.push(format!("model.layers.{i}.self_attn.o_proj.weight"));
         out.push(format!("model.layers.{i}.mlp.gate_proj.weight"));
         out.push(format!("model.layers.{i}.mlp.up_proj.weight"));
         out.push(format!("model.layers.{i}.mlp.down_proj.weight"));
         out.push(format!("model.layers.{i}.post_attention_layernorm.weight"));
-        // Optional: q_norm, k_norm, post_attention_layernorm etc.
-        // We handle optionality by checking what's mapped later.
+        out.push(format!("model.layers.{i}.ssm_conv1d.weight"));
+        out.push(format!("model.layers.{i}.ssm_conv_kernel.weight"));
+        out.push(format!("model.layers.{i}.ssm_a"));
+        out.push(format!("model.layers.{i}.ssm_dt.weight"));
     }
+    out.push("lm_head.weight".to_string());
     out
 }
 
@@ -2045,9 +2169,8 @@ fn map_gguf_qwen3_tensor_name(name: &str) -> Option<(String, bool, Option<usize>
     let layer_idx: usize = layer_s.parse().ok()?;
     let mapped = match suffix {
         "attn_norm.weight" => ("input_layernorm.weight", false),
-        "attn_q.weight" => ("self_attn.q_proj.weight", true),
-        "attn_k.weight" => ("self_attn.k_proj.weight", true),
-        "attn_v.weight" => ("self_attn.v_proj.weight", true),
+        "attn_qkv.weight" => ("self_attn.qkv_proj.weight", true),
+        "attn_output.weight" => ("self_attn.o_proj.weight", true),
         "attn_output.weight" => ("self_attn.o_proj.weight", true),
         "attn_q_norm.weight" => ("self_attn.q_norm.weight", false),
         "attn_k_norm.weight" => ("self_attn.k_norm.weight", false),
@@ -2055,6 +2178,10 @@ fn map_gguf_qwen3_tensor_name(name: &str) -> Option<(String, bool, Option<usize>
         "ffn_gate.weight" => ("mlp.gate_proj.weight", true),
         "ffn_up.weight" => ("mlp.up_proj.weight", true),
         "ffn_down.weight" => ("mlp.down_proj.weight", true),
+        "ssm_conv1d.weight" => ("ssm_conv1d.weight", true),
+        "ssm_dt.bias" => ("ssm_dt.weight", false),
+        "ssm_a" => ("ssm_a", false),
+        "ssm_conv_kernel" => ("ssm_conv_kernel.weight", false),
         _ => return None,
     };
     Some((
@@ -2079,14 +2206,17 @@ fn map_gguf_llama_tensor_name(name: &str) -> Option<(String, bool, Option<usize>
     let layer_idx: usize = layer_s.parse().ok()?;
     let mapped = match suffix {
         "attn_norm.weight" => ("input_layernorm.weight", false),
-        "attn_q.weight" => ("self_attn.q_proj.weight", true),
-        "attn_k.weight" => ("self_attn.k_proj.weight", true),
-        "attn_v.weight" => ("self_attn.v_proj.weight", true),
+        "attn_qkv.weight" => ("self_attn.qkv_proj.weight", true),
+        "attn_output.weight" => ("self_attn.o_proj.weight", true),
         "attn_output.weight" => ("self_attn.o_proj.weight", true),
         "ffn_norm.weight" => ("post_attention_layernorm.weight", false),
         "ffn_gate.weight" => ("mlp.gate_proj.weight", true),
         "ffn_up.weight" => ("mlp.up_proj.weight", true),
         "ffn_down.weight" => ("mlp.down_proj.weight", true),
+        "ssm_conv1d.weight" => ("ssm_conv1d.weight", true),
+        "ssm_dt.bias" => ("ssm_dt.weight", false),
+        "ssm_a" => ("ssm_a", false),
+        "ssm_conv_kernel" => ("ssm_conv_kernel.weight", false),
         _ => return None,
     };
     Some((
@@ -2119,9 +2249,8 @@ fn map_gguf_gemma4_tensor_name(name: &str) -> Option<(String, bool, Option<usize
     let layer_idx: usize = layer_s.parse().ok()?;
     let mapped = match suffix {
         "attn_norm.weight" => ("input_layernorm.weight", false),
-        "attn_q.weight" => ("self_attn.q_proj.weight", true),
-        "attn_k.weight" => ("self_attn.k_proj.weight", true),
-        "attn_v.weight" => ("self_attn.v_proj.weight", true),
+        "attn_qkv.weight" => ("self_attn.qkv_proj.weight", true),
+        "attn_output.weight" => ("self_attn.o_proj.weight", true),
         "attn_output.weight" => ("self_attn.o_proj.weight", true),
         "attn_q_norm.weight" => ("self_attn.q_norm.weight", false),
         "attn_k_norm.weight" => ("self_attn.k_norm.weight", false),
@@ -2169,31 +2298,41 @@ fn parse_gguf(bytes: &[u8]) -> Result<ParsedGguf> {
                 meta.quant_version = Some(read_gguf_u64_typed(&mut c, t)?)
             }
             "general.alignment" => meta.alignment = Some(read_gguf_u64_typed(&mut c, t)?),
-            "llama.vocab_size" | "gemma4.vocab_size" | "qwen3.vocab_size" => {
+            "llama.vocab_size" | "gemma4.vocab_size" | "qwen3.vocab_size" | "qwen35.vocab_size" | "lfm2.vocab_size" => {
                 meta.vocab_size = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
-            "llama.embedding_length" | "gemma4.embedding_length" | "qwen3.embedding_length" => {
+            "llama.embedding_length" | "gemma4.embedding_length" | "qwen3.embedding_length" | "qwen35.embedding_length" | "lfm2.embedding_length" => {
                 meta.embedding_length = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
-            "llama.block_count" | "gemma4.block_count" | "qwen3.block_count" => {
+            "llama.block_count" | "gemma4.block_count" | "qwen3.block_count" | "qwen35.block_count" | "lfm2.block_count" => {
                 meta.block_count = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
-            "llama.feed_forward_length" | "gemma4.feed_forward_length" | "qwen3.feed_forward_length" => {
+            "llama.feed_forward_length" | "gemma4.feed_forward_length" | "qwen3.feed_forward_length" | "qwen35.feed_forward_length" | "lfm2.feed_forward_length" => {
                 meta.feed_forward_length = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
-            "llama.attention.head_count" | "gemma4.attention.head_count" | "qwen3.attention.head_count" => {
+            "llama.attention.head_count" | "gemma4.attention.head_count" | "qwen3.attention.head_count" | "qwen35.attention.head_count" | "lfm2.attention.head_count" => {
                 meta.head_count = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
-            "llama.attention.head_count_kv" | "gemma4.attention.head_count_kv" | "qwen3.attention.head_count_kv" => {
+            // Hybrid architectures (LFM2) publish head_count_kv as a per-layer array where
+            // non-attention layers are 0. Collapse to the single non-zero attention value.
+            "lfm2.attention.head_count_kv" => {
+                meta.head_count_kv = Some(read_gguf_u64_max_typed(&mut c, t)? as usize)
+            }
+            "llama.attention.head_count_kv" | "gemma4.attention.head_count_kv" | "qwen3.attention.head_count_kv" | "qwen35.attention.head_count_kv" => {
                 meta.head_count_kv = Some(read_gguf_u64_typed(&mut c, t)? as usize)
+            }
+            "lfm2.shortconv.l_cache" => {
+                meta.conv_l_cache = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
             "llama.attention.layer_norm_rms_epsilon"
             | "gemma4.attention.layer_norm_rms_epsilon"
-            | "qwen3.attention.layer_norm_rms_epsilon" => meta.rms_norm_eps = Some(read_gguf_f32_typed(&mut c, t)?),
-            "llama.rope.freq_base" | "gemma4.rope.freq_base" | "qwen3.rope.freq_base" => {
+            | "qwen3.attention.layer_norm_rms_epsilon"
+            | "qwen35.attention.layer_norm_rms_epsilon"
+            | "lfm2.attention.layer_norm_rms_epsilon" => meta.rms_norm_eps = Some(read_gguf_f32_typed(&mut c, t)?),
+            "llama.rope.freq_base" | "gemma4.rope.freq_base" | "qwen3.rope.freq_base" | "qwen35.rope.freq_base" | "lfm2.rope.freq_base" => {
                 meta.rope_freq_base = Some(read_gguf_f32_typed(&mut c, t)?)
             }
-            "llama.context_length" | "gemma4.context_length" | "qwen3.context_length" => {
+            "llama.context_length" | "gemma4.context_length" | "qwen3.context_length" | "qwen35.context_length" | "lfm2.context_length" => {
                 meta.context_length = Some(read_gguf_u64_typed(&mut c, t)? as usize)
             }
             "tokenizer.ggml.bos_token_id" => {
@@ -2278,6 +2417,24 @@ fn read_gguf_u64_typed(c: &mut GgufCursor<'_>, t: u32) -> Result<u64> {
         11 => Ok(c.read_i64()? as u64),
         other => anyhow::bail!("expected GGUF integer scalar, got type={}", other),
     }
+}
+
+/// Like `read_gguf_u64_typed`, but for arrays returns the maximum element instead of the first.
+/// Hybrid models encode per-layer values with 0 for layers that do not use the feature.
+fn read_gguf_u64_max_typed(c: &mut GgufCursor<'_>, t: u32) -> Result<u64> {
+    if t != 9 {
+        return read_gguf_u64_typed(c, t);
+    }
+    let elem_t = c.read_u32()?;
+    let n = c.read_u64()? as usize;
+    if n == 0 {
+        anyhow::bail!("expected non-empty GGUF numeric array, got empty array");
+    }
+    let mut max = 0u64;
+    for _ in 0..n {
+        max = max.max(read_gguf_u64_typed(c, elem_t)?);
+    }
+    Ok(max)
 }
 
 fn read_gguf_f32_typed(c: &mut GgufCursor<'_>, t: u32) -> Result<f32> {
@@ -2437,12 +2594,14 @@ fn dequant_q4_0_to_f16<W: Write>(src: &[u8], numel: usize, w: &mut W) -> Result<
         let off = bi * bs;
         let d = f16::from_bits(u16::from_le_bytes([src[off], src[off + 1]])).to_f32();
         let qbytes = &src[off + 2..off + bs];
+        // ggml packs Q4_0 split-half, not interleaved: byte i holds element i in its low
+        // nibble and element i + qk/2 in its high nibble.
         for i in 0..16 {
             let b = qbytes[i];
             let q0 = (b & 0x0F) as i32 - 8;
             let q1 = (b >> 4) as i32 - 8;
-            out_f16[2 * i] = f16::from_f32(d * (q0 as f32)).to_bits();
-            out_f16[2 * i + 1] = f16::from_f32(d * (q1 as f32)).to_bits();
+            out_f16[i] = f16::from_f32(d * (q0 as f32)).to_bits();
+            out_f16[i + 16] = f16::from_f32(d * (q1 as f32)).to_bits();
         }
         w.write_all(cast_slice(&out_f16))?;
     }
@@ -2469,12 +2628,14 @@ fn dequant_q4_1_to_f16<W: Write>(src: &[u8], numel: usize, w: &mut W) -> Result<
         let d = f16::from_bits(u16::from_le_bytes([src[off], src[off + 1]])).to_f32();
         let m = f16::from_bits(u16::from_le_bytes([src[off + 2], src[off + 3]])).to_f32();
         let qbytes = &src[off + 4..off + bs];
+        // ggml packs Q4_1 split-half, not interleaved: byte i holds element i in its low
+        // nibble and element i + qk/2 in its high nibble.
         for i in 0..16 {
             let b = qbytes[i];
             let q0 = (b & 0x0F) as f32;
             let q1 = (b >> 4) as f32;
-            out_f16[2 * i] = f16::from_f32(d * q0 + m).to_bits();
-            out_f16[2 * i + 1] = f16::from_f32(d * q1 + m).to_bits();
+            out_f16[i] = f16::from_f32(d * q0 + m).to_bits();
+            out_f16[i + 16] = f16::from_f32(d * q1 + m).to_bits();
         }
         w.write_all(cast_slice(&out_f16))?;
     }
@@ -4216,8 +4377,10 @@ fn select_text_config(cfg: &HfConfigRoot) -> Result<SelectedTextConfig> {
         cfg.hidden_size.or_else(|| nested.and_then(|t| t.hidden_size)),
         "hidden_size",
     )?;
+    // DeepSeek V4 uses moe_intermediate_size instead of intermediate_size
     let intermediate_size = need(
         cfg.intermediate_size
+            .or_else(|| cfg.moe_intermediate_size)
             .or_else(|| nested.and_then(|t| t.intermediate_size)),
         "intermediate_size",
     )?;

@@ -62,3 +62,10 @@ todos/1.md
 
 research/experimentals
 __pycache__/
+
+# Editor / assistant local state (contains absolute paths to this machine)
+.idea/
+.roots/
+
+# Local scratch script, unrelated to cellm
+run.py

@@ -11,6 +11,7 @@ pub mod gemma_graph;
 pub mod qwen;
 pub mod granite;
 pub mod lfm;
+pub mod lfm_encoder;
 pub mod deepseek_v4;
 pub mod batched;
 

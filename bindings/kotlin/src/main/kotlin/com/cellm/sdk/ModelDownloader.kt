@@ -48,6 +48,15 @@ object ModelDownloader {
             tokenizerConfigUrl = null
         ),
         ModelSpec(
+            id = "lfm2.5-350m-int8",
+            displayName = "LFM 2.5 350M (Int8)",
+            description = "350M Liquid Foundation Model, int8. Fastest CPU decode.",
+            sizeMb = 339,
+            modelUrl = "https://huggingface.co/jeffasante/cellm-models/resolve/main/lfm2.5-350m-int8-v1/lfm2.5-350m-int8-v1.cellm?download=true",
+            tokenizerUrl = "https://huggingface.co/jeffasante/cellm-models/resolve/main/lfm2.5-350m-int8-v1/tokenizer.json?download=true",
+            tokenizerConfigUrl = null
+        ),
+        ModelSpec(
             id = "smolvlm-256m-instruct",
             displayName = "SmolVLM 256M (VLM)",
             description = "Vision-language model. Accepts image + text input.",

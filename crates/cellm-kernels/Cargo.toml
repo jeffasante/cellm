@@ -22,7 +22,16 @@ vulkan = ["dep:ash"]
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 metal = "0.27"
 objc = "0.2"
+libc = "0.2"
 
 [dev-dependencies]
 half = { workspace = true }
 pollster = "0.3"
+
+[[bench]]
+name = "w8a8"
+harness = false
+
+[[bench]]
+name = "w8a8_stream"
+harness = false

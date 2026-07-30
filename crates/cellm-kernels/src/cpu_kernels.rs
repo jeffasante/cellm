@@ -415,6 +415,333 @@ pub fn gemv_i8_f32(
     }
 }
 
+/// Quantize an f32 activation vector to per-tensor symmetric INT8.
+///
+/// Returns the scale `s` such that `x[i] ~= q[i] as f32 * s`. When the input is
+/// all zeros the scale is 0 and every quantized value is 0, which keeps the
+/// downstream `acc * w_scale * x_scale` product exact.
+pub fn quantize_activation_i8(x: &[f32], q: &mut [i8]) -> f32 {
+    debug_assert_eq!(x.len(), q.len());
+
+    let mut amax = 0.0f32;
+    for &v in x {
+        let a = v.abs();
+        if a > amax {
+            amax = a;
+        }
+    }
+    if amax == 0.0 || !amax.is_finite() {
+        q.fill(0);
+        return 0.0;
+    }
+
+    let scale = amax / 127.0;
+    let inv = 1.0 / scale;
+    for (qi, &v) in q.iter_mut().zip(x.iter()) {
+        // round-half-away-from-zero, clamped to the symmetric int8 range
+        *qi = (v * inv).round().clamp(-127.0, 127.0) as i8;
+    }
+    scale
+}
+
+/// `acc += sdot(a, b)` — ARMv8.2 SDOT via inline asm.
+///
+/// The `vdotq_s32` intrinsic is still unstable on stable Rust, so the instruction
+/// is emitted directly. Callers must have verified `dotprod` at runtime.
+///
+/// `dotprod` is not in the baseline feature set for every aarch64 target (notably
+/// `aarch64-apple-ios`), so the attribute is required for the assembler to accept
+/// `sdot` at all — without it this fails to build rather than falling back.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "dotprod")]
+unsafe fn sdot_s32(
+    acc: std::arch::aarch64::int32x4_t,
+    a: std::arch::aarch64::int8x16_t,
+    b: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    let mut out = acc;
+    std::arch::asm!(
+        "sdot {0:v}.4s, {1:v}.16b, {2:v}.16b",
+        inout(vreg) out,
+        in(vreg) a,
+        in(vreg) b,
+        options(pure, nomem, nostack, preserves_flags),
+    );
+    out
+}
+
+/// SDOT-accelerated INT8 x INT8 GEMV over a contiguous row range.
+///
+/// `weight_i8` is the full `[out_dim, in_dim]` row-major matrix; `row_off` is the
+/// index of the first row covered by `out` / `scales_f16`.
+///
+/// # Safety
+/// The caller must have verified `dotprod` via [`has_i8_dotprod`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn gemv_i8_dot_rows(
+    weight_i8: &[i8],
+    scales_f16: &[u16],
+    xq: &[i8],
+    x_scale: f32,
+    out: &mut [f32],
+    row_off: usize,
+    in_dim: usize,
+) {
+    use std::arch::aarch64::*;
+
+    let wp = weight_i8.as_ptr();
+    let xp = xq.as_ptr();
+    let n_rows = out.len();
+    let mut r = 0usize;
+
+    // 4 rows at a time: one activation load feeds four independent SDOT chains.
+    while r + 4 <= n_rows {
+        let b0 = (row_off + r) * in_dim;
+        let (b1, b2, b3) = (b0 + in_dim, b0 + 2 * in_dim, b0 + 3 * in_dim);
+
+        let mut a0 = vdupq_n_s32(0);
+        let mut a1 = vdupq_n_s32(0);
+        let mut a2 = vdupq_n_s32(0);
+        let mut a3 = vdupq_n_s32(0);
+
+        let mut i = 0usize;
+        while i + 16 <= in_dim {
+            let xv = vld1q_s8(xp.add(i));
+            a0 = sdot_s32(a0, vld1q_s8(wp.add(b0 + i)), xv);
+            a1 = sdot_s32(a1, vld1q_s8(wp.add(b1 + i)), xv);
+            a2 = sdot_s32(a2, vld1q_s8(wp.add(b2 + i)), xv);
+            a3 = sdot_s32(a3, vld1q_s8(wp.add(b3 + i)), xv);
+            i += 16;
+        }
+
+        let mut acc = [
+            vaddvq_s32(a0),
+            vaddvq_s32(a1),
+            vaddvq_s32(a2),
+            vaddvq_s32(a3),
+        ];
+        while i < in_dim {
+            let xi = *xp.add(i) as i32;
+            acc[0] += *wp.add(b0 + i) as i32 * xi;
+            acc[1] += *wp.add(b1 + i) as i32 * xi;
+            acc[2] += *wp.add(b2 + i) as i32 * xi;
+            acc[3] += *wp.add(b3 + i) as i32 * xi;
+            i += 1;
+        }
+
+        for j in 0..4 {
+            let ws = f16::from_bits(scales_f16[r + j]).to_f32();
+            out[r + j] = acc[j] as f32 * ws * x_scale;
+        }
+        r += 4;
+    }
+
+    while r < n_rows {
+        let base = (row_off + r) * in_dim;
+        let mut a0 = vdupq_n_s32(0);
+        let mut i = 0usize;
+        while i + 16 <= in_dim {
+            a0 = sdot_s32(a0, vld1q_s8(wp.add(base + i)), vld1q_s8(xp.add(i)));
+            i += 16;
+        }
+        let mut acc = vaddvq_s32(a0);
+        while i < in_dim {
+            acc += *wp.add(base + i) as i32 * *xp.add(i) as i32;
+            i += 1;
+        }
+        out[r] = acc as f32 * f16::from_bits(scales_f16[r]).to_f32() * x_scale;
+        r += 1;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+thread_local! {
+    /// Reusable INT8 activation buffer, so a per-token GEMV never allocates.
+    static ACT_SCRATCH: std::cell::RefCell<Vec<i8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Size rayon's global pool for single-stream decode.
+///
+/// Decode GEMVs are memory-bandwidth bound, so one core already reaches roughly
+/// half of peak throughput and extra workers mostly add fork/join barriers. On
+/// Apple silicon the efficiency cores also straggle, stalling every join. Using
+/// only the performance cores measured fastest end to end.
+///
+/// No-op if `RAYON_NUM_THREADS` is set or the pool is already initialised.
+pub fn init_decode_thread_pool() {
+    if std::env::var_os("RAYON_NUM_THREADS").is_some() {
+        return;
+    }
+
+    let threads = decode_thread_count();
+    // An existing global pool is fine; this is a best-effort default.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global();
+}
+
+/// Number of worker threads to use for decode.
+fn decode_thread_count() -> usize {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        // hw.perflevel0 is the performance-core cluster on Apple silicon.
+        if let Some(p) = sysctl_usize("hw.perflevel0.logicalcpu") {
+            if p >= 2 {
+                return p.min(4);
+            }
+        }
+    }
+    (num_cpus_available() / 2).clamp(2, 4)
+}
+
+fn num_cpus_available() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn sysctl_usize(name: &str) -> Option<usize> {
+    use std::ffi::CString;
+
+    let cname = CString::new(name).ok()?;
+    let mut value: i32 = 0;
+    let mut len = std::mem::size_of::<i32>();
+    // SAFETY: `cname` is NUL-terminated and `value`/`len` describe a valid i32 buffer.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            &mut value as *mut i32 as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && value > 0 {
+        Some(value as usize)
+    } else {
+        None
+    }
+}
+
+/// True when the CPU can run the W8A8 SDOT path.
+#[inline]
+pub fn has_i8_dotprod() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("dotprod")
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
+/// W8A8 INT8 GEMV: quantizes the activation vector to INT8 and uses ARM SDOT
+/// integer dot products, avoiding the int8 -> f32 widening of [`gemv_i8_f32`].
+///
+/// Falls back to [`gemv_i8_f32`] when SDOT is unavailable.
+pub fn gemv_i8_w8a8(
+    weight_i8: &[i8],
+    scales_f16: &[u16],
+    input: &[f32],
+    out: &mut [f32],
+    out_dim: usize,
+    in_dim: usize,
+) {
+    debug_assert_eq!(weight_i8.len(), out_dim * in_dim);
+    debug_assert_eq!(scales_f16.len(), out_dim);
+    debug_assert_eq!(input.len(), in_dim);
+    debug_assert_eq!(out.len(), out_dim);
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if has_i8_dotprod() {
+            // The activation scratch is thread-local and stays borrowed across the
+            // rayon region below. If a caller invokes this kernel from inside its
+            // own parallel loop, work stealing can land a nested task on this same
+            // worker thread, which would re-enter the borrow. Fall back to a local
+            // buffer in that case instead of panicking.
+            let handled = ACT_SCRATCH.with(|cell| match cell.try_borrow_mut() {
+                Ok(mut xq) => {
+                    if xq.len() < in_dim {
+                        xq.resize(in_dim, 0);
+                    }
+                    gemv_i8_w8a8_with_scratch(
+                        weight_i8,
+                        scales_f16,
+                        input,
+                        out,
+                        out_dim,
+                        in_dim,
+                        &mut xq[..in_dim],
+                    );
+                    true
+                }
+                Err(_) => false,
+            });
+            if !handled {
+                let mut xq = vec![0i8; in_dim];
+                gemv_i8_w8a8_with_scratch(
+                    weight_i8, scales_f16, input, out, out_dim, in_dim, &mut xq,
+                );
+            }
+            return;
+        }
+    }
+
+    gemv_i8_f32(weight_i8, scales_f16, input, out, out_dim, in_dim);
+}
+
+#[cfg(target_arch = "aarch64")]
+fn gemv_i8_w8a8_with_scratch(
+    weight_i8: &[i8],
+    scales_f16: &[u16],
+    input: &[f32],
+    out: &mut [f32],
+    out_dim: usize,
+    in_dim: usize,
+    xq: &mut [i8],
+) {
+    let x_scale = quantize_activation_i8(input, xq);
+    if x_scale == 0.0 {
+        out.fill(0.0);
+        return;
+    }
+
+    // This kernel is memory-bandwidth bound (one weight byte per MAC), so
+    // a single core already reaches ~half of peak. Extra threads only pay
+    // off when each task is large enough to dwarf the fork/join cost, and
+    // oversubscribing lets work stealing balance the P/E core mix.
+    let threads = rayon::current_num_threads().max(1);
+    const MIN_MACS_PER_TASK: usize = 512 * 1024;
+    let rows_per_task = out_dim
+        .div_ceil(threads * 8)
+        .max(MIN_MACS_PER_TASK.div_ceil(in_dim.max(1)))
+        .next_multiple_of(4);
+
+    // Below this the rayon fork/join costs more than the work it saves.
+    const PAR_MAC_THRESHOLD: usize = MIN_MACS_PER_TASK * 2;
+    if out_dim <= rows_per_task || out_dim * in_dim < PAR_MAC_THRESHOLD {
+        unsafe {
+            gemv_i8_dot_rows(weight_i8, scales_f16, xq, x_scale, out, 0, in_dim);
+        }
+    } else {
+        let xq: &[i8] = xq;
+        out.par_chunks_mut(rows_per_task)
+            .enumerate()
+            .for_each(|(ci, chunk)| {
+                let row_off = ci * rows_per_task;
+                let s = &scales_f16[row_off..row_off + chunk.len()];
+                unsafe {
+                    gemv_i8_dot_rows(weight_i8, s, xq, x_scale, chunk, row_off, in_dim);
+                }
+            });
+    }
+}
+
 pub fn matmul_i8_f32(
     a_i8: &[i8],
     a_scales_f16: &[u16],
@@ -751,6 +1078,42 @@ pub fn matmul_i4_f32(
     });
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn affine_i4_group_dot_neon(packed: *const u8, x: *const f32, len: usize) -> f32 {
+    use std::arch::aarch64::*;
+
+    let mask = vdup_n_u8(0x0f);
+    let mut acc = vdupq_n_f32(0.0);
+    let pairs = len / 2;
+    let mut pair = 0usize;
+
+    while pair + 4 <= pairs {
+        let bits = std::ptr::read_unaligned(packed.add(pair) as *const u32) as u64;
+        let bytes = vcreate_u8(bits);
+        let low = vand_u8(bytes, mask);
+        let high = vshr_n_u8::<4>(bytes);
+        let low_f32 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(low))));
+        let high_f32 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(high))));
+        let activations = vld2q_f32(x.add(pair * 2));
+        acc = vfmaq_f32(acc, low_f32, activations.0);
+        acc = vfmaq_f32(acc, high_f32, activations.1);
+        pair += 4;
+    }
+
+    let mut dot = vaddvq_f32(acc);
+    while pair < pairs {
+        let byte = *packed.add(pair);
+        dot += ((byte & 0x0f) as f32) * *x.add(pair * 2);
+        dot += ((byte >> 4) as f32) * *x.add(pair * 2 + 1);
+        pair += 1;
+    }
+    if len % 2 != 0 {
+        dot += ((*packed.add(pairs) & 0x0f) as f32) * *x.add(len - 1);
+    }
+    dot
+}
+
 /// Matrix-vector product for unsigned affine Q4 weights.
 ///
 /// Each row stores two 4-bit values per byte. Scales and biases are f32,
@@ -768,10 +1131,19 @@ pub fn matmul_affine_i4_f32(
     debug_assert_eq!(x.len(), cols);
     debug_assert_eq!(out.len(), rows);
     let groups_per_row = cols.div_ceil(group_size);
-    let packed_per_row = groups_per_row * group_size / 2;
+    let packed_per_group = group_size.div_ceil(2);
+    let packed_per_row = groups_per_row * packed_per_group;
     debug_assert_eq!(weights.len(), rows * packed_per_row);
     debug_assert_eq!(scales.len(), rows * groups_per_row);
     debug_assert_eq!(biases.len(), rows * groups_per_row);
+
+    // The affine bias contribution is bias * sum(x), which is identical for
+    // every output row. Compute it once per activation group instead of once
+    // per quantized value and output row.
+    let x_sums: Vec<f32> = x
+        .chunks(group_size)
+        .map(|group| group.iter().copied().sum())
+        .collect();
 
     out.par_iter_mut().enumerate().for_each(|(row_idx, value)| {
         let packed = &weights[row_idx * packed_per_row..(row_idx + 1) * packed_per_row];
@@ -779,17 +1151,163 @@ pub fn matmul_affine_i4_f32(
         let mut dot = 0.0f32;
         for group in 0..groups_per_row {
             let start = group * group_size;
-            let end = (start + group_size).min(cols);
+            let len = (cols - start).min(group_size);
             let scale = scales[params + group];
             let bias = biases[params + group];
-            for col in start..end {
-                let byte = packed[col / 2];
-                let q = if col % 2 == 0 { byte & 0x0f } else { byte >> 4 };
-                dot += (q as f32 * scale + bias) * x[col];
-            }
+            let group_packed = &packed[group * packed_per_group..];
+
+            #[cfg(target_arch = "aarch64")]
+            let quantized_dot = unsafe {
+                affine_i4_group_dot_neon(group_packed.as_ptr(), x.as_ptr().add(start), len)
+            };
+
+            #[cfg(not(target_arch = "aarch64"))]
+            let quantized_dot = {
+                let mut sum = 0.0f32;
+                for col in 0..len {
+                    let byte = group_packed[col / 2];
+                    let q = if col % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+                    sum += q as f32 * x[start + col];
+                }
+                sum
+            };
+
+            dot += scale * quantized_dot + bias * x_sums[group];
         }
         *value = dot;
     });
+}
+
+#[cfg(test)]
+mod w8a8_tests {
+    use super::{gemv_i8_f32, gemv_i8_w8a8};
+    use half::f16;
+
+    fn build(out_dim: usize, in_dim: usize) -> (Vec<i8>, Vec<u16>, Vec<f32>) {
+        let mut w = vec![0i8; out_dim * in_dim];
+        let mut seed = 0x12345678u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((seed >> 16) & 0xff) as i32 - 128
+        };
+        for v in w.iter_mut() {
+            *v = next().clamp(-127, 127) as i8;
+        }
+        let scales: Vec<u16> = (0..out_dim)
+            .map(|r| f16::from_f32(0.001 + (r % 7) as f32 * 0.0003).to_bits())
+            .collect();
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i * 37 % 211) as f32 - 105.0) / 90.0)
+            .collect();
+        (w, scales, x)
+    }
+
+    #[test]
+    fn w8a8_matches_f32_reference_within_activation_quant_error() {
+        for &(out_dim, in_dim) in &[(4usize, 64usize), (7, 33), (128, 1024), (65, 96)] {
+            let (w, scales, x) = build(out_dim, in_dim);
+            let mut got = vec![0.0f32; out_dim];
+            let mut want = vec![0.0f32; out_dim];
+            gemv_i8_w8a8(&w, &scales, &x, &mut got, out_dim, in_dim);
+            gemv_i8_f32(&w, &scales, &x, &mut want, out_dim, in_dim);
+
+            let norm = want.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+            let err = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f32>()
+                .sqrt();
+            assert!(
+                err / norm < 0.02,
+                "{out_dim}x{in_dim}: relative error {} too large",
+                err / norm
+            );
+        }
+    }
+
+    #[test]
+    fn w8a8_zero_activation_yields_zeros() {
+        let (w, scales, _) = build(16, 64);
+        let x = vec![0.0f32; 64];
+        let mut out = vec![9.0f32; 16];
+        gemv_i8_w8a8(&w, &scales, &x, &mut out, 16, 64);
+        assert!(out.iter().all(|v| *v == 0.0));
+    }
+}
+
+#[cfg(test)]
+mod affine_i4_tests {
+    use super::matmul_affine_i4_f32;
+
+    fn reference(
+        weights: &[u8],
+        scales: &[f32],
+        biases: &[f32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        x: &[f32],
+    ) -> Vec<f32> {
+        let groups = cols.div_ceil(group_size);
+        let packed_per_group = group_size.div_ceil(2);
+        let packed_per_row = groups * packed_per_group;
+        let mut out = vec![0.0; rows];
+        for row in 0..rows {
+            for group in 0..groups {
+                let start = group * group_size;
+                let len = (cols - start).min(group_size);
+                let packed = &weights[row * packed_per_row + group * packed_per_group..];
+                for col in 0..len {
+                    let byte = packed[col / 2];
+                    let q = if col % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+                    out[row] += (q as f32 * scales[row * groups + group]
+                        + biases[row * groups + group])
+                        * x[start + col];
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn affine_i4_matches_scalar_for_multiple_and_partial_groups() {
+        let rows: usize = 3;
+        let cols: usize = 13;
+        let group_size: usize = 8;
+        let groups = cols.div_ceil(group_size);
+        let packed_per_group = group_size.div_ceil(2);
+        let mut weights = vec![0u8; rows * groups * packed_per_group];
+        for (index, byte) in weights.iter_mut().enumerate() {
+            let low = (index * 3 + 1) % 16;
+            let high = (index * 5 + 7) % 16;
+            *byte = low as u8 | ((high as u8) << 4);
+        }
+        let scales = vec![0.125, -0.25, 0.5, 0.0625, -0.125, 0.375];
+        let biases = vec![-0.75, 1.25, 0.5, -1.0, 0.25, -0.5];
+        let x = vec![
+            -1.5, 0.25, 2.0, -0.75, 0.5, 1.25, -2.0, 0.125, 0.75, -1.0, 1.5, 0.375,
+            -0.625,
+        ];
+        let expected = reference(&weights, &scales, &biases, rows, cols, group_size, &x);
+        let mut actual = vec![0.0; rows];
+        matmul_affine_i4_f32(
+            &weights,
+            &scales,
+            &biases,
+            rows,
+            cols,
+            group_size,
+            &x,
+            &mut actual,
+        );
+        for (row, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-5,
+                "row {row}: actual={actual} expected={expected}"
+            );
+        }
+    }
 }
 
 pub fn softmax_f32_inplace(x: &mut [f32]) {

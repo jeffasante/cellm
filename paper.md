@@ -856,7 +856,123 @@ Rewrite the base draft." \
 - CPU speed: ~15 tok/s (Apple Silicon)
 - Metal: not implemented for LFM2 runner (passes --backend metal silently falls back to CPU)
 
+## LFM2.5 350M int8 (W8A8 SDOT, CPU)
 
+Per-row symmetric int8 weights with int8-quantized activations, using ARM
+`SDOT` integer dot products. Measured on an Apple M4 (4 P-cores + 6 E-cores).
+
+Convert from GGUF:
+
+```bash
+cargo build --release -p convert
+./target/release/convert \
+  --input models/LFM2.5-350M-Q4_0.gguf \
+  --output models/to-huggingface/lfm2.5-350m-int8-v1/lfm2.5-350m-int8-v1.cellm \
+  --quantize int8
+```
+
+LFM2 needs its chat template applied manually via `--prompt`:
+
+```bash
+./target/release/infer \
+  --model models/to-huggingface/lfm2.5-350m-int8-v1/lfm2.5-350m-int8-v1.cellm \
+  --tokenizer models/to-huggingface/lfm2.5-350m-int8-v1/tokenizer.json \
+  --prompt '<|startoftext|><|im_start|>user
+What is consciousness? Answer in one paragraph.<|im_end|>
+<|im_start|>assistant
+' \
+  --gen 200 --backend cpu
+
+  Prefill: 18 tokens in 0.70s
+  Decode:  98 tokens in 0.87s   (~113 tok/s, stopped at EOS)
+  ---
+  Consciousness is the state of subjective experience, the ability to have
+  thoughts, emotions, and perceptions directly within the mind; it involves
+  awareness of oneself as an individual and awareness of the environment,
+  including internal mental states such as sensations, feelings, and beliefs;
+  this inner experience can be fragmented or unified, depending on how
+  consciousness manifests in different contexts, from a fleeting moment to a
+  full-day reflection, and it arises without a clear external cause or
+  boundary between mind and body.
+```
+
+Steady-state decode, 300 tokens, three consecutive runs:
+
+```bash
+./target/release/infer \
+  --model models/to-huggingface/lfm2.5-350m-int8-v1/lfm2.5-350m-int8-v1.cellm \
+  --tokenizer models/to-huggingface/lfm2.5-350m-int8-v1/tokenizer.json \
+  --prompt '<|startoftext|><|im_start|>user
+Write a detailed explanation of how photosynthesis works.<|im_end|>
+<|im_start|>assistant
+' \
+  --gen 300 --backend cpu
+
+  Prefill: 18 tokens in 0.15s
+  Decode:  300 tokens in 2.56s / 2.60s / 2.56s   (~117 tok/s)
+```
+
+### Speed
+
+| Stage                              | Decode (350M, CPU) |
+| ---------------------------------- | ------------------ |
+| f16 baseline                       | ~25 tok/s          |
+| int8 weights, f32 MAC              | ~88 tok/s          |
+| int8 W8A8 + `SDOT` + P-core pool   | **~117-123 tok/s** |
+
+Two changes mattered, and the second was the larger one:
+
+1. `cpu_kernels::gemv_i8_w8a8` quantizes the activation to int8 and uses ARM
+   `SDOT`. Isolated, this is ~10x the old f32-MAC kernel.
+2. Thread-pool sizing. That 10x kernel only moved end-to-end speed 1.3x. A
+   leaf-weighted profile showed just 23% of samples in the kernel and ~57% in
+   rayon fork/join. On the M4's 4 P + 6 E cores, rayon's default 10 threads
+   makes the E-cores straggle at every join, so `init_decode_thread_pool()`
+   now caps the pool at `hw.perflevel0.logicalcpu`.
+
+Note: `vdotq_s32` is still unstable on stable Rust (`stdarch_neon_dotprod`),
+so the kernel emits the instruction via inline `asm!`.
+
+### This is at the memory roof — further tuning will not help
+
+Decode streams essentially the whole weight set per token. Exact traffic from
+the model header (`scratch/roofline.py`):
+
+```
+per-token weight bytes: 355.1 MB
+  mlp                    226.8 MB  (63.9%)
+  embed/logits (tied)     67.2 MB  (18.9%)
+  conv blocks             42.1 MB  (11.9%)
+  attention               18.9 MB  ( 5.3%)
+
+at 123 tok/s  ->  43.7 GB/s of weight traffic
+```
+
+`benches/w8a8_stream.rs` compares the kernel against a *pure read* of the same
+buffers. On a warm resident working set the GEMV runs at **98-100% of the read
+roof** (~45-52 GB/s) — it is purely bandwidth-bound, and 3 vs 6 threads land at
+the same GB/s.
+
+Consequences:
+
+- **SMMLA / `i8mm` is not worth implementing here.** It doubles compute
+  throughput, but compute is already free: every MAC is waiting on a weight
+  byte. It would cost a converter change and a blocked weight layout for ~0%.
+- A profile dominated by `__psynch_cvwait` / `swtch_pri` here is *not*
+  evidence of lock overhead. Those threads are waiting on DRAM. This was
+  initially misread as "1.5-2x left in thread orchestration"; the roofline
+  bench disproved it.
+- The only remaining levers reduce *bytes moved*, and both trade accuracy for
+  speed: Q4 weights (halves the 355 MB), or avoiding a full read of all 65536
+  logit rows (19% of traffic to produce one token).
+
+### Quality
+
+Fluent and well-structured, but the model confabulates at this size. In the
+photosynthesis run above it invented the term "photophysis", mislabeled the
+light-dependent stage as "the dark phase", and swapped the contents of the
+light-dependent and light-independent reactions. Treat 350M output as drafting
+material, not reference text.
 
 ## Qwen3.0
 

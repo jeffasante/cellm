@@ -1,3 +1,6 @@
 {
-    "liveServer.settings.port": 5501
+    "liveServer.settings.port": 5501,
+    "roots.backend.kind": "openai",
+    "roots.backend.model": "meta/llama-3.1-8b-instruct",
+    "roots.backend.baseUrl": "https://integrate.api.nvidia.com/v1"
 }

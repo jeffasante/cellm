@@ -80,6 +80,14 @@ enum DemoAssetLinks {
     static let lfm25FileName = "\(lfm25Dir)/lfm2.5-350m-v1.cellm"
     static let lfm25TokenizerFileName = "\(lfm25Dir)/tokenizer.json"
 
+    static let lfm25Int8 =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/lfm2.5-350m-int8-v1/lfm2.5-350m-int8-v1.cellm?download=true"
+    static let lfm25Int8Tokenizer =
+        "https://huggingface.co/jeffasante/cellm-models/resolve/main/lfm2.5-350m-int8-v1/tokenizer.json?download=true"
+    static let lfm25Int8Dir = "samples/lfm2.5-350m-int8"
+    static let lfm25Int8FileName = "\(lfm25Int8Dir)/lfm2.5-350m-int8-v1.cellm"
+    static let lfm25Int8TokenizerFileName = "\(lfm25Int8Dir)/tokenizer.json"
+
     static let lfm25230M =
         "https://huggingface.co/jeffasante/cellm-models/resolve/main/LFM2.5-230M/LFM2.5-230M.cellm?download=true"
     static let lfm25230MInt4 =

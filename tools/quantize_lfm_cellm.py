@@ -102,51 +102,50 @@ def read_cellm(path: Path):
 
 
 def write_cellm(output_path: Path, header: dict, tensors: dict):
-    """Write a .cellm file from header and {name: bytes_data} dict."""
-    # Build tensor index (offsets after header)
-    data_start = 0  # placeholder
-    current_offset = data_start
-    offsets = {}
-    for name in sorted(tensors.keys()):
-        current_offset = (current_offset + 63) & ~63
-        offsets[name] = current_offset
-        current_offset += len(tensors[name])
+    """Write a .cellm file from header and {name: bytes_data} dict.
 
-    tensor_index = []
-    for name in sorted(tensors.keys()):
-        tensor_index.append(
+    Offsets and the header length are mutually dependent: writing larger offsets
+    into the index makes the JSON longer, which pushes `data_start` further out,
+    which makes the offsets larger again. Solve it as a fixed point and verify,
+    rather than assuming a single correction pass converges.
+    """
+    names = sorted(tensors.keys())
+
+    # Clean up internal fields before serializing.
+    shapes = header.pop("_shapes")
+    dtypes = header.pop("_dtypes")
+
+    def layout(hdr_len: int):
+        data_start = (5 + 1 + 4 + hdr_len + 63) & ~63
+        offsets = {}
+        cur = data_start
+        for name in names:
+            cur = (cur + 63) & ~63
+            offsets[name] = cur
+            cur += len(tensors[name])
+        return data_start, offsets
+
+    hdr_len = 0
+    hdr_json = b""
+    data_start = 0
+    for _ in range(16):
+        data_start, offsets = layout(hdr_len)
+        header["tensors"] = [
             {
                 "name": name,
                 "offset_bytes": offsets[name],
                 "nbytes": len(tensors[name]),
-                "shape": list(header["_shapes"][name]),
-                "dtype": header["_dtypes"][name],
+                "shape": list(shapes[name]),
+                "dtype": dtypes[name],
             }
-        )
-
-    header["tensors"] = tensor_index
-    # Clean up internal fields
-    del header["_shapes"]
-    del header["_dtypes"]
-
-    hdr_json = json.dumps(header).encode("utf-8")
-    hdr_len = len(hdr_json)
-    data_start = (5 + 1 + 4 + hdr_len + 63) & ~63
-
-    # Recalculate offsets with correct data_start
-    current_offset = data_start
-    for name in sorted(tensors.keys()):
-        current_offset = (current_offset + 63) & ~63
-        offsets[name] = current_offset
-        current_offset += len(tensors[name])
-
-    for item in tensor_index:
-        item["offset_bytes"] = offsets[item["name"]]
-
-    header["tensors"] = tensor_index
-    hdr_json = json.dumps(header).encode("utf-8")
-    hdr_len = len(hdr_json)
-    data_start = (5 + 1 + 4 + hdr_len + 63) & ~63
+            for name in names
+        ]
+        hdr_json = json.dumps(header).encode("utf-8")
+        if len(hdr_json) == hdr_len:
+            break
+        hdr_len = len(hdr_json)
+    else:
+        raise RuntimeError("cellm header layout did not converge")
 
     with open(output_path, "wb") as f:
         f.write(b"CELLM")
@@ -156,11 +155,16 @@ def write_cellm(output_path: Path, header: dict, tensors: dict):
         pos = 5 + 1 + 4 + hdr_len
         if pos < data_start:
             f.write(b"\x00" * (data_start - pos))
-        for name in sorted(tensors.keys()):
+        for name in names:
             pos = f.tell()
             aligned = (pos + 63) & ~63
             if pos < aligned:
                 f.write(b"\x00" * (aligned - pos))
+            # A tensor written anywhere other than its indexed offset silently
+            # corrupts the model, so assert instead of trusting the arithmetic.
+            assert f.tell() == offsets[name], (
+                f"{name}: wrote at {f.tell()}, index says {offsets[name]}"
+            )
             f.write(tensors[name])
 
     return output_path

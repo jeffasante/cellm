@@ -6,11 +6,7 @@ repo_id = "jeffasante/cellm-models"
 base_dir = "models/to-huggingface"
 
 missing_models = [
-    "lfm2.5-350m-v1",
-    "qwen3-0.6b-v1",
-    "qwen3.5-0.8b-v1",
-    "smollm2-360m-q1-v1",
-    "smolvlm-256m-instruct-f16-full"
+    "lfm2.5-350m-int8-v1",
 ]
 
 for model in missing_models:

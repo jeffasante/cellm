@@ -28,7 +28,7 @@ fn last_error_cell() -> &'static Mutex<Option<String>> {
 fn engine_guard(engine: cellm_engine_t) -> std::sync::MutexGuard<'static, Engine> {
     unsafe { &*(engine as *mut std::sync::Mutex<Engine>) }.lock().unwrap_or_else(|poison| poison.into_inner())
 }
-fn set_last_error(msg: impl Into<String>) {
+pub(crate) fn set_last_error(msg: impl Into<String>) {
     let mut g = last_error_cell()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -86,7 +86,7 @@ fn get_last_vlm_encoder_layer_ms() -> Option<Vec<f64>> {
     LAST_VLM_ENCODER_LAYER_MS.with(|t| t.borrow().clone())
 }
 
-fn cstr_to_str<'a>(s: *const c_char) -> Result<&'a str, String> {
+pub(crate) fn cstr_to_str<'a>(s: *const c_char) -> Result<&'a str, String> {
     if s.is_null() {
         return Err("null string pointer".into());
     }
@@ -485,7 +485,7 @@ pub extern "C" fn cellm_engine_create_v4(
     }
 }
 
-fn load_tokenizer(path: &std::path::Path) -> Result<Tokenizer, String> {
+pub(crate) fn load_tokenizer(path: &std::path::Path) -> Result<Tokenizer, String> {
     // Strip virtual added_tokens (IDs >= 128000) from JSON before loading to
     // suppress hundreds of tokenizers crate warnings about tokens not in vocab.
     let cleaned = try_strip_virtual_added_tokens(path)?;

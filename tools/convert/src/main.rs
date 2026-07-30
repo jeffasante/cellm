@@ -1445,7 +1445,7 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
                 name: p.name.clone(),
                 offset_bytes: p.out_offset,
                 nbytes: p.out_nbytes as u64,
-                shape: p.shape.clone(),
+                shape: p.header_shape.clone(),
                 dtype: p.out_dtype.clone(),
             })
             .collect();
@@ -1469,7 +1469,7 @@ fn convert_gguf_to_cellm(args: &Args, gguf_path: &Path, type_summary: &str) -> R
             name: p.name.clone(),
             offset_bytes: p.out_offset,
             nbytes: p.out_nbytes as u64,
-            shape: p.shape.clone(),
+            shape: p.header_shape.clone(),
             dtype: p.out_dtype.clone(),
         })
         .collect();
@@ -1884,18 +1884,19 @@ fn decode_q4_0_prefix(src: &[u8], target: usize, out: &mut Vec<f32>) -> Result<(
         let off = bi * bs;
         let d = read_f16_le_as_f32(src[off], src[off + 1]);
         let q = &src[off + 2..off + bs];
+        // ggml Q4_0 packs a 32-element block split-half: byte i holds element i in the
+        // low nibble and element i+16 in the high nibble (NOT interleaved pairs).
+        let mut block = [0f32; 32];
         for i in 0..16usize {
-            if out.len() >= target {
-                break;
-            }
             let b = q[i];
-            let q0 = (b & 0x0F) as i32 - 8;
-            out.push(d * q0 as f32);
+            block[i] = d * ((b & 0x0F) as i32 - 8) as f32;
+            block[i + 16] = d * ((b >> 4) as i32 - 8) as f32;
+        }
+        for v in block {
             if out.len() >= target {
                 break;
             }
-            let q1 = (b >> 4) as i32 - 8;
-            out.push(d * q1 as f32);
+            out.push(v);
         }
     }
     Ok(())
@@ -1942,18 +1943,18 @@ fn decode_q4_1_prefix(src: &[u8], target: usize, out: &mut Vec<f32>) -> Result<(
         let d = read_f16_le_as_f32(src[off], src[off + 1]);
         let m = read_f16_le_as_f32(src[off + 2], src[off + 3]);
         let q = &src[off + 4..off + bs];
+        // ggml Q4_1 packs a 32-element block split-half, same as Q4_0.
+        let mut block = [0f32; 32];
         for i in 0..16usize {
-            if out.len() >= target {
-                break;
-            }
             let b = q[i];
-            let q0 = (b & 0x0F) as f32;
-            out.push(d * q0 + m);
+            block[i] = d * (b & 0x0F) as f32 + m;
+            block[i + 16] = d * (b >> 4) as f32 + m;
+        }
+        for v in block {
             if out.len() >= target {
                 break;
             }
-            let q1 = (b >> 4) as f32;
-            out.push(d * q1 + m);
+            out.push(v);
         }
     }
     Ok(())
@@ -3447,6 +3448,10 @@ fn is_quantization_excluded_name(name: &str) -> bool {
     name.contains("norm")
         || name.contains("per_layer_model_proj")
         || name.contains("lm_head")
+        // LFM2 depthwise short-conv kernel is [hidden, kernel_size] (kernel_size ~= 3).
+        // Per-row symmetric quantization over 3 elements is both lossy and unsupported
+        // by the conv path in the runner, which reads it as raw f16.
+        || name.ends_with("conv.conv.weight")
 }
 
 fn infer_tensor_prefixes(

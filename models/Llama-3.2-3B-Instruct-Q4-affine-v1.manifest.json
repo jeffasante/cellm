@@ -49,9 +49,9 @@
     "commit": "fd47a71b7cafd102a0fc31003a609225a378cb5a",
     "working_tree_dirty": true,
     "source_sha256": {
-      "crates/cellm-model/src/llama.rs": "d5226ae8915bde650107880421eaa572995b5b0d1ac3430404bd2470c8f8328d",
+      "crates/cellm-model/src/llama.rs": "4a57ac121435f6298e32a9363e569029d6d917ec9a2d48be8715f7175a86132d",
       "crates/cellm-model/src/cellm_file.rs": "4e5697a2c6f77cf867ee4200da2eea040e91c38b9cc0a47140e45aba9757e50d",
-      "crates/cellm-kernels/src/cpu_kernels.rs": "6bfa8440e4e59a151836fad2937f180128872bb00c2c096a468dfe050d5a5c70",
+      "crates/cellm-kernels/src/cpu_kernels.rs": "ac8e530e9b46ed398edea0090d46cfccf45f3f9cc0e0ddaffd9dc4f83bdfef08",
       "tools/infer/src/main.rs": "bbe18febed0da38bc82f786ca7b91409cccf8cb66f34e07c1c534e24606c108c"
     }
   },

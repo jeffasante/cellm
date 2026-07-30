@@ -9,6 +9,7 @@ All research models are hosted on the Hugging Face [jeffasante/cellm-models](htt
 | **Qwen 3.5 0.8B** | f16, int4, q1 | 1.6GB (f16) | [View on HF](https://huggingface.co/jeffasante/cellm-models/tree/main/qwen3.5-0.8b-v1) |
 | **Qwen 3.0 0.6B** | f16, int8, int4 | 1.2GB (f16) | [View on HF](https://huggingface.co/jeffasante/cellm-models/tree/main/qwen3-0.6b-v1) |
 | **LFM 2.5 350M** | 4-bit | 190MB | [View on HF](https://huggingface.co/jeffasante/cellm-models/tree/main/lfm2.5-350m-v1) |
+| **LFM 2.5 350M** | int8 (W8A8) | 339MB | [View on HF](https://huggingface.co/jeffasante/cellm-models/tree/main/lfm2.5-350m-int8-v1) |
 | **Gemma 4 E2B** | int4 | 2.1GB | [View on HF](https://huggingface.co/jeffasante/cellm-models/tree/main/gemma-4-E2B-it-int4-aggr-v5) |
 | **Gemma 3 1B** | int8, mixed-i4 | 1.1GB | [View on HF](https://huggingface.co/jeffasante/cellm-models/tree/main/gemma-3-1b-it-int8-v1) |
 | **SmolVLM 256M** | f16 | 513MB | [View on HF](https://huggingface.co/jeffasante/cellm-models/tree/main/smolvlm-256m-instruct-f16-full) |

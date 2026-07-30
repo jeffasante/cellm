@@ -976,6 +976,81 @@ impl LfmRunner {
         self.embed_token(token, out)
     }
 
+    /// Depthwise short-conv kernel width (`conv_L_cache`).
+    pub fn conv_kernel_size(&self) -> usize {
+        self.conv_kernel_size
+    }
+
+    /// Layer kind at `idx` (`"conv"` or `"full_attention"`), `""` when out of range.
+    pub fn layer_type(&self, idx: usize) -> &str {
+        self.layer_types.get(idx).map(|s| s.as_str()).unwrap_or("")
+    }
+
+    /// Load an RMSNorm gain vector as f32. Used by the bidirectional encoder,
+    /// which cannot reuse the single-position scratch buffers of `step_inner`.
+    pub(crate) fn norm_weight_f32(&self, name: &str) -> Result<Vec<f32>, CoreError> {
+        let w = self.tensor_f16(name)?;
+        Ok(w.iter().map(|&b| f16::from_bits(b).to_f32()).collect())
+    }
+
+    /// Copy an f16 weight matrix out of the mmap so callers can hold it across
+    /// `&mut self` borrows.
+    pub(crate) fn weight_f16_owned(&self, name: &str) -> Result<Vec<u16>, CoreError> {
+        match self.tensor_dtype(name).as_deref() {
+            Some("f16") | None => Ok(self.tensor_f16(name)?.to_vec()),
+            Some(other) => Err(CoreError::Backend(format!(
+                "lfm encode: tensor '{name}' has dtype '{other}', only f16 is supported"
+            ))),
+        }
+    }
+
+    /// Owned int8 weight matrix plus its per-row scales.
+    pub(crate) fn weight_i8_owned(&self, name: &str) -> Result<(Vec<i8>, Vec<u16>), CoreError> {
+        let w = self.tensor_i8(name)?.to_vec();
+        let s = self.tensor_f16(&format!("{name}.qscale"))?.to_vec();
+        Ok((w, s))
+    }
+
+    /// Dequantize an MLX-style int4 weight into a dense f32 matrix.
+    ///
+    /// Same layout as [`Self::linear_i4_out_in`] but returns the matrix instead
+    /// of consuming it, and bypasses the LRU cache — the encoder streams each
+    /// layer once so caching would only add peak memory.
+    pub(crate) fn weight_i4_dequant(
+        &self,
+        name: &str,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<Vec<f32>, CoreError> {
+        let base_name = name.trim_end_matches(".weight");
+        let weight_u32: &[u32] = bytemuck::cast_slice(self.file.tensor_bytes(name)?);
+        let scales_f32: &[f32] =
+            bytemuck::cast_slice(self.file.tensor_bytes(&format!("{base_name}.scales"))?);
+        let biases_f32: &[f32] =
+            bytemuck::cast_slice(self.file.tensor_bytes(&format!("{base_name}.biases"))?);
+
+        let group_size = 64usize;
+        let groups_per_row = in_dim.div_ceil(group_size);
+        let packed_in = in_dim / 8;
+
+        let mut dequant = vec![0.0f32; out_dim * in_dim];
+        dequant.par_chunks_exact_mut(in_dim).enumerate().for_each(|(i, row)| {
+            let row_offset = i * packed_in;
+            for j_packed in 0..packed_in {
+                let packed = weight_u32[row_offset + j_packed];
+                let g = (j_packed * 8) / group_size;
+                let scale = scales_f32[i * groups_per_row + g];
+                let bias = biases_f32[i * groups_per_row + g];
+                let j_base = j_packed * 8;
+                for k in 0..8 {
+                    let nibble = ((packed >> (k * 4)) & 0xF) as f32;
+                    row[j_base + k] = nibble * scale + bias;
+                }
+            }
+        });
+        Ok(dequant)
+    }
+
     pub fn step_topk(
         &mut self,
         token: u32,
@@ -1676,6 +1751,18 @@ impl LfmRunner {
 
                     *logit = acc;
                 });
+            } else if dtype == "i8" {
+                // Per-row symmetric int8 tied embeddings
+                let emb = self.tensor_i8("model.embed_tokens.weight")?;
+                let scales = self.tensor_f16("model.embed_tokens.weight.qscale")?;
+                cellm_kernels::cpu_kernels::gemv_i8_w8a8(
+                    emb,
+                    scales,
+                    &x_final,
+                    &mut logits,
+                    cfg.vocab_size,
+                    hidden,
+                );
             } else {
                 // F16 embeddings
                 let emb = self.tensor_f16("model.embed_tokens.weight")?;
@@ -1807,6 +1894,20 @@ impl LfmRunner {
                     out[j] = q * scale + bias;
                 }
             }
+        } else if dtype == "i8" {
+            // Per-row symmetric int8 embeddings
+            let emb = self.tensor_i8("model.embed_tokens.weight")?;
+            let scales = self.tensor_f16("model.embed_tokens.weight.qscale")?;
+            let row_start = (token as usize) * hidden;
+            if row_start + hidden > emb.len() {
+                return Err(CoreError::Backend(
+                    "embed_tokens.weight shape mismatch".into(),
+                ));
+            }
+            let scale = f16::from_bits(scales[token as usize]).to_f32();
+            for i in 0..hidden {
+                out[i] = (emb[row_start + i] as f32) * scale;
+            }
         } else {
             // Standard f16 embeddings
             let emb = self.tensor_f16("model.embed_tokens.weight")?;
@@ -1849,8 +1950,13 @@ impl LfmRunner {
         Ok(bytemuck::cast_slice(bytes))
     }
 
+    fn tensor_i8(&self, name: &str) -> Result<&[i8], CoreError> {
+        let bytes = self.file.tensor_bytes(name)?;
+        Ok(bytemuck::cast_slice(bytes))
+    }
+
     /// Get tensor dtype from header
-    fn tensor_dtype(&self, name: &str) -> Option<String> {
+    pub(crate) fn tensor_dtype(&self, name: &str) -> Option<String> {
         self.file.header.tensors.iter()
             .find(|t| t.name == name)
             .map(|t| t.dtype.clone())
@@ -1881,6 +1987,36 @@ impl LfmRunner {
         if dtype == "u32" && has_scales && has_biases {
             // Pre-quantized int4 path
             return self.linear_i4_out_in(input, weight_name, out_dim, in_dim, out);
+        }
+
+        if dtype == "i8" {
+            // Per-row symmetric int8 path (cellm --quantize-int8-symmetric).
+            let w = self.tensor_i8(weight_name)?;
+            let expected_len = out_dim * in_dim;
+            if w.len() != expected_len {
+                return Err(CoreError::Backend(format!(
+                    "linear_f16_out_in: weight shape mismatch for {weight_name}: got {} elements, expected {} ({}x{} i8)",
+                    w.len(), expected_len, out_dim, in_dim
+                )));
+            }
+            let scales = self.tensor_f16(&format!("{weight_name}.qscale"))?;
+            if scales.len() != out_dim {
+                return Err(CoreError::Backend(format!(
+                    "linear_f16_out_in: {weight_name}.qscale has {} entries, expected {out_dim}",
+                    scales.len()
+                )));
+            }
+
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            if let Some(ops) = &self.metal_ops {
+                ops.logits_i8(input, w, scales, out_dim, in_dim, weight_name, out)
+                    .map_err(|e| CoreError::Backend(e.to_string()))?;
+                return Ok(());
+            }
+
+            // W8A8: quantize the activation and use ARM SDOT integer dot products.
+            cellm_kernels::cpu_kernels::gemv_i8_w8a8(w, scales, input, out, out_dim, in_dim);
+            return Ok(());
         }
 
         // Standard f16 path

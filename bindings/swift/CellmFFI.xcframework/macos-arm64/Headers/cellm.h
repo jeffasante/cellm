@@ -224,6 +224,57 @@ int32_t cellm_vlm_last_timings_ms(
 uint32_t cellm_vlm_last_encoder_layer_count(void);
 int32_t cellm_vlm_last_encoder_layer_time_ms(uint32_t layer_index, double* out_ms);
 
+// ---------------------------------------------------------------------------
+// Text embeddings
+//
+// Separate handle from cellm_engine_t: an embedder has no KV cache, sampler or
+// session lifecycle. The model must be a bidirectional LFM2 checkpoint.
+// ---------------------------------------------------------------------------
+
+typedef uint64_t cellm_embedder_t;
+
+// Instruction prefixes the embedding model was trained with. Use QUERY for
+// search queries and DOCUMENT for indexed content; mixing them up measurably
+// degrades retrieval.
+#define CELLM_EMBED_NONE     0u
+#define CELLM_EMBED_QUERY    1u
+#define CELLM_EMBED_DOCUMENT 2u
+
+// Returns 0 on failure (see cellm_last_error_message).
+cellm_embedder_t cellm_embedder_create(
+    const char* model_path,
+    const char* tokenizer_path
+);
+
+void cellm_embedder_destroy(cellm_embedder_t embedder);
+
+// Embedding dimensionality, or -1 on error.
+int32_t cellm_embedder_dim(cellm_embedder_t embedder);
+
+// Max tokens considered; longer inputs are truncated. -1 on error.
+int32_t cellm_embedder_max_tokens(cellm_embedder_t embedder);
+
+// Writes `cellm_embedder_dim` L2-normalized floats into out_vec, so cosine
+// similarity is a plain dot product. Returns 0 on success, -1 on error.
+int32_t cellm_embed_text(
+    cellm_embedder_t embedder,
+    const char* text_utf8,
+    uint32_t prefix_kind,
+    float* out_vec,
+    size_t out_capacity
+);
+
+// Batch form: writes count*dim floats row-major. Returns the number of texts
+// embedded, or -1 on error.
+int32_t cellm_embed_texts(
+    cellm_embedder_t embedder,
+    const char* const* texts,
+    size_t count,
+    uint32_t prefix_kind,
+    float* out_vecs,
+    size_t out_capacity
+);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

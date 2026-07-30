@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use cellm_cache::{KVCache, KvEncodingKind, KvStorageKind, PageTable};
 use cellm_core::KvCacheLayout;
 use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, qwen::QwenRunner, lfm::LfmRunner, deepseek_v4::DeepSeekV4Runner, CellmFile, ModelConfig};
-use cellm_scheduler::{BatchDetector, BatchGroup, BatchSessionInfo, PolicyExecutor, RoundRobinScheduler, SchedulingPlan, SchedulingPolicy, Session as SchedSession, SessionState, ThermalLevel, ThermalPolicy};
+use cellm_scheduler::{BatchDetector, BatchSessionInfo, PolicyExecutor, RoundRobinScheduler, SchedulingPolicy, Session as SchedSession, SessionState, ThermalLevel, ThermalPolicy};
 use serde_json::Value;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -34,6 +34,7 @@ fn stats_elapsed_secs(_: &StatsInstant) -> Option<f64> {
 
 pub type SessionId = u64;
 
+pub mod embed_ffi;
 pub mod ffi;
 pub mod vlm;
 #[cfg(target_os = "android")]
@@ -60,7 +61,6 @@ pub struct EngineConfig {
 pub enum BackendKind {
     Cpu,
     Metal,
-    #[cfg(feature = "webgpu")]
     WebGpu,
 }
 
@@ -190,6 +190,12 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(model_path: &Path, engine_cfg: EngineConfig) -> anyhow::Result<Self> {
+        // Size rayon for single-stream decode before any kernel runs. Idempotent
+        // and a no-op once a global pool exists, so it is safe on every create.
+        // Without this, embedders reaching us through the C FFI (rather than the
+        // `infer` CLI) get rayon's default all-core pool, where Apple E-cores
+        // straggle on every join.
+        cellm_kernels::cpu_kernels::init_decode_thread_pool();
         apply_turboquant_runtime_config(&engine_cfg);
         let selected_backend = resolve_backend(engine_cfg.backend);
         let file = CellmFile::load(model_path)?;
@@ -261,7 +267,7 @@ impl Engine {
         let storage_kind = match selected_backend {
             BackendKind::Cpu => KvStorageKind::Cpu,
             BackendKind::Metal => KvStorageKind::Metal,
-            BackendKind::WebGpu => KvStorageKind::Cpu, // Use CPU for KV cache on WebGPU for now
+            BackendKind::WebGpu => KvStorageKind::Cpu, // CPU and WebGPU both use CPU KV storage for now
         };
         let kv_cache = KVCache::new_with_kind_and_encoding(layout, storage_kind, engine_cfg.kv_encoding)?;
 
@@ -339,7 +345,7 @@ impl Engine {
             _ => header.hidden_dim / header.num_heads.max(1),
         };
 
-        let mut runner = match text_model_type.as_str() {
+        let runner = match text_model_type.as_str() {
             "llama" | "smollm3" => Runner::Llama(LlamaRunner::from_file(file)?),
             t if t.starts_with("gemma") => Runner::Gemma(GemmaRunner::from_file(file)?),
             t if t.starts_with("qwen") => Runner::Qwen(QwenRunner::from_file(file)?),
@@ -366,7 +372,10 @@ impl Engine {
             num_kv_heads: cfg.num_key_value_heads,
             head_dim,
         };
-        let storage_kind = KvStorageKind::Cpu;
+        let storage_kind = match selected_backend {
+            BackendKind::Metal => KvStorageKind::Metal,
+            _ => KvStorageKind::Cpu,
+        };
         let kv_cache = KVCache::new_with_kind_and_encoding(layout, storage_kind, engine_cfg.kv_encoding)?;
 
         Ok(Self {
@@ -504,8 +513,25 @@ impl Engine {
             );
         }
 
-        let mut next = 0u32;
+        let next;
         s.pending_out.clear();
+
+        // A miss means the snapshot `reset_session` kept describes a different
+        // prompt, so its blocks are dead weight: prefill below starts at
+        // `next_pos` and appends, never reusing them. Leaving them allocated
+        // leaks a prompt's worth of blocks per question until the allocator is
+        // empty and prefill fails with "out of KV blocks".
+        s.page_table
+            .free_all(self.kv_cache.allocator_mut())
+            .map_err(|e| anyhow::anyhow!("free_all failed: {e}"))?;
+        s.next_pos = 0;
+        s.last_token = None;
+        s.recent.clear();
+        s.cached_prompt.clear();
+        s.cached_next_pos = 0;
+        s.cached_last_token = None;
+        s.cached_recent.clear();
+
         let (tokens_prefill, last_tok) = if tokens.len() > 1 {
             (&tokens[..tokens.len() - 1], tokens[tokens.len() - 1])
         } else {
@@ -1008,6 +1034,10 @@ fn apply_turboquant_runtime_config(cfg: &EngineConfig) {
 }
 
 fn resolve_backend(requested: BackendKind) -> BackendKind {
+    #[cfg(not(feature = "webgpu"))]
+    if matches!(requested, BackendKind::WebGpu) {
+        return BackendKind::Cpu;
+    }
     requested
 }
 

@@ -3,6 +3,9 @@ members = [
     "crates/*",
     "tools/*",
 ]
+# `tools/` also holds Python scripts; their __pycache__ dirs otherwise get
+# picked up by the glob above and break every cargo invocation.
+exclude = ["tools/__pycache__"]
 resolver = "2"
 
 [workspace.dependencies]

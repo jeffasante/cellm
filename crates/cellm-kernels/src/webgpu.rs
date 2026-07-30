@@ -1,4 +1,3 @@
-#![cfg(feature = "webgpu")]
 // Author: Jeffrey Asante (https://jeffasante.github.io/)
 //! WebGPU compute-kernel backend for cellm.
 //

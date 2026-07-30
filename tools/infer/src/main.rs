@@ -150,6 +150,8 @@ fn main() -> Result<()> {
         .filter_level(log::LevelFilter::Info)
         .init();
 
+    cellm_kernels::cpu_kernels::init_decode_thread_pool();
+
     let args = Args::parse();
     let t_startup = Instant::now();
 

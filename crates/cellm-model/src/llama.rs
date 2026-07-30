@@ -1323,6 +1323,18 @@ impl LlamaRunner {
             None
         };
 
+        if let Some(weights) = lm_src_f16 {
+            cellm_kernels::cpu_kernels::matmul_f16_f32(
+                weights,
+                vocab,
+                hidden,
+                &x_final,
+                &mut buf,
+            );
+            sanitize_logits_non_finite(&mut buf, "llama CPU f16 logits");
+            return Ok(buf);
+        }
+
         for vid in 0..vocab {
             let mut dot = if let Some(w) = lm_src_f16 {
                 let row = &w[vid * hidden..(vid + 1) * hidden];

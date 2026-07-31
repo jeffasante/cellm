@@ -71,3 +71,6 @@ __pycache__/
 run.py
 
 scratch/swiftgen
+
+# Model weights, wherever they land (models/* covers the usual location)
+*.cellm

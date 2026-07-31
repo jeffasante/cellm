@@ -742,6 +742,248 @@ fn gemv_i8_w8a8_with_scratch(
     }
 }
 
+/// Batched W8A8 INT8 GEMM: the same computation as calling [`gemv_i8_w8a8`]
+/// once per token, but reading each weight byte once for the whole batch
+/// instead of once per token.
+///
+/// A GEMV touches one weight byte per multiply-accumulate, so it is limited by
+/// memory bandwidth rather than arithmetic. Prefilling a 747-token prompt this
+/// way streams the entire model 747 times — hundreds of gigabytes to do work
+/// that only needs the weights once. Holding `n_tokens` activation columns in
+/// registers while a weight row is loaded amortises that read across the whole
+/// batch and turns the loop arithmetic-bound, where the cores are idle today.
+///
+/// Each token keeps its own activation scale, and accumulation stays in i32 in
+/// the same order as the single-token kernel, so results are bit-identical to
+/// the per-token path rather than merely close.
+///
+/// `input` is `[n_tokens, in_dim]` row-major; `out` is `[n_tokens, out_dim]`.
+/// Falls back to a per-token loop when SDOT is unavailable.
+pub fn gemm_i8_w8a8(
+    weight_i8: &[i8],
+    scales_f16: &[u16],
+    input: &[f32],
+    out: &mut [f32],
+    n_tokens: usize,
+    out_dim: usize,
+    in_dim: usize,
+) {
+    debug_assert_eq!(weight_i8.len(), out_dim * in_dim);
+    debug_assert_eq!(scales_f16.len(), out_dim);
+    debug_assert_eq!(input.len(), n_tokens * in_dim);
+    debug_assert_eq!(out.len(), n_tokens * out_dim);
+
+    if n_tokens == 0 {
+        return;
+    }
+    if n_tokens == 1 {
+        gemv_i8_w8a8(weight_i8, scales_f16, input, out, out_dim, in_dim);
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if has_i8_dotprod() {
+            // Quantize every token up front: the row loop below reuses these
+            // columns for all `out_dim` rows, so this cost is paid once per
+            // batch rather than once per row.
+            let mut xq = vec![0i8; n_tokens * in_dim];
+            let mut x_scales = vec![0.0f32; n_tokens];
+            for t in 0..n_tokens {
+                x_scales[t] = quantize_activation_i8(
+                    &input[t * in_dim..(t + 1) * in_dim],
+                    &mut xq[t * in_dim..(t + 1) * in_dim],
+                );
+            }
+
+            // Split by weight rows, not tokens: every task then walks a
+            // disjoint, contiguous slice of the weight matrix, and each task's
+            // share of the weights is read exactly once for all tokens.
+            let threads = rayon::current_num_threads().max(1);
+            let rows_per_task = out_dim.div_ceil(threads).max(4).next_multiple_of(4);
+
+            let xq: &[i8] = &xq;
+            let x_scales: &[f32] = &x_scales;
+
+            // `out` is token-major but the work is split row-major, so hand
+            // each task the row range and let it stride across tokens.
+            let row_chunks: Vec<(usize, usize)> = (0..out_dim)
+                .step_by(rows_per_task)
+                .map(|r0| (r0, (r0 + rows_per_task).min(out_dim)))
+                .collect();
+
+            let out_ptr = SendPtr(out.as_mut_ptr());
+            row_chunks.into_par_iter().for_each(|(r0, r1)| {
+                let out_ptr = &out_ptr;
+                // SAFETY: row ranges are disjoint, so the `(t, r)` cells written
+                // here are written by no other task.
+                unsafe {
+                    gemm_i8_dot_tile(
+                        weight_i8,
+                        &scales_f16[r0..r1],
+                        xq,
+                        x_scales,
+                        out_ptr.0,
+                        r0,
+                        r1,
+                        n_tokens,
+                        out_dim,
+                        in_dim,
+                    );
+                }
+            });
+            return;
+        }
+    }
+
+    for t in 0..n_tokens {
+        gemv_i8_w8a8(
+            weight_i8,
+            scales_f16,
+            &input[t * in_dim..(t + 1) * in_dim],
+            &mut out[t * out_dim..(t + 1) * out_dim],
+            out_dim,
+            in_dim,
+        );
+    }
+}
+
+/// Raw pointer wrapper so disjoint row ranges can be written from rayon tasks.
+///
+/// Needed because `out` is token-major while the parallel split is row-major,
+/// so the usual `par_chunks_mut` split does not line up with the work.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+struct SendPtr(*mut f32);
+
+// SAFETY: each task writes only cells in its own disjoint row range.
+#[cfg(target_arch = "aarch64")]
+unsafe impl Send for SendPtr {}
+#[cfg(target_arch = "aarch64")]
+unsafe impl Sync for SendPtr {}
+
+/// Core GEMM tile: 4 weight rows x 4 tokens per iteration.
+///
+/// The register block is what makes this worth doing. Loading four weight rows
+/// once and dotting them against four token columns yields 16 SDOT chains per
+/// pair of loads, so each weight byte fetched from memory does four times the
+/// work it does in the GEMV. Accumulation order within a row matches
+/// [`gemv_i8_dot_rows`] exactly, keeping results bit-identical.
+///
+/// # Safety
+/// Caller must have verified `dotprod`, and `out` must be a valid
+/// `[n_tokens, out_dim]` buffer whose rows `r0..r1` are exclusively owned.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemm_i8_dot_tile(
+    weight_i8: &[i8],
+    scales_f16: &[u16],
+    xq: &[i8],
+    x_scales: &[f32],
+    out: *mut f32,
+    r0: usize,
+    r1: usize,
+    n_tokens: usize,
+    out_dim: usize,
+    in_dim: usize,
+) {
+    use std::arch::aarch64::*;
+
+    let wp = weight_i8.as_ptr();
+    let xp = xq.as_ptr();
+
+    let mut r = r0;
+    while r < r1 {
+        let rows = (r1 - r).min(4);
+        let wb = [
+            r * in_dim,
+            (r + 1).min(out_dim - 1) * in_dim,
+            (r + 2).min(out_dim - 1) * in_dim,
+            (r + 3).min(out_dim - 1) * in_dim,
+        ];
+
+        let mut t = 0usize;
+        while t < n_tokens {
+            let toks = (n_tokens - t).min(4);
+            let xb = [
+                t * in_dim,
+                (t + 1).min(n_tokens - 1) * in_dim,
+                (t + 2).min(n_tokens - 1) * in_dim,
+                (t + 3).min(n_tokens - 1) * in_dim,
+            ];
+
+            // 4 rows x 4 tokens of independent SDOT accumulators.
+            let mut acc = [[vdupq_n_s32(0); 4]; 4];
+
+            let mut i = 0usize;
+            while i + 16 <= in_dim {
+                let w0 = vld1q_s8(wp.add(wb[0] + i));
+                let w1 = vld1q_s8(wp.add(wb[1] + i));
+                let w2 = vld1q_s8(wp.add(wb[2] + i));
+                let w3 = vld1q_s8(wp.add(wb[3] + i));
+
+                let x0 = vld1q_s8(xp.add(xb[0] + i));
+                let x1 = vld1q_s8(xp.add(xb[1] + i));
+                let x2 = vld1q_s8(xp.add(xb[2] + i));
+                let x3 = vld1q_s8(xp.add(xb[3] + i));
+
+                acc[0][0] = sdot_s32(acc[0][0], w0, x0);
+                acc[0][1] = sdot_s32(acc[0][1], w0, x1);
+                acc[0][2] = sdot_s32(acc[0][2], w0, x2);
+                acc[0][3] = sdot_s32(acc[0][3], w0, x3);
+
+                acc[1][0] = sdot_s32(acc[1][0], w1, x0);
+                acc[1][1] = sdot_s32(acc[1][1], w1, x1);
+                acc[1][2] = sdot_s32(acc[1][2], w1, x2);
+                acc[1][3] = sdot_s32(acc[1][3], w1, x3);
+
+                acc[2][0] = sdot_s32(acc[2][0], w2, x0);
+                acc[2][1] = sdot_s32(acc[2][1], w2, x1);
+                acc[2][2] = sdot_s32(acc[2][2], w2, x2);
+                acc[2][3] = sdot_s32(acc[2][3], w2, x3);
+
+                acc[3][0] = sdot_s32(acc[3][0], w3, x0);
+                acc[3][1] = sdot_s32(acc[3][1], w3, x1);
+                acc[3][2] = sdot_s32(acc[3][2], w3, x2);
+                acc[3][3] = sdot_s32(acc[3][3], w3, x3);
+
+                i += 16;
+            }
+
+            let mut sums = [[0i32; 4]; 4];
+            for (ri, accr) in acc.iter().enumerate() {
+                for (ti, a) in accr.iter().enumerate() {
+                    sums[ri][ti] = vaddvq_s32(*a);
+                }
+            }
+
+            // Tail elements, matching the GEMV's scalar remainder.
+            while i < in_dim {
+                for (ri, s) in sums.iter_mut().enumerate().take(rows) {
+                    let wv = *wp.add(wb[ri] + i) as i32;
+                    for (ti, sv) in s.iter_mut().enumerate().take(toks) {
+                        *sv += wv * *xp.add(xb[ti] + i) as i32;
+                    }
+                }
+                i += 1;
+            }
+
+            for ri in 0..rows {
+                let ws = f16::from_bits(scales_f16[r + ri - r0]).to_f32();
+                for ti in 0..toks {
+                    let v = sums[ri][ti] as f32 * ws * x_scales[t + ti];
+                    *out.add((t + ti) * out_dim + (r + ri)) = v;
+                }
+            }
+
+            t += 4;
+        }
+
+        r += 4;
+    }
+}
+
 pub fn matmul_i8_f32(
     a_i8: &[i8],
     a_scales_f16: &[u16],
@@ -1233,6 +1475,66 @@ mod w8a8_tests {
         let mut out = vec![9.0f32; 16];
         gemv_i8_w8a8(&w, &scales, &x, &mut out, 16, 64);
         assert!(out.iter().all(|v| *v == 0.0));
+    }
+
+    /// The batched kernel must be bit-identical to the per-token one.
+    ///
+    /// Prefill and decode share weights and must agree exactly: if batching
+    /// changed the arithmetic even slightly, a prompt would decode differently
+    /// depending on how it was chunked, which is far harder to debug than an
+    /// outright failure.
+    #[test]
+    fn gemm_is_bit_identical_to_per_token_gemv() {
+        use super::gemm_i8_w8a8;
+
+        for &(n_tokens, out_dim, in_dim) in &[
+            (1usize, 16usize, 64usize),
+            (2, 16, 64),
+            (3, 7, 33),   // rows, tokens and in_dim all non-multiples of 4/16
+            (5, 65, 96),
+            (8, 128, 1024),
+            (17, 36, 128), // token count not a multiple of the 4-wide tile
+        ] {
+            let (w, scales, _) = build(out_dim, in_dim);
+
+            // Distinct per-token activations, so a mixed-up token index shows up.
+            let mut x = vec![0.0f32; n_tokens * in_dim];
+            for t in 0..n_tokens {
+                for i in 0..in_dim {
+                    x[t * in_dim + i] =
+                        (((i * 37 + t * 101) % 211) as f32 - 105.0) / (90.0 + t as f32);
+                }
+            }
+
+            let mut got = vec![0.0f32; n_tokens * out_dim];
+            gemm_i8_w8a8(&w, &scales, &x, &mut got, n_tokens, out_dim, in_dim);
+
+            let mut want = vec![0.0f32; n_tokens * out_dim];
+            for t in 0..n_tokens {
+                gemv_i8_w8a8(
+                    &w,
+                    &scales,
+                    &x[t * in_dim..(t + 1) * in_dim],
+                    &mut want[t * out_dim..(t + 1) * out_dim],
+                    out_dim,
+                    in_dim,
+                );
+            }
+
+            for t in 0..n_tokens {
+                for r in 0..out_dim {
+                    let idx = t * out_dim + r;
+                    assert_eq!(
+                        got[idx].to_bits(),
+                        want[idx].to_bits(),
+                        "{n_tokens}x{out_dim}x{in_dim}: token {t} row {r}: \
+                         gemm {} != gemv {}",
+                        got[idx],
+                        want[idx]
+                    );
+                }
+            }
+        }
     }
 }
 

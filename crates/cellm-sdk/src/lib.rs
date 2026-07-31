@@ -106,6 +106,37 @@ enum Runner {
 }
 
 impl Runner {
+    /// Clears any per-sequence state a runner holds outside the KV cache.
+    ///
+    /// Only hybrid architectures need this. LFM2 interleaves attention layers
+    /// with convolution layers, and the conv layers keep a rolling window of
+    /// recent activations on the runner itself, where truncating the page
+    /// table cannot reach it. Purely attention-based runners keep everything
+    /// in the KV cache and have nothing to clear.
+    pub fn reset_state(&mut self) {
+        match self {
+            Runner::Lfm(r) => r.reset_state(),
+            Runner::Llama(_)
+            | Runner::Gemma(_)
+            | Runner::Qwen(_)
+            | Runner::DeepSeekV4(_) => {}
+        }
+    }
+
+    /// True when this runner carries per-sequence state that the KV cache does
+    /// not describe.
+    ///
+    /// This determines whether a prefill snapshot can be reused. The KV cache
+    /// is addressable — truncating the page table to token N restores exactly
+    /// the state after token N. Convolution state is not: it is a rolling
+    /// window that only moves forward, so there is no way to rewind it to
+    /// match a restored page table. Reusing a snapshot on such a runner yields
+    /// attention layers at token N and conv layers at token N+k, which decodes
+    /// to fluent-looking nonsense rather than an obvious failure.
+    pub fn has_recurrent_state(&self) -> bool {
+        matches!(self, Runner::Lfm(_))
+    }
+
     pub fn prefill(&mut self, tokens: &[u32], start_pos: usize, pt: &mut PageTable, kv: &mut KVCache) -> anyhow::Result<()> {
         match self {
             Runner::Llama(r) => r.prefill(tokens, start_pos, pt, kv).map_err(|e| anyhow::anyhow!(e)),
@@ -120,7 +151,18 @@ impl Runner {
                 r.prefill(tokens, start_pos, pt, kv).map_err(|e| anyhow::anyhow!(e))
             }
             Runner::Lfm(r) => {
-                r.prefill(tokens, start_pos, pt, kv).map_err(|e| anyhow::anyhow!(e))
+                // Batched prefill reads each weight once per chunk of tokens
+                // instead of once per token. Set CELLM_BATCHED_PREFILL=0 to fall
+                // back to the per-token path, which is useful for confirming the
+                // two agree on a given prompt.
+                let batched = std::env::var("CELLM_BATCHED_PREFILL")
+                    .map(|v| v != "0")
+                    .unwrap_or(true);
+                if batched {
+                    r.prefill_batched(tokens, start_pos, pt, kv).map_err(|e| anyhow::anyhow!(e))
+                } else {
+                    r.prefill(tokens, start_pos, pt, kv).map_err(|e| anyhow::anyhow!(e))
+                }
             }
             Runner::DeepSeekV4(r) => {
                 // Fallback for DeepSeekV4
@@ -474,7 +516,12 @@ impl Engine {
         meta.transition(SessionState::Prefill)
             .map_err(|e| anyhow::anyhow!("session transition failed: {e:?}"))?;
 
-        if !s.cached_prompt.is_empty()
+        // A snapshot can only be reused when the KV cache is the whole story.
+        // For hybrid runners it is not: conv state has moved on since the
+        // snapshot was taken and cannot be rewound, so a "hit" would pair a
+        // restored page table with stale convolution history.
+        if !self.runner.has_recurrent_state()
+            && !s.cached_prompt.is_empty()
             && s.cached_prompt == tokens
             && s.cached_last_token.is_some()
             && s.page_table.token_count() >= s.cached_next_pos
@@ -531,6 +578,11 @@ impl Engine {
         s.cached_next_pos = 0;
         s.cached_last_token = None;
         s.cached_recent.clear();
+
+        // Position 0 in the KV cache must mean position 0 everywhere. Freeing
+        // the blocks above clears attention history; this clears the conv
+        // history that lives outside them.
+        self.runner.reset_state();
 
         let (tokens_prefill, last_tok) = if tokens.len() > 1 {
             (&tokens[..tokens.len() - 1], tokens[tokens.len() - 1])
@@ -638,11 +690,19 @@ impl Engine {
     /// Reset session decode state while preserving any cached prefill snapshot.
     pub fn reset_session(&mut self, id: SessionId) -> anyhow::Result<()> {
         self.rr.remove(id);
+        // Hybrid runners cannot honour a kept snapshot: the conv window has
+        // advanced past it and does not rewind, so restoring the page table
+        // alone would leave the two halves of the model at different
+        // positions. Drop the snapshot and let the next prompt prefill.
+        let recurrent = self.runner.has_recurrent_state();
         let s = self
             .sessions
             .get_mut(&id)
             .ok_or_else(|| anyhow::anyhow!("unknown session id: {id}"))?;
-        let keep_tokens = if s.cached_last_token.is_some() && !s.cached_prompt.is_empty() {
+        let keep_tokens = if !recurrent
+            && s.cached_last_token.is_some()
+            && !s.cached_prompt.is_empty()
+        {
             s.cached_next_pos
         } else {
             0
@@ -658,8 +718,19 @@ impl Engine {
             s.next_pos = 0;
             s.last_token = None;
             s.recent.clear();
+            s.cached_prompt.clear();
+            s.cached_next_pos = 0;
+            s.cached_last_token = None;
+            s.cached_recent.clear();
         }
         s.pending_out.clear();
+
+        // Rewound to position 0, so the conv window must be zeroed too. When a
+        // snapshot was kept the runner has no recurrent state by definition,
+        // and this is a no-op.
+        if keep_tokens == 0 {
+            self.runner.reset_state();
+        }
 
         let meta = self
             .session_meta

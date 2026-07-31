@@ -35,3 +35,7 @@ harness = false
 [[bench]]
 name = "w8a8_stream"
 harness = false
+
+[[bench]]
+name = "gemm_batch"
+harness = false

@@ -922,6 +922,39 @@ impl LfmRunner {
         &self.cfg
     }
 
+    /// Clears the causal convolution state so the next sequence starts fresh.
+    ///
+    /// LFM2 is a hybrid architecture: attention layers keep their history in
+    /// the paged KV cache, but conv layers keep theirs here, in a rolling
+    /// window of the last `conv_kernel_size` gated activations. Resetting a
+    /// session truncates the page table and therefore misses this entirely,
+    /// so without this call generation N+1 begins with generation N's
+    /// convolution history still in the window.
+    ///
+    /// That leak is observable: with greedy decoding at temperature 0.0 the
+    /// same prompt produced three different outputs depending on what ran
+    /// before it, including a corrupted first token ("SubjectRXT") and
+    /// verbatim echoes of the previous prompt's source text.
+    ///
+    /// Must be called whenever a session is reset or a new sequence begins.
+    pub fn reset_state(&mut self) {
+        for state in &mut self.conv_states {
+            state.fill(0.0);
+        }
+
+        // The Metal path keeps its own copy in shared-storage buffers; zeroing
+        // the CPU vectors above does not touch them.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some(gs) = self.graph_state.as_mut() {
+            for buf in &gs.conv_states {
+                let len = buf.length() as usize;
+                unsafe {
+                    std::ptr::write_bytes(buf.contents() as *mut u8, 0, len);
+                }
+            }
+        }
+    }
+
     pub fn set_max_layers(&mut self, n: usize) {
         self.max_layers = n.min(self.cfg.num_hidden_layers).max(1);
     }
@@ -1083,6 +1116,384 @@ impl LfmRunner {
             self.step_inner(&x, pos, page_table, kv_cache, false)?;
         }
         Ok(())
+    }
+
+    /// Number of prompt tokens processed per batched prefill chunk.
+    ///
+    /// Large enough to amortise each weight read across many tokens, small
+    /// enough that a chunk's activations stay in cache: at hidden=1024 a
+    /// 32-token chunk is 128 KB of f32 activations. Measured 3-7x over the
+    /// per-token path on the real projection shapes, with gains flattening
+    /// beyond this.
+    const PREFILL_CHUNK: usize = 32;
+
+    /// Prefill that runs a whole chunk of tokens through each weight at once.
+    ///
+    /// Identical arithmetic to calling [`Self::prefill`], just reordered: the
+    /// per-token loop becomes the inner dimension of a GEMM instead of the
+    /// outer loop around a GEMV, so each weight is read once per chunk rather
+    /// than once per token.
+    ///
+    /// Only the CPU path is batched. Metal already coalesces its work into
+    /// command buffers, and the int4 dtype has no batched kernel, so both fall
+    /// back to [`Self::prefill`].
+    pub fn prefill_batched(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        page_table: &mut PageTable,
+        kv_cache: &mut KVCache,
+    ) -> Result<(), CoreError> {
+        if !self.can_batch_prefill() || tokens.len() < 2 {
+            return self.prefill(tokens, start_pos, page_table, kv_cache);
+        }
+
+        let cfg = self.cfg.clone();
+        let hidden = cfg.hidden_size;
+        let inter = cfg.intermediate_size;
+        let n_heads = cfg.num_attention_heads;
+        let n_kv_heads = cfg.num_key_value_heads;
+        let head_dim = cfg.head_dim;
+        let attn_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+
+        for (ci, chunk) in tokens.chunks(Self::PREFILL_CHUNK).enumerate() {
+            let nt = chunk.len();
+            let chunk_start = start_pos + ci * Self::PREFILL_CHUNK;
+
+            // Reserve cache slots for the whole chunk before any layer runs, so
+            // the page table can resolve every position in it.
+            for i in 0..nt {
+                if chunk_start + i == page_table.token_count() {
+                    page_table.append_token(kv_cache.allocator_mut()).map_err(|e| {
+                        CoreError::Backend(format!(
+                            "lfm prefill_batched: page_table append_token failed: {e}"
+                        ))
+                    })?;
+                }
+            }
+
+            let mut x = vec![0.0f32; nt * hidden];
+            for (i, &tok) in chunk.iter().enumerate() {
+                self.embed_token(tok, &mut x[i * hidden..(i + 1) * hidden])?;
+            }
+
+            let mut x_norm = vec![0.0f32; nt * hidden];
+            let mut norm_w = vec![0.0f32; hidden];
+            let mut bcx = vec![0.0f32; nt * hidden * 3];
+            let mut y = vec![0.0f32; nt * hidden];
+            let mut proj = vec![0.0f32; nt * hidden];
+            let mut q = vec![0.0f32; nt * attn_dim];
+            let mut k = vec![0.0f32; nt * kv_dim];
+            let mut v = vec![0.0f32; nt * kv_dim];
+            let mut attn_out = vec![0.0f32; nt * attn_dim];
+            let mut gate = vec![0.0f32; nt * inter];
+            let mut up = vec![0.0f32; nt * inter];
+            let mut conv_layer_idx = 0usize;
+
+            for layer in 0..self.max_layers {
+                let layer_type = self
+                    .layer_types
+                    .get(layer)
+                    .map(|s| s.as_str())
+                    .unwrap_or("conv")
+                    .to_string();
+
+                let op_norm_name = format!("model.layers.{layer}.operator_norm.weight");
+                self.rmsnorm_weight(&op_norm_name, &mut norm_w)?;
+                for t in 0..nt {
+                    let r = t * hidden..(t + 1) * hidden;
+                    rms_norm_f32(&x[r.clone()], &norm_w, cfg.rms_norm_eps, &mut x_norm[r]);
+                }
+
+                match layer_type.as_str() {
+                    "conv" => {
+                        self.linear_batched_out_in(
+                            &x_norm,
+                            &format!("model.layers.{layer}.conv.in_proj.weight"),
+                            nt,
+                            hidden * 3,
+                            hidden,
+                            &mut bcx,
+                        )?;
+
+                        // The convolution is the one part that cannot batch: its
+                        // state is a rolling window that advances one token at a
+                        // time. It is cheap (kernel_size MACs per channel) and
+                        // streams no weights, so leaving it sequential costs
+                        // little now that the projections around it are batched.
+                        let ks = self.conv_kernel_size;
+                        let conv_kernel_name = format!("model.layers.{layer}.conv.conv.weight");
+                        let kernel: Vec<u16> = {
+                            let bytes = self.file.tensor_bytes(&conv_kernel_name)?;
+                            bytemuck::cast_slice::<u8, u16>(bytes).to_vec()
+                        };
+                        let state = &mut self.conv_states[conv_layer_idx];
+
+                        for t in 0..nt {
+                            let base = t * hidden * 3;
+                            let b_part = &bcx[base..base + hidden];
+                            let c_part = &bcx[base + hidden..base + 2 * hidden];
+                            let x_part = &bcx[base + 2 * hidden..base + 3 * hidden];
+
+                            if ks > 1 {
+                                state.copy_within(hidden..(ks * hidden), 0);
+                            }
+                            for i in 0..hidden {
+                                state[(ks - 1) * hidden + i] = b_part[i] * x_part[i];
+                            }
+
+                            let yr = t * hidden;
+                            for i in 0..hidden {
+                                let mut acc = 0.0f32;
+                                let kernel_base = i * ks;
+                                for kk in 0..ks {
+                                    acc += state[kk * hidden + i]
+                                        * f16::from_bits(kernel[kernel_base + kk]).to_f32();
+                                }
+                                y[yr + i] = c_part[i] * acc;
+                            }
+                        }
+
+                        self.linear_batched_out_in(
+                            &y,
+                            &format!("model.layers.{layer}.conv.out_proj.weight"),
+                            nt,
+                            hidden,
+                            hidden,
+                            &mut proj,
+                        )?;
+
+                        conv_layer_idx += 1;
+                    }
+                    "full_attention" | "attention" => {
+                        self.linear_batched_out_in(
+                            &x_norm,
+                            &format!("model.layers.{layer}.self_attn.q_proj.weight"),
+                            nt,
+                            attn_dim,
+                            hidden,
+                            &mut q,
+                        )?;
+                        self.linear_batched_out_in(
+                            &x_norm,
+                            &format!("model.layers.{layer}.self_attn.k_proj.weight"),
+                            nt,
+                            kv_dim,
+                            hidden,
+                            &mut k,
+                        )?;
+                        self.linear_batched_out_in(
+                            &x_norm,
+                            &format!("model.layers.{layer}.self_attn.v_proj.weight"),
+                            nt,
+                            kv_dim,
+                            hidden,
+                            &mut v,
+                        )?;
+
+                        let q_norm_w: Option<Vec<f32>> = self
+                            .tensor_f16(&format!("model.layers.{layer}.self_attn.q_layernorm.weight"))
+                            .ok()
+                            .map(|w| w.iter().map(|&b| f16::from_bits(b).to_f32()).collect());
+                        let k_norm_w: Option<Vec<f32>> = self
+                            .tensor_f16(&format!("model.layers.{layer}.self_attn.k_layernorm.weight"))
+                            .ok()
+                            .map(|w| w.iter().map(|&b| f16::from_bits(b).to_f32()).collect());
+
+                        let mut head_buf = vec![0.0f32; head_dim];
+                        for t in 0..nt {
+                            let pos = chunk_start + t;
+                            let qb = t * attn_dim;
+                            let kb = t * kv_dim;
+
+                            if let Some(w) = &q_norm_w {
+                                for h in 0..n_heads {
+                                    let s = qb + h * head_dim;
+                                    rms_norm_f32(
+                                        &q[s..s + head_dim],
+                                        w,
+                                        cfg.rms_norm_eps,
+                                        &mut head_buf,
+                                    );
+                                    q[s..s + head_dim].copy_from_slice(&head_buf);
+                                }
+                            }
+                            if let Some(w) = &k_norm_w {
+                                for h in 0..n_kv_heads {
+                                    let s = kb + h * head_dim;
+                                    rms_norm_f32(
+                                        &k[s..s + head_dim],
+                                        w,
+                                        cfg.rms_norm_eps,
+                                        &mut head_buf,
+                                    );
+                                    k[s..s + head_dim].copy_from_slice(&head_buf);
+                                }
+                            }
+
+                            rope_non_interleaved_inplace_f32(
+                                &mut q[qb..qb + attn_dim],
+                                n_heads,
+                                head_dim,
+                                head_dim,
+                                pos,
+                                cfg.rope_theta,
+                            );
+                            rope_non_interleaved_inplace_f32(
+                                &mut k[kb..kb + kv_dim],
+                                n_kv_heads,
+                                head_dim,
+                                head_dim,
+                                pos,
+                                cfg.rope_theta,
+                            );
+
+                            let block_id = page_table.block_for_token(pos).map_err(|e| {
+                                CoreError::Backend(format!("lfm: block_for_token failed: {e}"))
+                            })?;
+                            let off = page_table.offset_in_block(pos).map_err(|e| {
+                                CoreError::Backend(format!("lfm: offset_in_block failed: {e}"))
+                            })?;
+                            let mut cv = kv_cache.view_mut();
+                            cv.write_token(
+                                block_id,
+                                layer,
+                                off,
+                                &k[kb..kb + kv_dim],
+                                &v[kb..kb + kv_dim],
+                            )?;
+                        }
+
+                        // Every K/V in this chunk is now written, so each token
+                        // can attend over exactly its own causal prefix. Gathering
+                        // 0..=pos is what the per-token path did implicitly, by
+                        // running before later tokens existed.
+                        let cr = kv_cache.view();
+                        let mut bases: Vec<usize> = Vec::with_capacity(chunk_start + nt);
+                        for t in 0..nt {
+                            let pos = chunk_start + t;
+                            bases.clear();
+                            for tpos in 0..=pos {
+                                let b = page_table.block_for_token(tpos).map_err(|e| {
+                                    CoreError::Backend(format!("lfm: block_for_token failed: {e}"))
+                                })?;
+                                let o = page_table.offset_in_block(tpos).map_err(|e| {
+                                    CoreError::Backend(format!("lfm: offset_in_block failed: {e}"))
+                                })?;
+                                bases.push(cr.layout.token_base_elem(b, layer, o)?);
+                            }
+                            cr.attention_single_token_gqa_from_bases(
+                                &bases,
+                                &q[t * attn_dim..(t + 1) * attn_dim],
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                None,
+                                None,
+                                &mut attn_out[t * attn_dim..(t + 1) * attn_dim],
+                            )?;
+                        }
+
+                        self.linear_batched_out_in(
+                            &attn_out,
+                            &format!("model.layers.{layer}.self_attn.out_proj.weight"),
+                            nt,
+                            hidden,
+                            attn_dim,
+                            &mut proj,
+                        )?;
+                    }
+                    _ => {
+                        return Err(CoreError::Backend(format!(
+                            "lfm: unknown layer type '{layer_type}' at layer {layer}"
+                        )));
+                    }
+                }
+
+                for i in 0..nt * hidden {
+                    x[i] += proj[i];
+                }
+
+                let ffn_norm_name = format!("model.layers.{layer}.ffn_norm.weight");
+                self.rmsnorm_weight(&ffn_norm_name, &mut norm_w)?;
+                for t in 0..nt {
+                    let r = t * hidden..(t + 1) * hidden;
+                    rms_norm_f32(&x[r.clone()], &norm_w, cfg.rms_norm_eps, &mut x_norm[r]);
+                }
+
+                self.linear_batched_out_in(
+                    &x_norm,
+                    &format!("model.layers.{layer}.feed_forward.w1.weight"),
+                    nt,
+                    inter,
+                    hidden,
+                    &mut gate,
+                )?;
+                self.linear_batched_out_in(
+                    &x_norm,
+                    &format!("model.layers.{layer}.feed_forward.w3.weight"),
+                    nt,
+                    inter,
+                    hidden,
+                    &mut up,
+                )?;
+
+                for i in 0..nt * inter {
+                    let g = gate[i];
+                    gate[i] = g * (1.0 / (1.0 + (-g).exp())) * up[i];
+                }
+
+                self.linear_batched_out_in(
+                    &gate,
+                    &format!("model.layers.{layer}.feed_forward.w2.weight"),
+                    nt,
+                    hidden,
+                    inter,
+                    &mut proj,
+                )?;
+
+                for i in 0..nt * hidden {
+                    x[i] += proj[i];
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// True when the batched prefill path applies.
+    ///
+    /// It reimplements only the CPU int8 route, so anything using Metal or a
+    /// non-int8 projection dtype must keep the per-token path to stay correct.
+    fn can_batch_prefill(&self) -> bool {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if self.metal_ops.is_some() {
+            return false;
+        }
+        if self.max_layers == 0 {
+            return false;
+        }
+        // All large projections share a dtype in practice; sample one per kind.
+        for layer in 0..self.max_layers {
+            let name = match self.layer_types.get(layer).map(|s| s.as_str()) {
+                Some("conv") => format!("model.layers.{layer}.conv.in_proj.weight"),
+                Some("full_attention") | Some("attention") => {
+                    format!("model.layers.{layer}.self_attn.q_proj.weight")
+                }
+                _ => return false,
+            };
+            if self.tensor_dtype(&name).as_deref() != Some("i8") {
+                return false;
+            }
+            if self.tensor_dtype(&format!("model.layers.{layer}.feed_forward.w1.weight"))
+                .as_deref()
+                != Some("i8")
+            {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn prefill_topk(
@@ -1960,6 +2371,80 @@ impl LfmRunner {
         self.file.header.tensors.iter()
             .find(|t| t.name == name)
             .map(|t| t.dtype.clone())
+    }
+
+    /// Applies a linear layer to `n_tokens` activations at once.
+    ///
+    /// A GEMV reads the whole weight matrix to produce one output vector, so
+    /// prefilling token-by-token re-reads every weight once per token. For a
+    /// 350M model and a 750-token prompt that is hundreds of gigabytes of
+    /// memory traffic to do work the weights only need to be read once for.
+    /// Passing the batch down to a GEMM amortises each weight read across all
+    /// the tokens in the chunk.
+    ///
+    /// `input` is `[n_tokens, in_dim]` row-major and `out` is
+    /// `[n_tokens, out_dim]`. Only the int8 path is batched, since that is what
+    /// this model's large tensors use; every other dtype falls back to a
+    /// per-token loop, which is exactly what it did before.
+    fn linear_batched_out_in(
+        &mut self,
+        input: &[f32],
+        weight_name: &str,
+        n_tokens: usize,
+        out_dim: usize,
+        in_dim: usize,
+        out: &mut [f32],
+    ) -> Result<(), CoreError> {
+        if n_tokens == 0 {
+            return Ok(());
+        }
+
+        let dtype = self.tensor_dtype(weight_name).unwrap_or_else(|| "f16".to_string());
+
+        // The GEMM is CPU-only, and the Metal path already batches its own work
+        // into command buffers, so leave it alone.
+        let use_gemm = dtype == "i8" && n_tokens > 1 && {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                self.metal_ops.is_none()
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            {
+                true
+            }
+        };
+
+        if use_gemm {
+            let w = self.tensor_i8(weight_name)?;
+            let expected_len = out_dim * in_dim;
+            if w.len() != expected_len {
+                return Err(CoreError::Backend(format!(
+                    "linear_batched_out_in: weight shape mismatch for {weight_name}: got {} elements, expected {expected_len}",
+                    w.len()
+                )));
+            }
+            let scales = self.tensor_f16(&format!("{weight_name}.qscale"))?;
+            if scales.len() != out_dim {
+                return Err(CoreError::Backend(format!(
+                    "linear_batched_out_in: {weight_name}.qscale has {} entries, expected {out_dim}",
+                    scales.len()
+                )));
+            }
+            cellm_kernels::cpu_kernels::gemm_i8_w8a8(
+                w, scales, input, out, n_tokens, out_dim, in_dim,
+            );
+            return Ok(());
+        }
+
+        for t in 0..n_tokens {
+            let (i0, i1) = (t * in_dim, (t + 1) * in_dim);
+            let (o0, o1) = (t * out_dim, (t + 1) * out_dim);
+            // Split the borrow: the input rows are read-only here, and
+            // `linear_f16_out_in` needs `&mut self` for its weight cache.
+            let row = input[i0..i1].to_vec();
+            self.linear_f16_out_in(&row, weight_name, out_dim, in_dim, &mut out[o0..o1])?;
+        }
+        Ok(())
     }
 
     /// Dequantize int4 weights and perform matmul: out = weight @ input

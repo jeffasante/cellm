@@ -69,3 +69,5 @@ __pycache__/
 
 # Local scratch script, unrelated to cellm
 run.py
+
+scratch/swiftgen

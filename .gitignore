@@ -63,6 +63,10 @@ todos/1.md
 research/experimentals
 __pycache__/
 
+# Unpublished research. Anything here stays local until it is deliberately
+# moved out; the public repo is MIT/Apache so nothing lands here by accident.
+private-research/
+
 # Editor / assistant local state (contains absolute paths to this machine)
 .idea/
 .roots/

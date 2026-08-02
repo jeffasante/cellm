@@ -67,16 +67,27 @@ func backendRaw(_ s: String) -> UInt32 {
 }
 
 let args = CommandLine.arguments
+let promptFile = parseFlag("--prompt-file", in: args)
+let promptFileText = promptFile.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) }
 guard let model = parseFlag("--model", in: args),
       let tokenizerPath = parseFlag("--tokenizer", in: args),
-      let prompt = parseFlag("--prompt", in: args)
+      let prompt = promptFileText ?? parseFlag("--prompt", in: args)
 else {
     fputs("""
 Usage:
   swift run CellmSmoke --model /path/model.cellm[d] --tokenizer /path/tokenizer.json --prompt "text" [--backend cpu|metal] [--gen 32]
+
+Options:
+  --prompt-file PATH  Read the prompt from a file instead of --prompt.
+  --raw               Send the prompt verbatim (no Gemma turn wrapping).
+                      Use for models with their own template, e.g. ChatML.
 """, stderr)
     exit(2)
 }
+
+// Prompts for non-Gemma templates (ChatML, etc.) must not be re-wrapped.
+let rawPrompt = args.contains("--raw")
+func preparePrompt(_ p: String) -> String { rawPrompt ? p : wrapGemmaPrompt(p) }
 
 let backend = parseFlag("--backend", in: args, default: "cpu") ?? "cpu"
 let gen = Int(parseFlag("--gen", in: args, default: "32") ?? "32") ?? 32
@@ -97,11 +108,16 @@ if tok == 0 {
 }
 defer { cellm_tokenizer_destroy(tok) }
 
+// tokensPerBlock * totalBlocks caps prompt + generation; the defaults hold
+// only 384 tokens, which overflows on realistic prompts.
+let tokensPerBlock = UInt32(parseFlag("--block", in: args, default: "8") ?? "8") ?? 8
+let totalBlocks = UInt32(parseFlag("--blocks", in: args, default: "48") ?? "48") ?? 48
+
 let engine = model.withCString { cstr in
     cellm_engine_create_v4(
         cstr,
-        8,
-        48,
+        tokensPerBlock,
+        totalBlocks,
         40,
         0.0,
         1.08,
@@ -120,7 +136,7 @@ defer { cellm_engine_destroy(engine) }
 
 if cellm_engine_is_litert_proxy(engine) != 0 {
     print("Detected LiteRT-LM model. Using direct generation API.")
-    let wrapped = wrapGemmaPrompt(prompt)
+    let wrapped = preparePrompt(prompt)
     let needed = wrapped.withCString { cstr in
         cellm_engine_generate_text(engine, cstr, nil, 0)
     }
@@ -147,7 +163,7 @@ var backendBuf = [CChar](repeating: 0, count: 32)
 _ = cellm_engine_backend_name(engine, &backendBuf, backendBuf.count)
 print("active_backend=\(String(cString: backendBuf))")
 
-let wrapped = wrapGemmaPrompt(prompt)
+let wrapped = preparePrompt(prompt)
 let promptTokens = try encode(tok: tok, text: wrapped)
 print("prompt_tokens=\(promptTokens.count)")
 

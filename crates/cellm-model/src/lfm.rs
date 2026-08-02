@@ -2162,6 +2162,22 @@ impl LfmRunner {
 
                     *logit = acc;
                 });
+            } else if dtype == "i4" {
+                // Per-row symmetric int4 tied embeddings. This is the single
+                // largest matmul in the model, so consuming the packed nibbles
+                // directly rather than dequantizing matters most here.
+                let emb = self.tensor_u8("model.embed_tokens.weight")?;
+                let scales = self.tensor_f16("model.embed_tokens.weight.qscale")?;
+                let group_size = hidden / (scales.len() / cfg.vocab_size).max(1);
+                cellm_kernels::cpu_kernels::gemv_i4_w4a8(
+                    emb,
+                    scales,
+                    &x_final,
+                    &mut logits,
+                    cfg.vocab_size,
+                    hidden,
+                    group_size,
+                );
             } else if dtype == "i8" {
                 // Per-row symmetric int8 tied embeddings
                 let emb = self.tensor_i8("model.embed_tokens.weight")?;
@@ -2305,6 +2321,27 @@ impl LfmRunner {
                     out[j] = q * scale + bias;
                 }
             }
+        } else if dtype == "i4" {
+            // Per-row symmetric int4 embeddings: one row gather, two weights
+            // per byte, stored biased by +8.
+            let emb = self.tensor_u8("model.embed_tokens.weight")?;
+            let scales = self.tensor_f16("model.embed_tokens.weight.qscale")?;
+            let row_stride = hidden.div_ceil(2);
+            let row_start = (token as usize) * row_stride;
+            if row_start + row_stride > emb.len() {
+                return Err(CoreError::Backend(
+                    "embed_tokens.weight shape mismatch".into(),
+                ));
+            }
+            let groups_per_row = (scales.len() / vocab.max(1)).max(1);
+            let group_size = hidden / groups_per_row;
+            let srow = (token as usize) * groups_per_row;
+            for i in 0..hidden {
+                let byte = emb[row_start + i / 2];
+                let nibble = if i % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+                let scale = f16::from_bits(scales[srow + i / group_size]).to_f32();
+                out[i] = (nibble as i32 - 8) as f32 * scale;
+            }
         } else if dtype == "i8" {
             // Per-row symmetric int8 embeddings
             let emb = self.tensor_i8("model.embed_tokens.weight")?;
@@ -2364,6 +2401,10 @@ impl LfmRunner {
     fn tensor_i8(&self, name: &str) -> Result<&[i8], CoreError> {
         let bytes = self.file.tensor_bytes(name)?;
         Ok(bytemuck::cast_slice(bytes))
+    }
+
+    fn tensor_u8(&self, name: &str) -> Result<&[u8], CoreError> {
+        self.file.tensor_bytes(name).map_err(CoreError::from)
     }
 
     /// Get tensor dtype from header
@@ -2472,6 +2513,35 @@ impl LfmRunner {
         if dtype == "u32" && has_scales && has_biases {
             // Pre-quantized int4 path
             return self.linear_i4_out_in(input, weight_name, out_dim, in_dim, out);
+        }
+
+        if dtype == "i4" {
+            // Per-row symmetric int4, two weights per byte. Unlike the MLX "u32"
+            // path above this never materialises the matrix in f32: the packed
+            // nibbles feed ARM SDOT directly, so a decode step moves half the
+            // bytes of the int8 path instead of eight times as many.
+            let w = self.tensor_u8(weight_name)?;
+            let expected_len = out_dim * in_dim.div_ceil(2);
+            if w.len() != expected_len {
+                return Err(CoreError::Backend(format!(
+                    "linear_f16_out_in: weight shape mismatch for {weight_name}: got {} bytes, expected {} ({}x{} i4)",
+                    w.len(), expected_len, out_dim, in_dim
+                )));
+            }
+            let scales = self.tensor_f16(&format!("{weight_name}.qscale"))?;
+            let groups_per_row = scales.len() / out_dim.max(1);
+            if groups_per_row == 0 || scales.len() % out_dim != 0 {
+                return Err(CoreError::Backend(format!(
+                    "linear_f16_out_in: {weight_name}.qscale has {} entries, not a multiple of {out_dim}",
+                    scales.len()
+                )));
+            }
+            let group_size = in_dim / groups_per_row;
+
+            cellm_kernels::cpu_kernels::gemv_i4_w4a8(
+                w, scales, input, out, out_dim, in_dim, group_size,
+            );
+            return Ok(());
         }
 
         if dtype == "i8" {

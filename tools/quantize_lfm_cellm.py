@@ -6,76 +6,47 @@ using the MLX-style format that the LFM runner already supports.
 Produces: u32 packed weights + f32 scales + f32 biases
 """
 
+import argparse
 import json
 import struct
-import sys
 from pathlib import Path
 
 import numpy as np
 
 
-def quantize_row_affine(row: np.ndarray, group_size: int = 64):
-    """Quantize a 1D row to int4 affine.
-    Returns (packed_u32, scales_f32, biases_f32).
+def quantize_weight_2d(weight_f16: np.ndarray, group_size: int = 64):
+    """Quantize a 2D f16 weight [out_dim, in_dim] to int4 MLX format.
+
+    Returns (packed_u32 [out,in/8], scales_f32 [out,groups], biases_f32 [out,groups]).
     """
-    n = len(row)
-    n_groups = (n + group_size - 1) // group_size
-    scales = np.zeros(n_groups, dtype=np.float32)
-    biases = np.zeros(n_groups, dtype=np.float32)
-    quantized = np.zeros(n, dtype=np.uint8)
+    w = weight_f16.astype(np.float32)
+    out_dim, in_dim = w.shape
+    if in_dim % group_size != 0 or in_dim % 8 != 0:
+        raise ValueError(f"in_dim {in_dim} must be a multiple of {group_size} and 8")
+    n_groups = in_dim // group_size
 
-    for g in range(n_groups):
-        start = g * group_size
-        end = min(start + group_size, n)
-        group = row[start:end]
-        g_min = group.min()
-        g_max = group.max()
+    g = w.reshape(out_dim, n_groups, group_size)
+    g_min = g.min(axis=2)
+    g_max = g.max(axis=2)
+    span = g_max - g_min
+    # A constant group has no range to encode; store the value in the bias and
+    # a zero scale so dequant reproduces it exactly.
+    degenerate = span == 0
+    scales = np.where(degenerate, 0.0, span / 15.0).astype(np.float32)
+    biases = g_min.astype(np.float32)
 
-        if g_max == g_min:
-            scales[g] = 0.0
-            biases[g] = float(g_min)
-            quantized[start:end] = 0
-        else:
-            scale = (g_max - g_min) / 15.0
-            bias = g_min
-            q = np.round((group - bias) / scale).clip(0, 15).astype(np.uint8)
-            scales[g] = scale
-            biases[g] = bias
-            quantized[start:end] = q
+    safe_scale = np.where(degenerate, 1.0, scales)
+    q = np.rint((g - biases[:, :, None]) / safe_scale[:, :, None])
+    q = np.clip(q, 0, 15).astype(np.uint8)
+    q[degenerate] = 0
+    q = q.reshape(out_dim, in_dim)
 
-    # Pack 8x 4-bit values per uint32
-    n_packed = (n + 7) // 8
-    packed = np.zeros(n_packed, dtype=np.uint32)
-    for p in range(n_packed):
-        val = 0
-        for k in range(8):
-            idx = p * 8 + k
-            if idx < n:
-                val |= (int(quantized[idx]) & 0xF) << (k * 4)
-        packed[p] = val
+    # Pack 8 nibbles per uint32, little-endian nibble order.
+    nib = q.reshape(out_dim, in_dim // 8, 8).astype(np.uint32)
+    shifts = (np.arange(8, dtype=np.uint32) * 4)
+    packed = np.bitwise_or.reduce(nib << shifts, axis=2).astype(np.uint32)
 
     return packed, scales, biases
-
-
-def quantize_weight_2d(weight_f16: np.ndarray, group_size: int = 64):
-    """Quantize a 2D f16 weight [out_dim, in_dim] to int4 MLX format."""
-    weight_f32 = weight_f16.astype(np.float32)
-    out_dim, in_dim = weight_f32.shape
-    packed_rows = []
-    scales_rows = []
-    biases_rows = []
-
-    for i in range(out_dim):
-        packed, scales, biases = quantize_row_affine(weight_f32[i, :], group_size)
-        packed_rows.append(packed)
-        scales_rows.append(scales)
-        biases_rows.append(biases)
-
-    return (
-        np.stack(packed_rows),  # [out_dim, packed_in]  uint32
-        np.stack(scales_rows),  # [out_dim, n_groups]   float32
-        np.stack(biases_rows),
-    )  # [out_dim, n_groups]   float32
 
 
 def read_cellm(path: Path):

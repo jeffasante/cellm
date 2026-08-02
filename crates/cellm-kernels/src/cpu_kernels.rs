@@ -848,6 +848,232 @@ pub fn gemm_i8_w8a8(
     }
 }
 
+/// Deinterleave an INT8 activation vector into even and odd halves.
+///
+/// A packed i4 weight byte holds element `2i` in its low nibble and `2i+1` in
+/// its high nibble. Masking and shifting a 16-byte load therefore yields two
+/// vectors of *strided* weights, which only line up with the activations if the
+/// activations are strided the same way. Doing that shuffle on the activation
+/// once per GEMV — rather than on every weight row — keeps the inner loop pure
+/// load-and-SDOT, which matters because the weights are the bandwidth cost.
+///
+/// `even[i] = xq[2i]`, `odd[i] = xq[2i + 1]`.
+#[cfg(target_arch = "aarch64")]
+fn deinterleave_i8(xq: &[i8], even: &mut [i8], odd: &mut [i8]) {
+    use std::arch::aarch64::*;
+
+    let half = xq.len() / 2;
+    debug_assert!(even.len() >= half && odd.len() >= half);
+
+    let mut i = 0usize;
+    // SAFETY: each iteration reads 32 bytes from `xq` and writes 16 to each
+    // half, all bounds-checked by the `i + 16 <= half` guard.
+    unsafe {
+        let xp = xq.as_ptr();
+        while i + 16 <= half {
+            let pair = vld2q_s8(xp.add(i * 2));
+            vst1q_s8(even.as_mut_ptr().add(i), pair.0);
+            vst1q_s8(odd.as_mut_ptr().add(i), pair.1);
+            i += 16;
+        }
+    }
+    while i < half {
+        even[i] = xq[i * 2];
+        odd[i] = xq[i * 2 + 1];
+        i += 1;
+    }
+}
+
+/// SDOT-accelerated INT4 x INT8 GEMV over a contiguous row range.
+///
+/// Weights are the `"i4"` on-disk layout: byte-packed two-per-byte, element `2i`
+/// in the low nibble and `2i+1` in the high nibble, stored biased by +8 so the
+/// nibble range `0..15` maps to `-7..=7`. Scales are per group of `group_size`
+/// consecutive input elements, laid out `[out_dim, groups_per_row]`.
+///
+/// The `+8` bias is removed algebraically rather than per element. Since
+/// `sum((n_j - 8) * x_j) == sum(n_j * x_j) - 8 * sum(x_j)` over a group, and the
+/// group activation sums are the same for every output row, the correction costs
+/// one multiply per group instead of a `vsub` in the inner loop. That keeps the
+/// loop at two SDOTs per 16 weight bytes — one for the even lane, one for the odd.
+///
+/// # Safety
+/// The caller must have verified `dotprod` via [`has_i8_dotprod`], must have
+/// checked `in_dim % group_size == 0` and `group_size % 32 == 0`, and
+/// `xq_even`/`xq_odd` must hold at least `in_dim / 2` entries each.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemv_i4_dot_rows(
+    weight_i4: &[u8],
+    scales_f16: &[u16],
+    xq_even: &[i8],
+    xq_odd: &[i8],
+    x_scale: f32,
+    x_group_sums: &[i32],
+    out: &mut [f32],
+    row_off: usize,
+    in_dim: usize,
+    group_size: usize,
+) {
+    use std::arch::aarch64::*;
+
+    let row_stride = in_dim / 2;
+    let bytes_per_group = group_size / 2;
+    let groups_per_row = in_dim / group_size;
+    let wp = weight_i4.as_ptr();
+    let ep = xq_even.as_ptr();
+    let op = xq_odd.as_ptr();
+    let lo_mask = vdupq_n_u8(0x0f);
+
+    for r in 0..out.len() {
+        let base = (row_off + r) * row_stride;
+        let srow = r * groups_per_row;
+        let mut dot = 0.0f32;
+
+        for g in 0..groups_per_row {
+            let gb = g * bytes_per_group;
+            let mut acc_e = vdupq_n_s32(0);
+            let mut acc_o = vdupq_n_s32(0);
+
+            // 16 packed bytes = 32 weights per iteration.
+            let mut b = 0usize;
+            while b + 16 <= bytes_per_group {
+                let packed = vld1q_u8(wp.add(base + gb + b));
+                let lo = vreinterpretq_s8_u8(vandq_u8(packed, lo_mask));
+                let hi = vreinterpretq_s8_u8(vshrq_n_u8::<4>(packed));
+                acc_e = sdot_s32(acc_e, lo, vld1q_s8(ep.add(gb + b)));
+                acc_o = sdot_s32(acc_o, hi, vld1q_s8(op.add(gb + b)));
+                b += 16;
+            }
+
+            let acc = vaddvq_s32(acc_e) + vaddvq_s32(acc_o);
+            // Undo the +8 storage bias for the whole group at once.
+            let gs = f16::from_bits(scales_f16[srow + g]).to_f32();
+            dot += (acc - 8 * x_group_sums[g]) as f32 * gs;
+        }
+
+        out[r] = dot * x_scale;
+    }
+}
+
+/// W4A8 INT4 GEMV: quantizes the activation to INT8 and dots it against packed
+/// 4-bit weights with ARM SDOT, without materialising the weights as f32.
+///
+/// `weight_i4` is `[out_dim, in_dim / 2]` row-major and `scales_f16` is
+/// `[out_dim, in_dim / group_size]`, matching the converter's `--quantize-int4`
+/// output. A single scale per row leaves only 15 levels to cover a whole
+/// 1024-wide row, which measurably degrades output; grouping keeps the step size
+/// local to a slice of the row and costs one f16 per 64 weights.
+///
+/// Falls back to a scalar dequant-and-dot loop when SDOT is unavailable or the
+/// dimensions do not divide evenly.
+pub fn gemv_i4_w4a8(
+    weight_i4: &[u8],
+    scales_f16: &[u16],
+    input: &[f32],
+    out: &mut [f32],
+    out_dim: usize,
+    in_dim: usize,
+    group_size: usize,
+) {
+    debug_assert_eq!(input.len(), in_dim);
+    debug_assert_eq!(out.len(), out_dim);
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if has_i8_dotprod() && group_size % 32 == 0 && in_dim % group_size == 0 {
+            let half = in_dim / 2;
+            let mut xq = vec![0i8; in_dim];
+            let x_scale = quantize_activation_i8(input, &mut xq);
+            if x_scale == 0.0 {
+                out.fill(0.0);
+                return;
+            }
+
+            let mut even = vec![0i8; half];
+            let mut odd = vec![0i8; half];
+            deinterleave_i8(&xq, &mut even, &mut odd);
+            let x_group_sums: Vec<i32> = xq
+                .chunks(group_size)
+                .map(|g| g.iter().map(|&v| v as i32).sum())
+                .collect();
+
+            let threads = rayon::current_num_threads().max(1);
+            const MIN_MACS_PER_TASK: usize = 512 * 1024;
+            let rows_per_task = out_dim
+                .div_ceil(threads * 8)
+                .max(MIN_MACS_PER_TASK.div_ceil(in_dim.max(1)))
+                .next_multiple_of(4);
+            const PAR_MAC_THRESHOLD: usize = MIN_MACS_PER_TASK * 2;
+
+            if out_dim <= rows_per_task || out_dim * in_dim < PAR_MAC_THRESHOLD {
+                unsafe {
+                    gemv_i4_dot_rows(
+                        weight_i4,
+                        scales_f16,
+                        &even,
+                        &odd,
+                        x_scale,
+                        &x_group_sums,
+                        out,
+                        0,
+                        in_dim,
+                        group_size,
+                    );
+                }
+            } else {
+                let groups_per_row = in_dim / group_size;
+                let (even, odd, sums) = (&even[..], &odd[..], &x_group_sums[..]);
+                out.par_chunks_mut(rows_per_task)
+                    .enumerate()
+                    .for_each(|(ci, chunk)| {
+                        let row_off = ci * rows_per_task;
+                        let s = &scales_f16[row_off * groups_per_row
+                            ..(row_off + chunk.len()) * groups_per_row];
+                        unsafe {
+                            gemv_i4_dot_rows(
+                                weight_i4, s, even, odd, x_scale, sums, chunk, row_off, in_dim,
+                                group_size,
+                            );
+                        }
+                    });
+            }
+            return;
+        }
+    }
+
+    gemv_i4_f32_ref(weight_i4, scales_f16, input, out, out_dim, in_dim, group_size);
+}
+
+/// Scalar reference for [`gemv_i4_w4a8`]: dequantizes in f32 with no activation
+/// quantization. Used on non-SDOT hardware and as the test oracle.
+pub fn gemv_i4_f32_ref(
+    weight_i4: &[u8],
+    scales_f16: &[u16],
+    input: &[f32],
+    out: &mut [f32],
+    out_dim: usize,
+    in_dim: usize,
+    group_size: usize,
+) {
+    debug_assert_eq!(out.len(), out_dim);
+    let row_stride = in_dim.div_ceil(2);
+    let groups_per_row = in_dim.div_ceil(group_size);
+    out.par_iter_mut().enumerate().for_each(|(r, o)| {
+        let base = r * row_stride;
+        let srow = r * groups_per_row;
+        let mut acc = 0.0f32;
+        for j in 0..in_dim {
+            let byte = weight_i4[base + j / 2];
+            let nibble = if j % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+            let scale = f16::from_bits(scales_f16[srow + j / group_size]).to_f32();
+            acc += (nibble as i32 - 8) as f32 * scale * input[j];
+        }
+        *o = acc;
+    });
+}
+
 /// Raw pointer wrapper so disjoint row ranges can be written from rayon tasks.
 ///
 /// Needed because `out` is token-major while the parallel split is row-major,
@@ -1418,6 +1644,77 @@ pub fn matmul_affine_i4_f32(
         }
         *value = dot;
     });
+}
+
+#[cfg(test)]
+mod w4a8_tests {
+    use super::{gemv_i4_f32_ref, gemv_i4_w4a8};
+    use half::f16;
+
+    fn build(out_dim: usize, in_dim: usize, gs: usize) -> (Vec<u8>, Vec<u16>, Vec<f32>) {
+        let row_stride = in_dim.div_ceil(2);
+        let mut seed = 0x9e3779b9u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 24) & 0xff
+        };
+        // Two nibbles per byte, each already biased by +8 into 1..=15.
+        let w: Vec<u8> = (0..out_dim * row_stride)
+            .map(|_| {
+                let lo = (next() % 15) + 1;
+                let hi = (next() % 15) + 1;
+                (lo | (hi << 4)) as u8
+            })
+            .collect();
+        let groups = out_dim * in_dim.div_ceil(gs);
+        let scales: Vec<u16> = (0..groups)
+            .map(|g| f16::from_f32(0.002 + (g % 5) as f32 * 0.0007).to_bits())
+            .collect();
+        let x: Vec<f32> = (0..in_dim)
+            .map(|i| ((i * 53 % 197) as f32 - 98.0) / 80.0)
+            .collect();
+        (w, scales, x)
+    }
+
+    #[test]
+    fn w4a8_matches_f32_reference_within_activation_quant_error() {
+        for &(out_dim, in_dim, gs) in &[
+            (4usize, 64usize, 64usize),
+            (8, 128, 32),
+            (128, 1024, 64),
+            (68, 96, 32),
+        ] {
+            let (w, scales, x) = build(out_dim, in_dim, gs);
+            let mut got = vec![0.0f32; out_dim];
+            let mut want = vec![0.0f32; out_dim];
+            gemv_i4_w4a8(&w, &scales, &x, &mut got, out_dim, in_dim, gs);
+            gemv_i4_f32_ref(&w, &scales, &x, &mut want, out_dim, in_dim, gs);
+
+            let norm = want.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+            let err = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f32>()
+                .sqrt();
+            assert!(
+                err / norm < 0.02,
+                "{out_dim}x{in_dim} gs={gs}: relative error {} too high\ngot  {:?}\nwant {:?}",
+                err / norm,
+                &got[..got.len().min(4)],
+                &want[..want.len().min(4)]
+            );
+        }
+    }
+
+    #[test]
+    fn w4a8_zero_activation_yields_zero() {
+        let (w, scales, _) = build(16, 64, 64);
+        let x = vec![0.0f32; 64];
+        let mut got = vec![1.0f32; 16];
+        gemv_i4_w4a8(&w, &scales, &x, &mut got, 16, 64, 64);
+        assert!(got.iter().all(|&v| v == 0.0), "got {got:?}");
+    }
 }
 
 #[cfg(test)]

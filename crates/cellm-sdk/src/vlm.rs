@@ -15,7 +15,7 @@ use cellm_kernels::metal::MetalMatmul;
 use cellm_kernels::MetalKernels;
 #[cfg(feature = "webgpu")]
 use cellm_kernels::VisionWebGpu;
-use cellm_model::{gemma::GemmaRunner, llama::LlamaRunner, CellmFile};
+use cellm_model::{gemma::GemmaRunner, lfm::LfmRunner, llama::LlamaRunner, CellmFile};
 use half::f16;
 use image::RgbImage;
 use ndarray::{Array2, Array3, Array4, Array5, Axis};
@@ -111,6 +111,20 @@ struct PreparedImage {
     gemma4_patch_values: Option<Array3<f32>>,
     gemma4_position_ids: Option<Array3<i32>>,
     gemma4_num_soft_tokens: Option<Vec<usize>>,
+    /// LFM2-VL (SigLIP2 NaFlex): already-patchified rows, one entry per image.
+    /// Each entry is (patch_rows, `[num_patches, C*P*P]` flattened) with
+    /// `num_patches == rows * cols`.
+    lfm2vl_patches: Option<Vec<Lfm2VlImagePatches>>,
+}
+
+/// A single LFM2-VL image after smart-resize + patchify. Unlike the other VLM
+/// paths the patch grid is rectangular and image-specific.
+struct Lfm2VlImagePatches {
+    rows: usize,
+    cols: usize,
+    /// Row-major over (row, col); each patch is `patch*patch*3` values ordered
+    /// (ky, kx, channel) to match HF `convert_image_to_patches`.
+    data: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -170,6 +184,15 @@ struct Gemma4VisionLayerWeights {
     down_clip_out: Option<(f32, f32)>,
 }
 
+/// LFM2-VL uses a SigLIP2 NaFlex tower with a 2-layer MLP projector.
+fn is_lfm2vl_vision(file: &CellmFile) -> bool {
+    file.tensor_index("model.vision_tower.vision_model.embeddings.patch_embedding.weight")
+        .is_some()
+        && file
+            .tensor_index("model.multi_modal_projector.linear_1.weight")
+            .is_some()
+}
+
 pub fn describe_image_with_cellm(
     model_path: &Path,
     image_bytes: &[u8],
@@ -203,8 +226,9 @@ pub fn describe_image_with_cellm_timed(
         && file
             .tensor_index("model.connector.modality_projection.proj.weight")
             .is_some();
-    if !is_gemma4_vision && !is_idefics3_vision {
-        anyhow::bail!("This model does not support image input (gemma4_vision={}, idefics3_vision={})", is_gemma4_vision, is_idefics3_vision);
+    let is_lfm2vl = is_lfm2vl_vision(&file);
+    if !is_gemma4_vision && !is_idefics3_vision && !is_lfm2vl {
+        anyhow::bail!("This model does not support image input (gemma4_vision={}, idefics3_vision={}, lfm2vl_vision={})", is_gemma4_vision, is_idefics3_vision, is_lfm2vl);
     }
 
     if std::env::var("CELLM_VLM_DEBUG_LOAD").is_ok() {
@@ -223,13 +247,15 @@ pub fn describe_image_with_cellm_timed(
     let gemma4_mode = std::env::var("CELLM_VLM_GEMMA4_MODE").unwrap_or_else(|_| "placeholder".to_string());
     let gemma4_prefix_image = is_gemma4_vision && model_type.starts_with("gemma4")
         && gemma4_mode.eq_ignore_ascii_case("prefix");
+    let lfm2vl_cfg = is_lfm2vl.then(|| lfm2vl_preprocess_config(&file));
     let image_input = preprocess_image_for_model(
         image_bytes,
         processor_hints.do_image_splitting,
         is_gemma4_vision,
         processor_hints.image_seq_len.unwrap_or(280),
+        lfm2vl_cfg.as_ref(),
     )?;
-    let num_images = image_input.pixel_values.shape()[1];
+    let num_images = prepared_num_images(&image_input);
     let mut vision_backend = match cfg.backend {
         BackendKind::Metal => {
             let ctx = MetalKernels::create_matmul()
@@ -308,13 +334,17 @@ pub fn describe_image_with_cellm_timed(
         .or_else(|| tok.token_to_id("<end_of_utterance>").map(|v| v as i64));
     let banned_token_ids = banned_token_ids(&tok);
 
-    if let Some(expected) = processor_hints.image_seq_len {
-        if expected != image_seq_len {
-            anyhow::bail!(
-                "processor/image_seq_len mismatch: processor_config={} vision_projector={}",
-                expected,
-                image_seq_len
-            );
+    // LFM2-VL is NaFlex: the token count depends on the image's native aspect
+    // ratio, so a fixed processor hint can never match and must not be enforced.
+    if !is_lfm2vl {
+        if let Some(expected) = processor_hints.image_seq_len {
+            if expected != image_seq_len {
+                anyhow::bail!(
+                    "processor/image_seq_len mismatch: processor_config={} vision_projector={}",
+                    expected,
+                    image_seq_len
+                );
+            }
         }
     }
     let image_block = if gemma4_prefix_image {
@@ -324,7 +354,9 @@ pub fn describe_image_with_cellm_timed(
             num_images,
             image_seq_len,
             image_token_text.as_str(),
-            use_idefics_wrappers,
+            // LFM2-VL emits bare <image> repeats; the Idefics3 wrapper tokens
+            // do not exist in this tokenizer.
+            use_idefics_wrappers && !is_lfm2vl,
             boi_token_text.as_deref(),
             eoi_token_text.as_deref(),
         )
@@ -335,6 +367,8 @@ pub fn describe_image_with_cellm_timed(
         } else {
             format!("{image_block}\n{user_prompt}")
         }
+    } else if is_lfm2vl {
+        build_lfm2_chat_prompt(user_prompt, &image_block)
     } else {
         build_single_turn_prompt(
             user_prompt,
@@ -408,23 +442,26 @@ pub async fn describe_image_with_cellm_webgpu(
         && file
             .tensor_index("model.connector.modality_projection.proj.weight")
             .is_some();
-    if !is_gemma4_vision && !is_idefics3_vision {
+    let is_lfm2vl = is_lfm2vl_vision(&file);
+    if !is_gemma4_vision && !is_idefics3_vision && !is_lfm2vl {
         anyhow::bail!(
-            "This model does not support image input (gemma4_vision={}, idefics3_vision={})",
-            is_gemma4_vision, is_idefics3_vision
+            "This model does not support image input (gemma4_vision={}, idefics3_vision={}, lfm2vl_vision={})",
+            is_gemma4_vision, is_idefics3_vision, is_lfm2vl
         );
     }
     let model_type = effective_text_model_type(&file.header);
     let gemma4_mode = std::env::var("CELLM_VLM_GEMMA4_MODE").unwrap_or_else(|_| "placeholder".to_string());
     let gemma4_prefix_image = is_gemma4_vision && model_type.starts_with("gemma4")
         && gemma4_mode.eq_ignore_ascii_case("prefix");
+    let lfm2vl_cfg = is_lfm2vl.then(|| lfm2vl_preprocess_config(&file));
     let image_input = preprocess_image_for_model(
         image_bytes,
         processor_hints.do_image_splitting,
         is_gemma4_vision,
         processor_hints.image_seq_len.unwrap_or(280),
+        lfm2vl_cfg.as_ref(),
     )?;
-    let num_images = image_input.pixel_values.shape()[1];
+    let num_images = prepared_num_images(&image_input);
 
     // Use WebGPU for the vision encoder
     let mut linear_backend = LinearBackend::WebGpu(vision);
@@ -567,19 +604,22 @@ pub async fn describe_image_with_cellm_webgpu_from_bytes(
         && file
             .tensor_index("model.connector.modality_projection.proj.weight")
             .is_some();
-    if !is_gemma4_vision && !is_idefics3_vision {
+    let is_lfm2vl = is_lfm2vl_vision(&file);
+    if !is_gemma4_vision && !is_idefics3_vision && !is_lfm2vl {
         anyhow::bail!(
-            "This model does not support image input (gemma4_vision={}, idefics3_vision={})",
-            is_gemma4_vision, is_idefics3_vision
+            "This model does not support image input (gemma4_vision={}, idefics3_vision={}, lfm2vl_vision={})",
+            is_gemma4_vision, is_idefics3_vision, is_lfm2vl
         );
     }
+    let lfm2vl_cfg = is_lfm2vl.then(|| lfm2vl_preprocess_config(&file));
     let image_input = preprocess_image_for_model(
         image_bytes,
         false,
         is_gemma4_vision,
         280,
+        lfm2vl_cfg.as_ref(),
     )?;
-    let num_images = image_input.pixel_values.shape()[1];
+    let num_images = prepared_num_images(&image_input);
 
     // Use WebGPU for the vision encoder
     let mut linear_backend = LinearBackend::WebGpu(vision);
@@ -863,6 +903,7 @@ async fn run_decode_cellm_inner_impl(
     enum DecodeRunner {
         Llama(LlamaRunner),
         Gemma(GemmaRunner),
+        Lfm(LfmRunner),
     }
 
     // Extract info before moving file into runner
@@ -877,6 +918,9 @@ async fn run_decode_cellm_inner_impl(
         "llama" | "smollm3" => {
             DecodeRunner::Llama(LlamaRunner::from_file(file).map_err(|e| anyhow::anyhow!("{e}"))?)
         }
+        "lfm2" | "lfm" => {
+            DecodeRunner::Lfm(LfmRunner::from_file(file).map_err(|e| anyhow::anyhow!("{e}"))?)
+        }
         t if t.starts_with("gemma") => {
             DecodeRunner::Gemma(GemmaRunner::from_file(file).map_err(|e| anyhow::anyhow!("{e}"))?)
         }
@@ -888,6 +932,7 @@ async fn run_decode_cellm_inner_impl(
         match &mut runner {
             DecodeRunner::Llama(r) => { r.enable_metal_full_backend(); }
             DecodeRunner::Gemma(r) => { r.enable_metal_full_backend(); }
+            DecodeRunner::Lfm(r) => { r.enable_metal_full_backend(); }
         }
     }
     #[cfg(feature = "webgpu")]
@@ -907,6 +952,10 @@ async fn run_decode_cellm_inner_impl(
             let c = r.config();
             (c.hidden_size, c.num_hidden_layers, c.num_key_value_heads, c.num_attention_heads)
         }
+        DecodeRunner::Lfm(r) => {
+            let c = r.config();
+            (c.hidden_size, c.num_hidden_layers, c.num_key_value_heads, c.num_attention_heads)
+        }
     };
     if image_features.shape()[1] != hidden {
         anyhow::bail!(
@@ -918,6 +967,10 @@ async fn run_decode_cellm_inner_impl(
 
     let head_dim = if model_type.starts_with("gemma") {
         head_dim_from_config
+    } else if let DecodeRunner::Lfm(r) = &runner {
+        // LFM2 head_dim is set explicitly in the config and is not necessarily
+        // hidden / num_heads.
+        r.config().head_dim
     } else {
         hidden / num_heads.max(1)
     };
@@ -952,6 +1005,12 @@ async fn run_decode_cellm_inner_impl(
         }
     }
 
+    // LFM2 keeps rolling short-conv state outside the KV cache, so it must be
+    // cleared explicitly before prefill.
+    if let DecodeRunner::Lfm(r) = &mut runner {
+        r.reset_state();
+    }
+
     let mut image_idx = 0usize;
     let mut x = vec![0.0f32; hidden];
     let mut rng = StdRng::seed_from_u64(cfg.seed.max(1));
@@ -968,6 +1027,7 @@ async fn run_decode_cellm_inner_impl(
                 DecodeRunner::Llama(r) => r.step_from_hidden(&x, pos, &mut page_table, &mut kv_cache)
                     .map_err(|e| anyhow::anyhow!("{e}"))?,
                 DecodeRunner::Gemma(r) => { let _ = r.step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1)).map_err(|e| anyhow::anyhow!("{e}"))?; }
+                DecodeRunner::Lfm(r) => { let _ = r.step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1)).map_err(|e| anyhow::anyhow!("{e}"))?; }
             }
             pos += 1; image_idx += 1;
         }
@@ -989,6 +1049,7 @@ async fn run_decode_cellm_inner_impl(
                     match &mut runner {
                         DecodeRunner::Llama(r) => r.step_from_hidden(&x, pos, &mut page_table, &mut kv_cache).map_err(|e| anyhow::anyhow!("{e}"))?,
                         DecodeRunner::Gemma(r) => { let _ = r.step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1)).map_err(|e| anyhow::anyhow!("{e}"))?; }
+                        DecodeRunner::Lfm(r) => { let _ = r.step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1)).map_err(|e| anyhow::anyhow!("{e}"))?; }
                     }
                     pos += 1;
                 }
@@ -996,11 +1057,13 @@ async fn run_decode_cellm_inner_impl(
                 match &runner {
                     DecodeRunner::Llama(r) => r.embed_token_hidden(tok_id as u32, &mut x).map_err(|e| anyhow::anyhow!("{e}"))?,
                     DecodeRunner::Gemma(r) => r.embed_token_hidden(tok_id as u32, &mut x).map_err(|e| anyhow::anyhow!("{e}"))?,
+                    DecodeRunner::Lfm(r) => r.embed_token_hidden(tok_id as u32, &mut x).map_err(|e| anyhow::anyhow!("{e}"))?,
                 }
                 recent.push(tok_id as u32);
                 let cand = match &mut runner {
                     DecodeRunner::Llama(r) => r.step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1)).map_err(|e| anyhow::anyhow!("{e}"))?,
                     DecodeRunner::Gemma(r) => r.step_topk_from_hidden_with_token(tok_id as u32, &x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1)).map_err(|e| anyhow::anyhow!("{e}"))?,
+                    DecodeRunner::Lfm(r) => r.step_topk_from_hidden(&x, pos, &mut page_table, &mut kv_cache, cfg.top_k.max(1)).map_err(|e| anyhow::anyhow!("{e}"))?,
                 };
                 next = sample_from_candidates(&cand, cfg.temperature, cfg.repeat_penalty, cfg.repeat_window, banned_token_ids, &recent, &mut rng)?;
                 pos += 1; i += 1;
@@ -1022,11 +1085,13 @@ async fn run_decode_cellm_inner_impl(
         match &runner {
             DecodeRunner::Llama(r) => r.embed_token_hidden(next as u32, &mut x).map_err(|e| anyhow::anyhow!("{e}"))?,
             DecodeRunner::Gemma(r) => r.embed_token_hidden(next as u32, &mut x).map_err(|e| anyhow::anyhow!("{e}"))?,
+            DecodeRunner::Lfm(r) => r.embed_token_hidden(next as u32, &mut x).map_err(|e| anyhow::anyhow!("{e}"))?,
         }
         let p = pos + step;
         let cand = match &mut runner {
             DecodeRunner::Llama(r) => r.step_topk_from_hidden(&x, p, &mut page_table, &mut kv_cache, cfg.top_k.max(1)).map_err(|e| anyhow::anyhow!("{e}"))?,
             DecodeRunner::Gemma(r) => r.step_topk_from_hidden_with_token(next as u32, &x, p, &mut page_table, &mut kv_cache, cfg.top_k.max(1)).map_err(|e| anyhow::anyhow!("{e}"))?,
+            DecodeRunner::Lfm(r) => r.step_topk_from_hidden(&x, p, &mut page_table, &mut kv_cache, cfg.top_k.max(1)).map_err(|e| anyhow::anyhow!("{e}"))?,
         };
         next = sample_from_candidates(&cand, cfg.temperature, cfg.repeat_penalty, cfg.repeat_window, banned_token_ids, &recent, &mut rng)?;
         recent.push(generated[generated.len() - 1] as u32);
@@ -1199,6 +1264,9 @@ async fn run_vision_cellm(
             .is_some()
     {
         return run_vision_cellm_gemma4(file, image_input, target_image_seq_len, backend).await;
+    }
+    if is_lfm2vl_vision(file) {
+        return run_vision_cellm_lfm2vl(file, image_input, backend).await;
     }
     let pixel_values = image_input.pixel_values.clone();
 
@@ -1549,6 +1617,373 @@ async fn run_vision_cellm(
     }
 
     Ok((out, out_tokens_per_image, patch_ms, encoder_ms, encoder_layer_ms))
+}
+
+/// Exact erf-based GELU, as used by the LFM2-VL projector (`hidden_act: "gelu"`).
+/// This is *not* the tanh approximation used inside the SigLIP2 encoder MLP.
+fn gelu_erf_inplace(x: &mut [f32]) {
+    const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    x.par_iter_mut().for_each(|v| {
+        *v = 0.5 * *v * (1.0 + erf_f32(*v * INV_SQRT2));
+    });
+}
+
+/// Abramowitz & Stegun 7.1.26 erf approximation (max abs error ~1.5e-7).
+fn erf_f32(x: f32) -> f32 {
+    const A1: f32 = 0.254_829_592;
+    const A2: f32 = -0.284_496_736;
+    const A3: f32 = 1.421_413_741;
+    const A4: f32 = -1.453_152_027;
+    const A5: f32 = 1.061_405_429;
+    const P: f32 = 0.327_591_1;
+    let sign = if x < 0.0 { -1.0f32 } else { 1.0f32 };
+    let ax = x.abs();
+    let t = 1.0 / (1.0 + P * ax);
+    let y = 1.0 - (((((A5 * t + A4) * t) + A3) * t + A2) * t + A1) * t * (-ax * ax).exp();
+    sign * y
+}
+
+/// Bilinearly resize a `(src_h, src_w, dim)` position-embedding grid to
+/// `(dst_h, dst_w, dim)`, matching `F.interpolate(mode="bilinear",
+/// align_corners=False)`.
+///
+/// HF also passes `antialias=True`, which only has an effect when downsampling.
+/// LFM2-VL always upsamples from the 16x16 learned grid for realistic image
+/// sizes, so plain bilinear is numerically equivalent there. When the target is
+/// smaller we still use plain bilinear and accept the small difference rather
+/// than silently producing a different number of tokens.
+fn resize_position_embeddings_bilinear(
+    src: &[f32],
+    src_h: usize,
+    src_w: usize,
+    dim: usize,
+    dst_h: usize,
+    dst_w: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; dst_h * dst_w * dim];
+    let scale_y = src_h as f32 / dst_h as f32;
+    let scale_x = src_w as f32 / dst_w as f32;
+    for oy in 0..dst_h {
+        // align_corners=False sampling grid
+        let iy = ((oy as f32 + 0.5) * scale_y - 0.5).max(0.0);
+        let y0 = iy.floor() as usize;
+        let y1 = (y0 + 1).min(src_h - 1);
+        let wy = iy - y0 as f32;
+        for ox in 0..dst_w {
+            let ix = ((ox as f32 + 0.5) * scale_x - 0.5).max(0.0);
+            let x0 = ix.floor() as usize;
+            let x1 = (x0 + 1).min(src_w - 1);
+            let wx = ix - x0 as f32;
+
+            let p00 = (y0 * src_w + x0) * dim;
+            let p01 = (y0 * src_w + x1) * dim;
+            let p10 = (y1 * src_w + x0) * dim;
+            let p11 = (y1 * src_w + x1) * dim;
+            let dst = (oy * dst_w + ox) * dim;
+            for d in 0..dim {
+                let top = src[p00 + d] * (1.0 - wx) + src[p01 + d] * wx;
+                let bot = src[p10 + d] * (1.0 - wx) + src[p11 + d] * wx;
+                out[dst + d] = top * (1.0 - wy) + bot * wy;
+            }
+        }
+    }
+    out
+}
+
+/// Vision tower for LFM2-VL (SigLIP2 NaFlex encoder + 2-layer MLP projector).
+///
+/// Differs from `run_vision_cellm` in three ways that cannot be expressed by the
+/// existing SigLIP path: the patch embedding is a plain `Linear` over
+/// pre-patchified input, the patch grid is rectangular and image-specific (so
+/// position embeddings must be interpolated per image), and the projector is
+/// `linear_1 -> gelu -> linear_2` with biases.
+async fn run_vision_cellm_lfm2vl(
+    file: &CellmFile,
+    image_input: &PreparedImage,
+    backend: &mut LinearBackend,
+) -> Result<(Array2<f32>, usize, f64, f64, Vec<f64>)> {
+    let images = image_input
+        .lfm2vl_patches
+        .as_ref()
+        .context("LFM2-VL vision path requires patchified image input")?;
+    if images.len() != 1 {
+        anyhow::bail!(
+            "LFM2-VL vision path currently supports exactly one image tile, got {}",
+            images.len()
+        );
+    }
+
+    let vision_prefix = file
+        .header
+        .vision_tensor_prefix
+        .clone()
+        .unwrap_or_else(|| "model.vision_tower.vision_model.".to_string());
+    let projector_prefix = file
+        .header
+        .projector_tensor_prefix
+        .clone()
+        .unwrap_or_else(|| "model.multi_modal_projector.".to_string());
+
+    let patch_w_name = format!("{vision_prefix}embeddings.patch_embedding.weight");
+    let patch_b_name = format!("{vision_prefix}embeddings.patch_embedding.bias");
+    let pos_name = format!("{vision_prefix}embeddings.position_embedding.weight");
+    let ln_w_name = format!("{vision_prefix}post_layernorm.weight");
+    let ln_b_name = format!("{vision_prefix}post_layernorm.bias");
+    let p1_w_name = format!("{projector_prefix}linear_1.weight");
+    let p1_b_name = format!("{projector_prefix}linear_1.bias");
+    let p2_w_name = format!("{projector_prefix}linear_2.weight");
+    let p2_b_name = format!("{projector_prefix}linear_2.bias");
+
+    let patch_w_shape = tensor_shape(file, &patch_w_name)?;
+    let pos_shape = tensor_shape(file, &pos_name)?;
+    let p1_shape = tensor_shape(file, &p1_w_name)?;
+    let p2_shape = tensor_shape(file, &p2_w_name)?;
+
+    if patch_w_shape.len() != 2 {
+        anyhow::bail!("LFM2-VL patch embedding must be 2D (Linear), got {patch_w_shape:?}");
+    }
+    let hidden = patch_w_shape[0];
+    let patch_in_dim = patch_w_shape[1];
+    if patch_in_dim % 3 != 0 {
+        anyhow::bail!("patch input dim {patch_in_dim} not divisible by 3 channels");
+    }
+    let patch = ((patch_in_dim / 3) as f64).sqrt() as usize;
+    if patch * patch * 3 != patch_in_dim {
+        anyhow::bail!("patch input dim {patch_in_dim} is not 3*P*P for an integer P");
+    }
+    if pos_shape.len() != 2 || pos_shape[1] != hidden {
+        anyhow::bail!("unexpected position embedding shape: {pos_shape:?}");
+    }
+    let pos_grid = (pos_shape[0] as f64).sqrt() as usize;
+    if pos_grid * pos_grid != pos_shape[0] {
+        anyhow::bail!("position embedding count {} is not square", pos_shape[0]);
+    }
+    if p1_shape.len() != 2 || p2_shape.len() != 2 {
+        anyhow::bail!("unexpected projector shapes: {p1_shape:?} {p2_shape:?}");
+    }
+    let projector_in = p1_shape[1];
+    let projector_mid = p1_shape[0];
+    if p2_shape[1] != projector_mid {
+        anyhow::bail!(
+            "projector linear_2 input {} != linear_1 output {}",
+            p2_shape[1],
+            projector_mid
+        );
+    }
+    let text_hidden = p2_shape[0];
+    if projector_in % hidden != 0 {
+        anyhow::bail!("projector input {projector_in} not divisible by vision hidden {hidden}");
+    }
+    let packed = projector_in / hidden;
+    let factor = (packed as f64).sqrt() as usize;
+    if factor * factor != packed {
+        anyhow::bail!("projector packing {packed} is not a square downsample factor");
+    }
+
+    let img = &images[0];
+    let (rows, cols) = (img.rows, img.cols);
+    if rows % factor != 0 || cols % factor != 0 {
+        anyhow::bail!(
+            "patch grid {rows}x{cols} not divisible by downsample factor {factor}"
+        );
+    }
+    let num_tokens = rows * cols;
+    if img.data.len() != num_tokens * patch_in_dim {
+        anyhow::bail!(
+            "patch buffer length {} != {num_tokens} * {patch_in_dim}",
+            img.data.len()
+        );
+    }
+    let out_rows = rows / factor;
+    let out_cols = cols / factor;
+    let out_tokens = out_rows * out_cols;
+
+    let eps = file
+        .header
+        .source_vision_config
+        .as_ref()
+        .and_then(|v| v.get("layer_norm_eps"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1e-6) as f32;
+    let num_layers = file
+        .header
+        .source_vision_config
+        .as_ref()
+        .and_then(|v| v.get("num_hidden_layers"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or_else(|| infer_vision_num_layers(file, &vision_prefix));
+    let num_heads = file
+        .header
+        .source_vision_config
+        .as_ref()
+        .and_then(|v| v.get("num_attention_heads"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or_else(|| hidden / 64);
+    let intermediate = file
+        .header
+        .source_vision_config
+        .as_ref()
+        .and_then(|v| v.get("intermediate_size"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(hidden * 4);
+    if num_heads == 0 || hidden % num_heads != 0 {
+        anyhow::bail!("invalid vision heads: hidden={hidden}, num_heads={num_heads}");
+    }
+    if num_layers == 0 {
+        anyhow::bail!("vision layer count resolved to zero");
+    }
+    let head_dim = hidden / num_heads;
+
+    let patch_w = tensor_to_f32(file, &patch_w_name)?;
+    let patch_b = tensor_to_f32(file, &patch_b_name)?;
+    let pos_raw = tensor_to_f32(file, &pos_name)?;
+    let post_ln_w = tensor_to_f32(file, &ln_w_name)?;
+    let post_ln_b = tensor_to_f32(file, &ln_b_name)?;
+    let p1_w = tensor_to_f32(file, &p1_w_name)?;
+    let p1_b = tensor_to_f32(file, &p1_b_name)?;
+    let p2_w = tensor_to_f32(file, &p2_w_name)?;
+    let p2_b = tensor_to_f32(file, &p2_b_name)?;
+
+    let mut layers = Vec::with_capacity(num_layers);
+    for layer in 0..num_layers {
+        let prefix = format!("{vision_prefix}encoder.layers.{layer}.");
+        layers.push(VisionLayerWeights {
+            ln1_w: tensor_to_f32(file, &format!("{prefix}layer_norm1.weight"))?,
+            ln1_b: tensor_to_f32(file, &format!("{prefix}layer_norm1.bias"))?,
+            q_w: tensor_to_f32(file, &format!("{prefix}self_attn.q_proj.weight"))?,
+            q_b: tensor_to_f32(file, &format!("{prefix}self_attn.q_proj.bias"))?,
+            k_w: tensor_to_f32(file, &format!("{prefix}self_attn.k_proj.weight"))?,
+            k_b: tensor_to_f32(file, &format!("{prefix}self_attn.k_proj.bias"))?,
+            v_w: tensor_to_f32(file, &format!("{prefix}self_attn.v_proj.weight"))?,
+            v_b: tensor_to_f32(file, &format!("{prefix}self_attn.v_proj.bias"))?,
+            qkv_w: Vec::new(),
+            qkv_b: Vec::new(),
+            o_w: tensor_to_f32(file, &format!("{prefix}self_attn.out_proj.weight"))?,
+            o_b: tensor_to_f32(file, &format!("{prefix}self_attn.out_proj.bias"))?,
+            ln2_w: tensor_to_f32(file, &format!("{prefix}layer_norm2.weight"))?,
+            ln2_b: tensor_to_f32(file, &format!("{prefix}layer_norm2.bias"))?,
+            fc1_w: tensor_to_f32(file, &format!("{prefix}mlp.fc1.weight"))?,
+            fc1_b: tensor_to_f32(file, &format!("{prefix}mlp.fc1.bias"))?,
+            fc2_w: tensor_to_f32(file, &format!("{prefix}mlp.fc2.weight"))?,
+            fc2_b: tensor_to_f32(file, &format!("{prefix}mlp.fc2.bias"))?,
+        });
+    }
+
+    let mut tokens = vec![0.0f32; num_tokens * hidden];
+    let mut norm1 = vec![0.0f32; num_tokens * hidden];
+    let mut q = vec![0.0f32; num_tokens * hidden];
+    let mut k = vec![0.0f32; num_tokens * hidden];
+    let mut v = vec![0.0f32; num_tokens * hidden];
+    let mut attn = vec![0.0f32; num_tokens * hidden];
+    let mut proj_out = vec![0.0f32; num_tokens * hidden];
+    let mut norm2 = vec![0.0f32; num_tokens * hidden];
+    let mut mlp_up = vec![0.0f32; num_tokens * intermediate];
+    let mut mlp_out = vec![0.0f32; num_tokens * hidden];
+    let mut score_buf = vec![0.0f32; (num_heads * num_tokens * num_tokens).max(num_tokens)];
+    let mut prob_buf = vec![0.0f32; num_tokens];
+
+    let mut encoder_layer_ms = vec![0.0f64; num_layers];
+
+    // ---- patch embedding: plain Linear over pre-patchified rows ----
+    let patch_start = stats_instant_now();
+    linear_rows(
+        &img.data,
+        num_tokens,
+        patch_in_dim,
+        &patch_w,
+        hidden,
+        Some(&patch_b),
+        &mut tokens,
+        backend,
+    )
+    .await;
+
+    // Position embeddings: interpolate the learned square grid to this image.
+    let pos = resize_position_embeddings_bilinear(&pos_raw, pos_grid, pos_grid, hidden, rows, cols);
+    for t in 0..num_tokens {
+        let row = &mut tokens[t * hidden..(t + 1) * hidden];
+        let p = &pos[t * hidden..(t + 1) * hidden];
+        for i in 0..hidden {
+            row[i] += p[i];
+        }
+    }
+    let patch_ms = stats_elapsed_ms(&patch_start);
+
+    // ---- encoder ----
+    let encoder_start = stats_instant_now();
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        let layer_start = stats_instant_now();
+        layer_norm_rows(&tokens, num_tokens, hidden, &layer.ln1_w, &layer.ln1_b, eps, &mut norm1);
+        linear_rows(&norm1, num_tokens, hidden, &layer.q_w, hidden, Some(&layer.q_b), &mut q, backend).await;
+        linear_rows(&norm1, num_tokens, hidden, &layer.k_w, hidden, Some(&layer.k_b), &mut k, backend).await;
+        linear_rows(&norm1, num_tokens, hidden, &layer.v_w, hidden, Some(&layer.v_b), &mut v, backend).await;
+
+        // No padding is produced by the single-tile preprocessor, so every
+        // token is valid and the bidirectional mask is a no-op.
+        self_attention_full(
+            &q, &k, &v, num_tokens, num_heads, head_dim, None,
+            &mut score_buf, &mut prob_buf, &mut attn, None, backend,
+        );
+
+        linear_rows(&attn, num_tokens, hidden, &layer.o_w, hidden, Some(&layer.o_b), &mut proj_out, backend).await;
+        add_inplace(&mut tokens, &proj_out);
+
+        layer_norm_rows(&tokens, num_tokens, hidden, &layer.ln2_w, &layer.ln2_b, eps, &mut norm2);
+        linear_rows(&norm2, num_tokens, hidden, &layer.fc1_w, intermediate, Some(&layer.fc1_b), &mut mlp_up, backend).await;
+        gelu_pytorch_tanh_inplace(&mut mlp_up);
+        linear_rows(&mlp_up, num_tokens, intermediate, &layer.fc2_w, hidden, Some(&layer.fc2_b), &mut mlp_out, backend).await;
+        add_inplace(&mut tokens, &mlp_out);
+        encoder_layer_ms[layer_idx] = stats_elapsed_ms(&layer_start);
+    }
+
+    layer_norm_rows(&tokens, num_tokens, hidden, &post_ln_w, &post_ln_b, eps, &mut norm1);
+    tokens.copy_from_slice(&norm1);
+
+    // ---- pixel_unshuffle over the rectangular grid ----
+    // Verified against HF: for output cell (oy, ox) the sub-index `s` selects
+    // source patch (oy*f + s/f, ox*f + s%f), i.e. row offset outer, col inner.
+    let mut packed_tokens = vec![0.0f32; out_tokens * projector_in];
+    for oy in 0..out_rows {
+        for ox in 0..out_cols {
+            let dst = &mut packed_tokens[(oy * out_cols + ox) * projector_in..][..projector_in];
+            let mut off = 0usize;
+            for dy in 0..factor {
+                for dx in 0..factor {
+                    let src_idx = (oy * factor + dy) * cols + (ox * factor + dx);
+                    dst[off..off + hidden]
+                        .copy_from_slice(&tokens[src_idx * hidden..(src_idx + 1) * hidden]);
+                    off += hidden;
+                }
+            }
+        }
+    }
+
+    // ---- projector: linear_1 -> gelu (exact erf) -> linear_2 ----
+    let mut mid = vec![0.0f32; out_tokens * projector_mid];
+    linear_rows(&packed_tokens, out_tokens, projector_in, &p1_w, projector_mid, Some(&p1_b), &mut mid, backend).await;
+    gelu_erf_inplace(&mut mid);
+    let mut flat_out = vec![0.0f32; out_tokens * text_hidden];
+    linear_rows(&mid, out_tokens, projector_mid, &p2_w, text_hidden, Some(&p2_b), &mut flat_out, backend).await;
+
+    let encoder_ms = stats_elapsed_ms(&encoder_start);
+
+    let mut out = Array2::<f32>::zeros((out_tokens, text_hidden));
+    for r in 0..out_tokens {
+        for c in 0..text_hidden {
+            out[[r, c]] = flat_out[r * text_hidden + c];
+        }
+    }
+
+    if std::env::var("CELLM_STEP_TIMING").is_ok() {
+        eprintln!(
+            "VISION_ENCODER(lfm2vl) grid={rows}x{cols} tokens={num_tokens} -> {out_tokens} patch={patch_ms:.1}ms encoder={encoder_ms:.1}ms"
+        );
+    }
+
+    Ok((out, out_tokens, patch_ms, encoder_ms, encoder_layer_ms))
 }
 
 async fn run_vision_cellm_gemma4(
@@ -3855,6 +4290,13 @@ fn build_single_turn_prompt(user_text: &str, image_block: &str, use_gemma4_turn:
     format!("<|im_start|>User:{image_block}{user_text}<end_of_utterance>\nAssistant:")
 }
 
+/// LFM2 ChatML prompt, matching the model's `chat_template.jinja`:
+/// BOS, then `<|im_start|>{role}\n{content}<|im_end|>\n`, ending with the
+/// assistant generation prompt.
+fn build_lfm2_chat_prompt(user_text: &str, image_block: &str) -> String {
+    format!("<|startoftext|><|im_start|>user\n{image_block}{user_text}<|im_end|>\n<|im_start|>assistant\n")
+}
+
 fn format_image_block(
     num_images: usize,
     image_seq_len: usize,
@@ -4015,7 +4457,17 @@ fn preprocess_image_for_model(
     split_image: bool,
     is_gemma4_vision: bool,
     max_soft_tokens: usize,
+    lfm2vl: Option<&Lfm2VlPreprocessConfig>,
 ) -> Result<PreparedImage> {
+    if let Some(c) = lfm2vl {
+        return preprocess_image_lfm2vl(
+            image_bytes,
+            c.downsample_factor,
+            c.encoder_patch_size,
+            c.min_image_tokens,
+            c.max_image_tokens,
+        );
+    }
     if is_gemma4_vision {
         let max_soft_tokens = std::env::var("CELLM_VLM_MAX_SOFT_TOKENS")
             .ok()
@@ -4024,6 +4476,39 @@ fn preprocess_image_for_model(
         return preprocess_image_gemma4(image_bytes, max_soft_tokens);
     }
     preprocess_image_idefics3(image_bytes, split_image)
+}
+
+fn prepared_num_images(image_input: &PreparedImage) -> usize {
+    if let Some(p) = image_input.lfm2vl_patches.as_ref() {
+        return p.len();
+    }
+    image_input.pixel_values.shape()[1]
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Lfm2VlPreprocessConfig {
+    downsample_factor: usize,
+    encoder_patch_size: usize,
+    min_image_tokens: usize,
+    max_image_tokens: usize,
+}
+
+/// Read LFM2-VL preprocessing knobs from the projector config written by the
+/// converter, falling back to the published defaults.
+fn lfm2vl_preprocess_config(file: &CellmFile) -> Lfm2VlPreprocessConfig {
+    let cfg = file.header.source_projector_config.as_ref();
+    let get = |key: &str, default: usize| -> usize {
+        cfg.and_then(|v| v.get(key))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(default)
+    };
+    Lfm2VlPreprocessConfig {
+        downsample_factor: get("downsample_factor", 2).max(1),
+        encoder_patch_size: get("encoder_patch_size", 16).max(1),
+        min_image_tokens: get("min_image_tokens", 64).max(1),
+        max_image_tokens: get("max_image_tokens", 256).max(1),
+    }
 }
 
 fn get_aspect_ratio_preserving_size(
@@ -4104,6 +4589,108 @@ fn preprocess_image_gemma4(image_bytes: &[u8], max_soft_tokens: usize) -> Result
         gemma4_patch_values: Some(patch_values),
         gemma4_position_ids: Some(pos_ids),
         gemma4_num_soft_tokens: Some(vec![num_soft]),
+        lfm2vl_patches: None,
+    })
+}
+
+/// LFM2-VL `smart_resize` (mirrors `Lfm2VlImageProcessor.smart_resize`).
+/// Returns `(width, height)` -- note the HF function returns width first.
+fn lfm2vl_smart_resize(
+    height: usize,
+    width: usize,
+    downsample_factor: usize,
+    min_image_tokens: usize,
+    max_image_tokens: usize,
+    encoder_patch_size: usize,
+) -> (usize, usize) {
+    let total_factor = encoder_patch_size * downsample_factor;
+    let tf = total_factor as f64;
+    let px_per_token = (encoder_patch_size * encoder_patch_size * downsample_factor * downsample_factor) as f64;
+    let min_pixels = min_image_tokens as f64 * px_per_token;
+    let max_pixels = max_image_tokens as f64 * px_per_token;
+
+    // round_by_factor: round(n / factor) * factor, with Python banker's-free
+    // `round` semantics approximated by round-half-away-from-zero.
+    let round_by_factor = |n: usize| -> usize { ((n as f64 / tf).round() as usize) * total_factor };
+
+    let mut h_bar = total_factor.max(round_by_factor(height));
+    let mut w_bar = total_factor.max(round_by_factor(width));
+    let area = (h_bar * w_bar) as f64;
+
+    if area > max_pixels {
+        let beta = ((height * width) as f64 / max_pixels).sqrt();
+        h_bar = total_factor.max(((height as f64 / beta / tf).floor() as usize) * total_factor);
+        w_bar = total_factor.max(((width as f64 / beta / tf).floor() as usize) * total_factor);
+    } else if area < min_pixels {
+        let beta = (min_pixels / (height * width) as f64).sqrt();
+        h_bar = ((height as f64 * beta / tf).ceil() as usize) * total_factor;
+        w_bar = ((width as f64 * beta / tf).ceil() as usize) * total_factor;
+    }
+    (w_bar, h_bar)
+}
+
+/// Preprocess for LFM2-VL: smart-resize to a native (non-square) size, rescale,
+/// normalize, then patchify into `[num_patches, C*P*P]` rows.
+///
+/// Tiling is deliberately not performed here; a single native-resolution tile is
+/// what the reference processor produces when `min_tiles == max_tiles == 1`.
+fn preprocess_image_lfm2vl(
+    image_bytes: &[u8],
+    downsample_factor: usize,
+    encoder_patch_size: usize,
+    min_image_tokens: usize,
+    max_image_tokens: usize,
+) -> Result<PreparedImage> {
+    let img = image::load_from_memory(image_bytes).context("decode image bytes failed")?;
+    let rgb = img.to_rgb8();
+    let (w0, h0) = rgb.dimensions();
+    let (tw, th) = lfm2vl_smart_resize(
+        h0 as usize,
+        w0 as usize,
+        downsample_factor,
+        min_image_tokens,
+        max_image_tokens,
+        encoder_patch_size,
+    );
+    // Bilinear with antialiasing (HF uses torchvision bilinear + antialias=True).
+    // `Triangle` is image-rs's antialiased bilinear filter.
+    let resized = image::imageops::resize(
+        &rgb,
+        tw as u32,
+        th as u32,
+        image::imageops::FilterType::Triangle,
+    );
+
+    let patch = encoder_patch_size;
+    let rows = th / patch;
+    let cols = tw / patch;
+    let in_dim = patch * patch * 3;
+    let mut data = vec![0.0f32; rows * cols * in_dim];
+    for py in 0..rows {
+        for px in 0..cols {
+            let token_idx = py * cols + px;
+            let base = token_idx * in_dim;
+            let mut i = 0usize;
+            // HF permute(0, 2, 4, 3, 5, 1) => inner order is (ky, kx, channel).
+            for ky in 0..patch {
+                for kx in 0..patch {
+                    let p = resized.get_pixel((px * patch + kx) as u32, (py * patch + ky) as u32);
+                    for c in 0..3usize {
+                        // rescale 1/255 then normalize (x - 0.5) / 0.5
+                        data[base + i] = (p[c] as f32 / 255.0 - 0.5) / 0.5;
+                        i += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(PreparedImage {
+        pixel_values: Array5::<f32>::zeros((1, 1, 3, 1, 1)),
+        gemma4_patch_values: None,
+        gemma4_position_ids: None,
+        gemma4_num_soft_tokens: None,
+        lfm2vl_patches: Some(vec![Lfm2VlImagePatches { rows, cols, data }]),
     })
 }
 
@@ -4157,6 +4744,7 @@ fn preprocess_image_idefics3(image_bytes: &[u8], split_image: bool) -> Result<Pr
         gemma4_patch_values: None,
         gemma4_position_ids: None,
         gemma4_num_soft_tokens: None,
+        lfm2vl_patches: None,
     })
 }
 

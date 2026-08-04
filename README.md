@@ -369,6 +369,7 @@ Sample checkpoints bundled in this repo (via Git LFS):
 | Paged KV cache internals | [`docs/paged-kv-cache-foundation.md`](docs/paged-kv-cache-foundation.md) |
 | Scheduler & continuous batching | [`docs/phase4-continuous-batching.md`](docs/phase4-continuous-batching.md) |
 | Model conversion & quantization | [`docs/convert-quantized-models.md`](docs/convert-quantized-models.md) |
+| On-device function calling | [`docs/function-calling-gemma.md`](docs/function-calling-gemma.md) |
 | TurboQuant KV compression | [`docs/turboquant_dataflow.md`](docs/turboquant_dataflow.md) |
 | VLM / SmolVLM ONNX guide | [`docs/vlm-smolvlm-onnx.md`](docs/vlm-smolvlm-onnx.md) |
 | VLM sequence tracking | [`docs/cellm-vlm-sequence.md`](docs/cellm-vlm-sequence.md) |
@@ -428,12 +429,22 @@ For more debug flags and backend-specific notes, see the per-model docs in `docs
 
 ---
 
+## Citation
+
+If you use cellm in your research, please cite:
+
+```bibtex
+@software{asante2026cellm,
+  author       = {Asante, Jeffrey},
+  title        = {cellm: A Mobile-Native LLM Serving Engine},
+  year         = {2026},
+  url          = {https://github.com/jeffasante/cellm},
+  note         = {Rust inference engine with paged KV cache and multi-session scheduling}
+}
+```
+
+---
 
 ## License
 
-Licensed under either of:
-
-- MIT license (`LICENSE-MIT`)
-- Apache License, Version 2.0 (`LICENSE-APACHE`)
-
-at your option.
+Apache License, Version 2.0 (`LICENSE-APACHE`)

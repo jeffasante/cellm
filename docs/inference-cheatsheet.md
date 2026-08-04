@@ -1523,9 +1523,18 @@ python3 tools/convert_gemma3_hf.py \
 
 ```sh
 ./target/release/infer \
-  --model models/functiongemma-270m-it-int8e.cellm \
-  --tokenizer models/functiongemma-270m-cellm/tokenizer.json \
+  --model models/to-huggingface/function-calls/functiongemma-270m-cellm/functiongemma-270m-int8e.cellm \
+  --tokenizer models/to-huggingface/function-calls/functiongemma-270m-cellm/tokenizer.json \
   --prompt "Turn on wifi and set brightness to 50" --chat \
+  --gen 96 --temperature 0 --top-k 1 --stop-tokens 1,50,106 \
+  --backend cpu
+```
+
+```sh
+./target/release/infer \
+  --model models/to-huggingface/function-calls/functiongemma-270m-cellm/functiongemma-270m-int8e.cellm \
+  --tokenizer models/to-huggingface/function-calls/functiongemma-270m-cellm/tokenizer.json \
+  --prompt "Make the screen brighter, set it to 90" --chat \
   --gen 96 --temperature 0 --top-k 1 --stop-tokens 1,50,106 \
   --backend cpu
 ```

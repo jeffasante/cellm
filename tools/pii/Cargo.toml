@@ -1,0 +1,15 @@
+[package]
+name = "cellm-pii"
+version = "0.1.0"
+edition = "2021"
+description = "PII span detection with the privacy-filter .cellm model."
+
+[[bin]]
+name = "pii"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+cellm-model = { path = "../../crates/cellm-model" }
+tokenizers = "0.21"

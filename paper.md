@@ -1289,3 +1289,213 @@ The resulting model contains 646 tensors and is 2,550,044,032 bytes (2.37 GiB). 
 ```
 
 `--chat --chat-format auto` detects the embedded Llama 3 template, and generation stops on `<|eot_id|>`/`<|eom_id|>`. Validated CPU output: `The capital of France is Paris.`
+
+---
+
+## openai/privacy-filter (PII token classifier)
+
+### Overview
+
+An encoder-only token classifier, not a generator, so it does not run through `infer`. It has its own runner (`crates/cellm-model/src/privacy_filter.rs`) and its own binary (`pii`). Six things kept it off the existing paths: bidirectional attention, per-head attention sinks, the `head_dim**-0.25` scale applied separately to Q *and* K, interleaved YaRN RoPE, a 128-expert top-4 MoE with clamped SwiGLU, and group-32 int4 with `f16` scale/bias sidecars (`lfm.rs` hardcodes group 64 and `f32`).
+
+640 hidden, 8 layers, 14 heads / 2 KV heads, head_dim 64, 128 experts top-4, vocab 200064, 33 BIOES labels, bidirectional sliding window of 128.
+
+### Convert
+
+```sh
+python3 tools/convert_privacy_filter_hf.py \
+  models/hf/privacy-filter \
+  models/privacy-filter/privacy-filter-int4-g32-f16s.cellm \
+  --quant int4 --group-size 32 --quant-embedding
+```
+
+6269 tensors, 942,793,408 bytes (899 MiB). Group 32 is the smallest recipe that leaks nothing: at group 64 five entities present in the f32 baseline go undetected. `--quant-embedding` stores `embed_tokens` as int8 (−128 MB); int4 there costs 18 missed entities, so it is not offered. Omitting `--f32-scales` keeps the sidecars in `f16`, which is where 157 MB of the earlier 1049 MB build went — measured accuracy is identical.
+
+### Build
+
+```sh
+cargo build --release -p cellm-pii
+```
+
+### Inference (CPU)
+
+```sh
+./target/release/pii \
+  models/privacy-filter/privacy-filter-int4-g32-f16s.cellm \
+  --tokenizer models/hf/privacy-filter/tokenizer.json \
+  --text "Contact Bob Smith at bob.smith@example.com or (555) 123-4567."
+```
+
+
+```text
+=== Contact Bob Smith at bob.smith@example.com or (555) 123-4567.
+    private_person   [   7:  17]  " Bob Smith"
+    private_email    [  20:  42]  " bob.smith@example.com"
+    private_phone    [  45:  60]  " (555) 123-4567"
+```
+
+
+
+#### test samples
+
+```text
+./target/release/pii \
+  models/privacy-filter/privacy-filter-int4-g32-f16s.cellm \
+  --tokenizer models/hf/privacy-filter/tokenizer.json \
+  --text "To: John Doe (john.doe@email.com), Cc: finance-team@company.com. Subject: Cloud Server Config. Hey Team, use API key AKIAIOSFODNN7EXAMPLE and Stripe test card 4242-4242-4242-4242 (exp: 08/28, CVV: 123) for the new billing portal setup."
+```
+
+./target/release/pii \
+  models/privacy-filter/privacy-filter-int4-g32-f16s.cellm \
+  --tokenizer models/hf/privacy-filter/tokenizer.json \
+  --text "John Smith lives at 1600 Pennsylvania Ave, Washington DC. His email is john@gmail.com"
+
+
+```sh
+./target/release/pii \
+  models/privacy-filter/privacy-filter-int4-g32-f16s.cellm \
+  --tokenizer models/hf/privacy-filter/tokenizer.json \
+  --text "Dr. Ama Serwaa Mensah, born on 14 February 1989, recently moved from House No. 17B, Mango Street, East Legon, Accra, Ghana to Apartment 4C, 221B Baker Street, London NW1 6XE. Her Ghana Card number is GHA-123456789-0, passport number G3456789, employee ID ECG-ICT-004721, and tax identification number P0012345678. You can reach her at ama.mensah+work@example.co.uk, backup_email99@gmail.com, +233 24 555 0198, 024-555-0198, or on WhatsApp at +44 7700 900123. Her bank account is 0040163411018 at Republic Bank, SWIFT code HFCAGHAC, sort code 11-01-04, and card number 4111 1111 1111 1111, expiring 09/29 with CVV 317. She connected from IPv4 address 192.168.10.45, public IP 102.176.94.21, IPv6 address 2001:0db8:85a3:0000:0000:8a2e:0370:7334, and device MAC address A4:5E:60:11:22:33. Her username is ama_mensah89 and the temporary password is Summer2026!DoNotShare. The medical record ECG-2026-77891 states that she visited Ridge Hospital on 3 August 2026. Emergency contact: Kwame Osei, phone +233 20 111 2233, living near Independence Square, Accra. Please note that Apple, Republic Bank, Ridge Hospital, Washington, and ECG may be organization or location names rather than private persons. The example IP 8.8.8.8 is a public DNS server, order number ORD-2026-00081 is not a national ID, and 123456 is merely a verification example."
+```
+
+```sh
+./target/release/pii \
+models/privacy-filter/privacy-filter-int3-g128.cellm\
+  --tokenizer models/hf/privacy-filter/tokenizer.json \
+  --text "Dr. Ama Serwaa Mensah, born on 14 February 1989, recently moved from House No. 17B, Mango Street, East Legon, Accra, Ghana to Apartment 4C, 221B Baker Street, London NW1 6XE. Her Ghana Card number is GHA-123456789-0, passport number G3456789, employee ID ECG-ICT-004721, and tax identification number P0012345678. You can reach her at ama.mensah+work@example.co.uk, backup_email99@gmail.com, +233 24 555 0198, 024-555-0198, or on WhatsApp at +44 7700 900123. Her bank account is 0040163411018 at Republic Bank, SWIFT code HFCAGHAC, sort code 11-01-04, and card number 4111 1111 1111 1111, expiring 09/29 with CVV 317. She connected from IPv4 address 192.168.10.45, public IP 102.176.94.21, IPv6 address 2001:0db8:85a3:0000:0000:8a2e:0370:7334, and device MAC address A4:5E:60:11:22:33. Her username is ama_mensah89 and the temporary password is Summer2026!DoNotShare. The medical record ECG-2026-77891 states that she visited Ridge Hospital on 3 August 2026. Emergency contact: Kwame Osei, phone +233 20 111 2233, living near Independence Square, Accra. Please note that Apple, Republic Bank, Ridge Hospital, Washington, and ECG may be organization or location names rather than private persons. The example IP 8.8.8.8 is a public DNS server, order number ORD-2026-00081 is not a national ID, and 123456 is merely a verification example."
+```
+
+
+```sh
+./target/release/pii \
+models/privacy-filter/privacy-filter-int4-emb8.cellm\
+  --tokenizer models/hf/privacy-filter/tokenizer.json \
+  --text "Dr. Ama Serwaa Mensah, born on 14 February 1989, recently moved from House No. 17B, Mango Street, East Legon, Accra, Ghana to Apartment 4C, 221B Baker Street, London NW1 6XE. Her Ghana Card number is GHA-123456789-0, passport number G3456789, employee ID ECG-ICT-004721, and tax identification number P0012345678. You can reach her at ama.mensah+work@example.co.uk, backup_email99@gmail.com, +233 24 555 0198, 024-555-0198, or on WhatsApp at +44 7700 900123. Her bank account is 0040163411018 at Republic Bank, SWIFT code HFCAGHAC, sort code 11-01-04, and card number 4111 1111 1111 1111, expiring 09/29 with CVV 317. She connected from IPv4 address 192.168.10.45, public IP 102.176.94.21, IPv6 address 2001:0db8:85a3:0000:0000:8a2e:0370:7334, and device MAC address A4:5E:60:11:22:33. Her username is ama_mensah89 and the temporary password is Summer2026!DoNotShare. The medical record ECG-2026-77891 states that she visited Ridge Hospital on 3 August 2026. Emergency contact: Kwame Osei, phone +233 20 111 2233, living near Independence Square, Accra. Please note that Apple, Republic Bank, Ridge Hospital, Washington, and ECG may be organization or location names rather than private persons. The example IP 8.8.8.8 is a public DNS server, order number ORD-2026-00081 is not a national ID, and 123456 is merely a verification example."
+```
+
+
+```
+
+./target/release/pii \
+  models/privacy-filter/privacy-filter-int4-g32-f16s.cellm \
+  --tokenizer models/hf/privacy-filter/tokenizer.json \
+  --text 'CONFIDENTIAL INCIDENT REPORT
+Employee: Nana Yaw Boateng
+Preferred name: Yaw
+Date of birth: 22 September 1992
+Residential address: Flat 7B, Adom Heights, Boundary Road, East Legon Hills, Accra, Ghana
+Previous address: P.O. Box CT 1847, Cantonments, Accra
+Personal email: nana.boateng+private@samplemail.com
+Work email: yaw.boateng@ecg-example.org
+Primary phone: +233 (0)24 718 9032
+Alternative phone: 020-555-0147
+Emergency contact: Akosua Owusu, his sister, reachable at +233 50 444 8219.
+
+Identification details:
+Ghana Card: GHA-987654321-4
+Passport number: G00048291
+Taxpayer ID: P0098765432
+Employee number: ECG/ICT/2026/00481
+Health insurance membership number: NHIS-2039-8841-752
+Driver licence: DVLA-GH-92-104883
+Medical file number: RIDGE-MRN-2026-008741
+
+Payroll details:
+Bank: Example Republic Bank
+Account holder: Nana Yaw Boateng
+Account number: 0040163411099
+Branch: Ridge
+Sort code: 11-01-04
+SWIFT/BIC: HFCAGHAC
+Payment card: 4111 1111 1111 1111
+Expiry date: 09/29
+CVV: 317
+Mobile Money wallet: +233 24 718 9032
+Monthly salary: GHS 6,250.00
+
+Medical note:
+On 1 August 2026, Dr. Efua Sarpong recorded that Nana had a severe peanut allergy and prescribed TESTMED-25MG. His blood type is O+, and his next appointment is scheduled for 18 August 2026 at Ridge Hospital.
+
+Security incident:
+The employee reported receiving a password-reset message. His username is nboateng92, temporary password is Temp#Access2026!, recovery answer is BlueMango47, and one-time code is 483921. The internal service generated API key sk_test_7vN2pQ8mL4xR9aBc, bearer token eyJhbGciOiJIUzI1NiJ9.test-signature, and session ID sess_9f2d71a8c3e64b2f.
+
+Device information:
+Hostname: ECG-LAPTOP-0481
+Private IPv4: 10.30.41.87
+Public IPv4: 102.176.94.21
+IPv6: 2001:db8:85a3::8a2e:370:7334
+MAC address: A4:5E:60:11:22:33
+Wi-Fi SSID: ECG-Staff
+Device serial number: C02TEST9MD6T
+Last login: 2026-08-04T14:32:18Z
+
+Relevant application log:
+{
+  "customer_name": "Nana Yaw Boateng",
+  "email": "nana.boateng+private@samplemail.com",
+  "phone": "+233247189032",
+  "ghana_card": "GHA-987654321-4",
+  "account": "0040163411099",
+  "ip": "10.30.41.87",
+  "authorization": "Bearer eyJhbGciOiJIUzI1NiJ9.test-signature",
+  "password": "Temp#Access2026!",
+  "callback_url": "https://example.test/reset?token=abc987XYZ",
+  "message": "Customer requested assistance."
+}
+
+Database error:
+postgres://nboateng:DbPass%402026@10.30.41.12:5432/hr_records
+Connection failed for user nboateng from 10.30.41.87.
+
+Support transcript:
+Agent: Please confirm the last four digits of your account.
+Customer: They are 1099. My full account is 0040163411099.
+Agent: Do not share your password.
+Customer: I already emailed Temp#Access2026! to yaw.boateng@ecg-example.org.
+
+Control statements:
+Apple released a software update on 14 July.
+Republic Bank opened a new branch.
+The server processed 123456 records.
+Order ORD-2026-00081 was delivered successfully.
+Version 10.30.41 was released internally.
+The value 4111 is only a count.
+Contact support@example.test for fictional testing.
+Google public DNS is available at 8.8.8.8.
+
+END OF REPORT'
+
+```
+
+
+`--text` repeats for batching. `--redact` additionally prints the spliced string:
+
+```text
+    redacted: Contact[PRIVATE_PERSON] at[PRIVATE_EMAIL] or[PRIVATE_PHONE].
+```
+
+Offsets come straight from the tokenizer, so a leading space belongs to the token and lands inside the span — a caller wanting clean text should trim.
+
+### Parity
+
+`--dump-logits <path>` writes, per text, `u32 seq_len`, `u32 n_labels`, then `seq*labels` little-endian `f32`, for comparison against a HuggingFace reference:
+
+```sh
+./target/release/pii ... --dump-logits /tmp/pf_rust.bin
+```
+
+100% argmax parity with HF fp32 on both a 53-token corpus (max |Δlogit| 2.96) and a 328-token corpus (max |Δlogit| 8.35). The long input is the one that matters: below 129 tokens the sliding window never engages, and an off-by-one in the mask is invisible.
+
+
+
+
+### Notes
+
+- CPU-only, and unoptimized: every layer is dequantized on each `forward()` with no caching, and the matmul is a naive loop rather than `cellm_kernels::matmul_f32`. ~6 s wall for three short texts, cold.
+- Span decoding is greedy BIOES. `models/hf/privacy-filter/viterbi_calibration.json` ships transition biases for a constrained decode that is not yet implemented.
+- The `tokenizer.json` stores merges as arrays, which needs `tokenizers` 0.21+; `tools/infer` and `tools/bench` still pin 0.15 and would fail to load it.
+- Accuracy evidence is a 30-text / 1025-token sweep, not a broad benchmark.
+- The model recognizes 8 entity types: `account_number`, `private_address`, `private_date`, `private_email`, `private_person`, `private_phone`, `private_url`, `secret`. Anything else (national ID, license plate, medical record) is `O`.
+- **Documentation placeholder keys are not flagged.** `AKIAIOSFODNN7EXAMPLE` scores `O` at p≈1.000 across every token, while `AKIA4TZQ8W2LMXPVK9RJ` is caught as `secret`. Bisecting the string shows the trigger is the trailing `EXAMPLE`/`SAMPLE`/`AMPLE` token, not the `AKIA` prefix — the model learned that placeholder-looking keys are not real credentials. This is training-data behavior, verified identical in HF fp32, not a quantization or runner artifact. It means canned examples in test fixtures will under-report.
+- Structured secrets split rather than span: `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` yields two fragments (`EMI/K7`, `/bPxRfi`) instead of one. A redactor should merge or widen `secret` spans before splicing.
+- Bare numerics are labeled by surrounding context, and the context can be wrong: a card CVV `123` came back `private_address` at p=0.47 vs `private_date` at p=0.42 — low confidence and effectively a coin flip. Card numbers land in `account_number`; there is no dedicated card/CVV class.

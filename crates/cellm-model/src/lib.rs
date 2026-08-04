@@ -12,6 +12,8 @@ pub mod qwen;
 pub mod granite;
 pub mod lfm;
 pub mod lfm_encoder;
+pub mod privacy_filter;
+pub use privacy_filter::PrivacyFilterRunner;
 pub mod deepseek_v4;
 pub mod batched;
 

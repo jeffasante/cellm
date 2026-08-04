@@ -123,6 +123,11 @@ struct Args {
     #[arg(long, default_value_t = true)]
     stop_eos: bool,
 
+    /// Extra token ids that terminate generation, for models whose
+    /// generation_config lists several (e.g. functiongemma: 1,50,106).
+    #[arg(long, value_delimiter = ',')]
+    stop_tokens: Vec<u32>,
+
     /// Inference backend selector.
     ///
     /// `metal` uses strict model Metal backend init; failures return an error.
@@ -505,7 +510,12 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                 let last_tok = *prompt_tokens.last().unwrap();
                 r.step_topk(last_tok, prompt_tokens.len() - 1, &mut page_table, &mut kv_cache, args.top_k)?
             }
-            Runner::Gemma(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
+            Runner::Gemma(r) => {
+                // Only the last prompt token's logits are sampled, so ask for
+                // top_k=0 elsewhere and skip the lm_head matmul per position.
+                let want = if i + 1 == prompt_tokens.len() { args.top_k } else { 0 };
+                r.step_topk(tok, i, &mut page_table, &mut kv_cache, want)?
+            }
             Runner::Qwen(r) => {
                 // Qwen supports batch prefill. Process all but the last token in one pass,
                 // then step the final token to get logits for sampling the first decode token.
@@ -522,6 +532,10 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             Runner::DeepSeekV4(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
         };
         all_ids.push(tok);
+        // Positions asked for top_k=0 return no candidates and nothing to sample.
+        if cand.is_empty() {
+            continue;
+        }
         if initial_candidates.is_empty() {
             initial_candidates = cand.clone();
         }
@@ -579,6 +593,10 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
             }
             if Some(cur) == chat_im_start {
                 stop_reason = "im_start";
+                break;
+            }
+            if args.stop_tokens.contains(&cur) {
+                stop_reason = "stop_token";
                 break;
             }
         }

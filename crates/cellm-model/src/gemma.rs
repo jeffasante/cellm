@@ -857,6 +857,10 @@ impl GemmaRunner {
         // Try fully-batched single-command-buffer GPU decode first.
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let Some(all_logits) = self.step_topk_batched(x0, per_layer_input, pos, page_table, kv_cache)? {
+            // KV is written; a caller that wants no logits can skip the top-k scan.
+            if top_k == 0 {
+                return Ok(Vec::new());
+            }
             let vocab = cfg.vocab_size;
             let k = top_k.max(1).min(vocab);
             let mut top: Vec<(u32, f32)> = Vec::with_capacity(k);
@@ -1704,6 +1708,12 @@ impl GemmaRunner {
             rms_norm_f32(&x, &norm_w, cfg.rms_norm_eps, &mut x_final);
         }
 
+        // The KV cache is fully written by this point, so prefill positions whose
+        // logits are never sampled can skip the lm_head matmul entirely.
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+
         // Logits via tied embeddings / lm_head.
         let vocab = cfg.vocab_size;
         let k = top_k.max(1).min(vocab);
@@ -1794,13 +1804,15 @@ impl GemmaRunner {
                     } else if let (Some(wi4), Some(scales)) = (lm_src_i4, lm_src_i4_scales) {
                         let row_stride = hidden.div_ceil(2);
                         let row = &wi4[vid * row_stride..(vid + 1) * row_stride];
-                        let scale = f16::from_bits(scales[vid]).to_f32();
-                        dot = dot_i4_scaled_row(row, x_final.as_slice(), scale);
+                        let spr = (scales.len() / vocab).max(1);
+                        let rs = &scales[vid * spr..(vid + 1) * spr];
+                        dot = dot_i4_grouped_row(row, x_final.as_slice(), rs, hidden / spr);
                     } else if let (Some(wi2), Some(scales)) = (lm_src_i2, lm_src_i2_scales) {
                         let row_stride = hidden.div_ceil(4);
                         let row = &wi2[vid * row_stride..(vid + 1) * row_stride];
-                        let scale = f16::from_bits(scales[vid]).to_f32();
-                        dot = dot_i2_scaled_row(row, x_final.as_slice(), scale);
+                        let spr = (scales.len() / vocab).max(1);
+                        let rs = &scales[vid * spr..(vid + 1) * spr];
+                        dot = dot_i2_grouped_row(row, x_final.as_slice(), rs, hidden / spr);
                     }
                     *out_v = dot;
                 });
@@ -1821,13 +1833,15 @@ impl GemmaRunner {
                     } else if let (Some(wi4), Some(scales)) = (lm_src_i4, lm_src_i4_scales) {
                         let row_stride = hidden.div_ceil(2);
                         let row = &wi4[vid * row_stride..(vid + 1) * row_stride];
-                        let scale = f16::from_bits(scales[vid]).to_f32();
-                        dot = dot_i4_scaled_row(row, &x_final, scale);
+                        let spr = (scales.len() / vocab).max(1);
+                        let rs = &scales[vid * spr..(vid + 1) * spr];
+                        dot = dot_i4_grouped_row(row, &x_final, rs, hidden / spr);
                     } else if let (Some(wi2), Some(scales)) = (lm_src_i2, lm_src_i2_scales) {
                         let row_stride = hidden.div_ceil(4);
                         let row = &wi2[vid * row_stride..(vid + 1) * row_stride];
-                        let scale = f16::from_bits(scales[vid]).to_f32();
-                        dot = dot_i2_scaled_row(row, &x_final, scale);
+                        let spr = (scales.len() / vocab).max(1);
+                        let rs = &scales[vid * spr..(vid + 1) * spr];
+                        dot = dot_i2_grouped_row(row, &x_final, rs, hidden / spr);
                     } else {
                         dot = f32::NAN;
                     }
@@ -1933,20 +1947,26 @@ impl GemmaRunner {
             "i4" => {
                 let embed = self.tensor_u8_by_exact_name(&resolved)?;
                 let scales = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
-                let scale = f16::from_bits(scales[t]).to_f32() * embed_scale;
+                let spr = (scales.len() / vocab).max(1);
+                let gs = hidden / spr;
+                let rs = &scales[t * spr..(t + 1) * spr];
                 let row_stride = hidden.div_ceil(2);
                 let row = &embed[t * row_stride..(t + 1) * row_stride];
                 for i in 0..hidden {
+                    let scale = f16::from_bits(rs[i / gs]).to_f32() * embed_scale;
                     out[i] = unpack_i4(row, i) * scale;
                 }
             }
             "i2" => {
                 let embed = self.tensor_u8_by_exact_name(&resolved)?;
                 let scales = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
-                let scale = f16::from_bits(scales[t]).to_f32() * embed_scale;
+                let spr = (scales.len() / vocab).max(1);
+                let gs = hidden / spr;
+                let rs = &scales[t * spr..(t + 1) * spr];
                 let row_stride = hidden.div_ceil(4);
                 let row = &embed[t * row_stride..(t + 1) * row_stride];
                 for i in 0..hidden {
+                    let scale = f16::from_bits(rs[i / gs]).to_f32() * embed_scale;
                     out[i] = unpack_i2(row, i) * scale;
                 }
             }
@@ -2213,14 +2233,23 @@ impl GemmaRunner {
                     )));
                 }
                 let s = self.tensor_f16_by_exact_name(&format!("{resolved}.qscale"))?;
-                if s.len() != out_dim {
+                // One scale per row, or `in_dim / gs` scales per row for grouped
+                // quantization; the kernel handles both via `gs`.
+                if s.len() % out_dim != 0 || s.len() == 0 {
                     return Err(CoreError::Backend(format!(
-                        "weight {weight_name} qscale len mismatch: {} expected {}",
+                        "weight {weight_name} qscale len mismatch: {} not a multiple of {}",
                         s.len(),
                         out_dim
                     )));
                 }
-                cellm_kernels::cpu_kernels::matmul_i4_f32(w, s, out_dim, in_dim, in_dim, x, out);
+                let spr = s.len() / out_dim;
+                if in_dim % spr != 0 {
+                    return Err(CoreError::Backend(format!(
+                        "weight {weight_name} qscale groups {spr} do not divide in_dim {in_dim}"
+                    )));
+                }
+                let gs = in_dim / spr;
+                cellm_kernels::cpu_kernels::matmul_i4_f32(w, s, out_dim, in_dim, gs, x, out);
             }
             "i2" => {
                 let w = self.tensor_u8_by_exact_name(&resolved)?;
@@ -2844,6 +2873,29 @@ fn dot_i4_scaled_row(row_packed: &[u8], x: &[f32], scale: f32) -> f32 {
         let hi = ((b >> 4) as i8) - 8;
         acc += x[xi] * ((hi as f32) * scale);
         xi += 1;
+    }
+    acc
+}
+
+/// `scales` holds this row's group scales; `gs == x.len()` degenerates to per-row.
+fn dot_i4_grouped_row(row_packed: &[u8], x: &[f32], scales: &[u16], gs: usize) -> f32 {
+    let mut acc = 0.0f32;
+    for (xi, &xv) in x.iter().enumerate() {
+        let b = row_packed[xi / 2];
+        let n = if xi % 2 == 0 { b & 0x0f } else { (b >> 4) & 0x0f };
+        let q = (n as i8) - 8;
+        let scale = f16::from_bits(scales[(xi / gs).min(scales.len() - 1)]).to_f32();
+        acc += xv * (q as f32) * scale;
+    }
+    acc
+}
+
+fn dot_i2_grouped_row(row_packed: &[u8], x: &[f32], scales: &[u16], gs: usize) -> f32 {
+    let mut acc = 0.0f32;
+    for (xi, &xv) in x.iter().enumerate() {
+        let q = (row_packed[xi / 4] >> ((xi % 4) * 2)) & 0x03;
+        let scale = f16::from_bits(scales[(xi / gs).min(scales.len() - 1)]).to_f32();
+        acc += xv * dequant_i2(q) * scale;
     }
     acc
 }

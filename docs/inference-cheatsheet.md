@@ -1309,7 +1309,17 @@ python3 tools/convert_privacy_filter_hf.py \
   --quant int4 --group-size 32 --quant-embedding
 ```
 
-6269 tensors, 942,793,408 bytes (899 MiB). Group 32 is the smallest recipe that leaks nothing: at group 64 five entities present in the f32 baseline go undetected. `--quant-embedding` stores `embed_tokens` as int8 (−128 MB); int4 there costs 18 missed entities, so it is not offered. Omitting `--f32-scales` keeps the sidecars in `f16`, which is where 157 MB of the earlier 1049 MB build went — measured accuracy is identical.
+6269 tensors, 942,793,408 bytes (899 MiB). Group 32 is the best measured recipe, but it does not leak nothing: recall 0.978, precision 0.975, F1 0.977, and **2.2% of gold entities still go undetected**. Group 64 is worse, missing five entities that the f32 baseline catches. `--quant-embedding` stores `embed_tokens` as int8 (−128 MB); int4 there costs 18 missed entities, so it is not offered. Omitting `--f32-scales` keeps the sidecars in `f16`, which is where 157 MB of the earlier 1049 MB build went — measured accuracy is identical.
+
+No published build reaches zero leak. Treat this model as a first-pass filter, not a compliance guarantee:
+
+| Build | Size | Recall | Precision | F1 | Leak |
+|---|---|---|---|---|---|
+| **int4 g32** | **899 MB** | **0.978** | **0.975** | **0.977** | **2.2%** |
+| int3 g128 | 667 MB | 0.954 | 0.923 | 0.938 | 4.6% |
+| int2 g32 | 599 MB | 0.934 | 0.919 | 0.927 | 6.6% |
+
+Names, phone numbers, and emails survive quantization intact; URLs, account numbers, and addresses degrade first. int2 drops 23% of URLs and 17% of account numbers, which is why it is not for compliance use.
 
 ### Build
 

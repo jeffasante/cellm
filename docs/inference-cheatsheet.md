@@ -974,6 +974,171 @@ light-dependent stage as "the dark phase", and swapped the contents of the
 light-dependent and light-independent reactions. Treat 350M output as drafting
 material, not reference text.
 
+## LFM2 2.6B int4 g64 (CPU)
+
+30 layers, hidden 2048, heads 32/8, vocab 128000, tied embeddings, 2.697 B
+params. Weights are MLX-style affine int4: nibbles packed 8-per-`u32` with f32
+`.scales`/`.biases` sidecars at group size 64.
+
+- File: 1,686,190,208 bytes (1.57 GiB)
+- Chat format: ChatML, EOS 124900. This build emits `<think>` reasoning blocks.
+- Metal is not implemented for the LFM2 runner; `--backend metal` falls back to CPU.
+
+```bash
+./target/release/infer \
+  --model models/LFM2-2.6B-int4-g64.cellm \
+  --tokenizer models/LFM2-2.6B-int4-g64.tokenizer.json \
+  --prompt "What is the capital of France?" \
+  --chat --gen 120 --temperature 0 --stop-eos
+
+  Prefill: 16 tokens in 4.41s (next=124901)
+  <think>The user is asking a straightforward factual question: "What is the
+  capital of France?"
+
+  1.  **Identify the core entity and attribute:** The entity is "France", the
+      attribute is "capital".
+  2.  **Retrieve knowledge:** My internal knowledge base contains information
+      about world capitals. The capital of France is Paris.
+  3.  **Formulate the answer:** The direct answer is "Paris".
+  4.  **Check for nuances or additional context:** Sometimes people mention
+      "Île-de-France" as the region, but the capital city is definitely Paris.
+  Decode: 120 tokens in 18.28s
+```
+
+Run-to-run variance is about ±7% on both stages, so treat any single timing as
+a range rather than a figure. A cold page cache on the 1.6 GiB file changes
+prefill by more than 2x; warm the file with a throwaway `--gen 1` run before
+measuring anything.
+
+The tokenizer carries vision/audio tokens this text-only build does not define,
+so startup prints hundreds of benign lines like
+`Token '<|img_row_9_col_9|>' was expected to have ID '124996' but was given ID 'None'`.
+Filter them: `2>&1 | grep -v 'tokenizers::'`.
+
+### Use the packed-nibble kernel, not the dequant cache
+
+`linear_i4_out_in` used to dequantize each `u32` weight into a full
+`out_dim x in_dim` f32 matrix, cache it, then run a scalar dot product.
+`llama.rs` already routed the identical layout to
+`cpu_kernels::matmul_affine_i4_f32`, which dots the nibbles in place via NEON
+and hoists the affine bias to one multiply per group. Routing LFM through it
+too (commit `9ea9c53`):
+
+| Stage                | before  | after  |
+| -------------------- | ------- | ------ |
+| Prefill (16 tokens)  | 28.40s  | 8.16s  |
+| Decode (8 tokens)    | 12.42s  | 2.45s  |
+| Peak RSS             | 3391 MB | 1697 MB |
+
+The old entry-count cache bound was also not a memory bound: 128 entries is
+~0.6 GiB at 230M but ~9.6 GiB at 2.6B, which exhausted swap. The cache is now
+bounded by bytes, overridable with `CELLM_WEIGHT_CACHE_MB`.
+
+Measure resident size with `vmmap --summary` "Physical footprint", not `ps`
+RSS — RSS counts clean file-backed mmap pages and overstates this by ~3x.
+
+### Widen the NEON accumulator before adding threads
+
+`affine_i4_group_dot_neon` consumed 4 bytes (8 weights) per iteration into a
+single accumulator, so every `vfmaq_f32` depended on the previous one and the
+loop ran at FMA *latency* rather than issue rate. Processing 16 bytes across
+four independent accumulators took decode from 12.37s to 9.62s.
+
+Decode time scaling near-linearly with thread count is the tell: a
+bandwidth-bound kernel saturates early, so linear scaling means it was
+compute-bound and the inner loop was the problem. Raising the thread cap
+would have masked that instead of fixing it.
+
+### W4A8 SDOT for prefill
+
+Prefill has 16+ tokens of parallelism decode does not, which is enough to
+amortize quantizing activations to int8 and using SDOT. Affine nibbles are
+unsigned 0..15, so they reinterpret as non-negative `i8` exactly and need none
+of the `+8` bias correction the symmetric `gemv_i4_w4a8` path applies. Each
+16-byte weight load unpacks once and feeds eight SDOTs across a 4-token tile.
+The affine `bias * sum(x)` term stays in f32 against unquantized activations,
+so only the `q · x` product carries quantization error.
+
+| prompt tokens | f32 NEON | W4A8   | speedup |
+| ------------- | -------- | ------ | ------- |
+| 70            | 11.30s   | 2.28s  | 4.96x   |
+| 210           | 27.74s   | 6.63s  | 4.18x   |
+| 460           | 61.99s   | 19.68s | 3.15x   |
+
+Greedy output is byte-identical with W4A8 on and off at all three lengths. The
+speedup falls off as prompts grow because attention is quadratic and untouched
+by this; long-context prefill is increasingly attention-bound.
+
+Gated on `group_size % 32 == 0 && cols % group_size == 0`; other shapes fall
+through to the f32 NEON path.
+
+### Two failed prefill experiments
+
+Both are recorded because each looked obviously correct beforehand.
+
+*Batching the int4 GEMM* first measured as no change at all. Two independent
+gates each fully suppressed it: `can_batch_prefill()` accepted only `i8`, and
+`tools/infer` never called `prefill_batched` for LFM. When a fix measures as
+no-change, look for a second gate before concluding the fix was wrong. Opening
+both gave only 6.86s to 5.01s, because per-token cost stayed flat under
+batching — which is itself the cheap diagnostic that prefill was compute-bound,
+not weight-bandwidth-bound, and should have been run first.
+
+*Hoisting the nibble unpack* out of the token loop was 3x slower (23.5s to
+56.4s at 171 tokens) and was reverted. Reusing an unpacked f32 tile requires a
+scalar dot product, and the NEON path unpacks essentially for free — the SIMD
+loss dwarfed the algorithmic win.
+
+### Do not go below int4 on this model
+
+int2 was tested end-to-end by writing int2-derived `(q, scale, bias)` triples
+into the int4 container (int2's 4 levels are a subset of int4's 16), which
+reproduces int2 numerics exactly with no new format or kernel
+(`scratch/sim_int2_ffn.py`). FFN-only, group 64, MSE-optimal clipping — the
+gentlest int2 variant measured, 34.2% mean weight error:
+
+```
+>>> What is the capital of France?
+The word I'm receiving is "V" from the user. It seems like they are asking me
+what the capital of France is.
+
+>>> Explain in two sentences why the sky is blue.
+The atmosphere is not transparent, so we can see it from different colors. The
+reason for this is that the air is not directly in the form of sunlight.
+
+>>> Write a Python function that reverses a string.
+(prose about time complexity; never emitted code)
+```
+
+Grammatical but broken: lost the `<think>` behavior, hallucinated a phantom
+input token, inverted the physics, and would not write code when asked. Naive
+minmax int2 is worse still (46% error), and group 128 worse again (53%).
+
+Requantization error on real FFN tensors, per bit width:
+
+| scheme        | rel. error | cosine |
+| ------------- | ---------- | ------ |
+| int4 g64      | 0.00%      | 1.0000 |
+| int3 g64      | 20.4%      | 0.9872 |
+| int2 g64 mse  | 33.8%      | 0.9437 |
+| int2 g64      | 46.0%      | 0.9161 |
+| int2 g128     | 53.5%      | 0.8946 |
+
+Size floor for 2.697 B params (a 800 MB target needs 2.37 bits/param, which is
+below anything that survives):
+
+| config                    | size    |
+| ------------------------- | ------- |
+| int4 g64, f32 meta (today)| 1686 MB |
+| int4 g64, f16 meta        | 1517 MB |
+| int4 g128, f16 meta       | 1433 MB |
+| int3 g64, f16 meta        | 1180 MB |
+| int2 g64 FFN, rest int4   | 1022 MB |
+
+The cheapest untaken win is storing `.scales`/`.biases` as f16: 337 MB to
+169 MB of the file, worst-case 0.046% error on values above the f16 floor
+(0.89% of metadata falls below it, and those groups were already ~zero).
+
 ## Qwen3.0
 
 ```bash

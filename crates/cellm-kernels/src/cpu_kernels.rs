@@ -1556,6 +1556,52 @@ unsafe fn affine_i4_group_dot_neon(packed: *const u8, x: *const f32, len: usize)
     let pairs = len / 2;
     let mut pair = 0usize;
 
+    // Four independent accumulators: a single one serialises on FMA latency
+    // rather than issue rate, which costs several times the throughput here.
+    let mask16 = vdupq_n_u8(0x0f);
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut acc2 = vdupq_n_f32(0.0);
+    let mut acc3 = vdupq_n_f32(0.0);
+
+    while pair + 16 <= pairs {
+        let bytes = vld1q_u8(packed.add(pair));
+        let lo_n = vandq_u8(bytes, mask16);
+        let hi_n = vshrq_n_u8::<4>(bytes);
+
+        let lo_16a = vmovl_u8(vget_low_u8(lo_n));
+        let lo_16b = vmovl_high_u8(lo_n);
+        let hi_16a = vmovl_u8(vget_low_u8(hi_n));
+        let hi_16b = vmovl_high_u8(hi_n);
+
+        let l0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo_16a)));
+        let l1 = vcvtq_f32_u32(vmovl_high_u16(lo_16a));
+        let l2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo_16b)));
+        let l3 = vcvtq_f32_u32(vmovl_high_u16(lo_16b));
+        let h0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi_16a)));
+        let h1 = vcvtq_f32_u32(vmovl_high_u16(hi_16a));
+        let h2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi_16b)));
+        let h3 = vcvtq_f32_u32(vmovl_high_u16(hi_16b));
+
+        let base = x.add(pair * 2);
+        let a0 = vld2q_f32(base);
+        let a1 = vld2q_f32(base.add(8));
+        let a2 = vld2q_f32(base.add(16));
+        let a3 = vld2q_f32(base.add(24));
+
+        acc0 = vfmaq_f32(acc0, l0, a0.0);
+        acc1 = vfmaq_f32(acc1, h0, a0.1);
+        acc2 = vfmaq_f32(acc2, l1, a1.0);
+        acc3 = vfmaq_f32(acc3, h1, a1.1);
+        acc0 = vfmaq_f32(acc0, l2, a2.0);
+        acc1 = vfmaq_f32(acc1, h2, a2.1);
+        acc2 = vfmaq_f32(acc2, l3, a3.0);
+        acc3 = vfmaq_f32(acc3, h3, a3.1);
+        pair += 16;
+    }
+
+    acc = vaddq_f32(acc, vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
+
     while pair + 4 <= pairs {
         let bits = std::ptr::read_unaligned(packed.add(pair) as *const u32) as u64;
         let bytes = vcreate_u8(bits);
@@ -1644,6 +1690,220 @@ pub fn matmul_affine_i4_f32(
         }
         *value = dot;
     });
+}
+
+/// W4A8 form of [`gemm_affine_i4_f32`]: quantizes activations to int8 and uses
+/// SDOT, trading a small numeric error for ~4x the arithmetic throughput.
+///
+/// Affine nibbles are unsigned 0..=15, so they reinterpret as non-negative `i8`
+/// exactly and need none of the `+8` bias correction the symmetric path applies.
+/// The affine `bias * sum(x)` term is kept in f32 against the unquantized
+/// activations, so only the `q . x` product carries quantization error.
+///
+/// Returns false when the shapes or hardware rule out the fast path, leaving
+/// `out` untouched so the caller can fall back.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+fn gemm_affine_i4_w4a8(
+    weights: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    x: &[f32],
+    out: &mut [f32],
+    n_tokens: usize,
+) -> bool {
+    use std::arch::aarch64::*;
+
+    if !has_i8_dotprod() || group_size % 32 != 0 || cols % group_size != 0 || n_tokens == 0 {
+        return false;
+    }
+
+    let groups_per_row = cols / group_size;
+    let bytes_per_group = group_size / 2;
+    let packed_per_row = groups_per_row * bytes_per_group;
+    let half = cols / 2;
+
+    // Pad the token axis to a multiple of 4 so the inner tile never needs a
+    // remainder path; padded rows carry scale 0 and are discarded.
+    let tiles = n_tokens.div_ceil(4);
+    let padded = tiles * 4;
+
+    let mut even = vec![0i8; padded * half];
+    let mut odd = vec![0i8; padded * half];
+    let mut x_scales = vec![0.0f32; padded];
+    let mut x_sums = vec![0.0f32; padded * groups_per_row];
+    let mut xq = vec![0i8; cols];
+
+    for t in 0..n_tokens {
+        let row = &x[t * cols..(t + 1) * cols];
+        x_scales[t] = quantize_activation_i8(row, &mut xq);
+        deinterleave_i8(
+            &xq,
+            &mut even[t * half..(t + 1) * half],
+            &mut odd[t * half..(t + 1) * half],
+        );
+        for (g, chunk) in row.chunks(group_size).enumerate() {
+            x_sums[t * groups_per_row + g] = chunk.iter().copied().sum();
+        }
+    }
+
+    let mut cols_out: Vec<Vec<f32>> = (0..rows).map(|_| vec![0.0f32; n_tokens]).collect();
+    let lo_mask = unsafe { vdupq_n_u8(0x0f) };
+
+    cols_out.par_iter_mut().enumerate().for_each(|(row_idx, dst)| {
+        let base = row_idx * packed_per_row;
+        let params = row_idx * groups_per_row;
+
+        for tile in 0..tiles {
+            let t0 = tile * 4;
+            let mut qdot = [0.0f32; 4];
+
+            for g in 0..groups_per_row {
+                let gb = g * bytes_per_group;
+                let mut acc_e = [unsafe { vdupq_n_s32(0) }; 4];
+                let mut acc_o = [unsafe { vdupq_n_s32(0) }; 4];
+
+                let mut b = 0usize;
+                while b + 16 <= bytes_per_group {
+                    unsafe {
+                        // One weight load and unpack feeds eight SDOTs.
+                        let packed = vld1q_u8(weights.as_ptr().add(base + gb + b));
+                        let lo = vreinterpretq_s8_u8(vandq_u8(packed, lo_mask));
+                        let hi = vreinterpretq_s8_u8(vshrq_n_u8::<4>(packed));
+
+                        for k in 0..4 {
+                            let off = (t0 + k) * half + gb + b;
+                            acc_e[k] = sdot_s32(acc_e[k], lo, vld1q_s8(even.as_ptr().add(off)));
+                            acc_o[k] = sdot_s32(acc_o[k], hi, vld1q_s8(odd.as_ptr().add(off)));
+                        }
+                    }
+                    b += 16;
+                }
+
+                let scale = scales[params + g];
+                for k in 0..4 {
+                    let acc = unsafe { vaddvq_s32(acc_e[k]) + vaddvq_s32(acc_o[k]) };
+                    qdot[k] += acc as f32 * scale;
+                }
+            }
+
+            for k in 0..4 {
+                let t = t0 + k;
+                if t >= n_tokens {
+                    break;
+                }
+                let mut bias_term = 0.0f32;
+                for g in 0..groups_per_row {
+                    bias_term += biases[params + g] * x_sums[t * groups_per_row + g];
+                }
+                dst[t] = qdot[k] * x_scales[t] + bias_term;
+            }
+        }
+    });
+
+    for (row_idx, col) in cols_out.iter().enumerate() {
+        for (t, v) in col.iter().enumerate() {
+            out[t * rows + row_idx] = *v;
+        }
+    }
+    true
+}
+
+/// Batched form of [`matmul_affine_i4_f32`] over `n_tokens` activation rows.
+///
+/// Parallelising over rows rather than tokens keeps each weight row resident
+/// while every token dots against it. Prefers the W4A8 SDOT path and falls back
+/// to f32 NEON when the shape or hardware does not support it.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_affine_i4_f32(
+    weights: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    x: &[f32],
+    out: &mut [f32],
+    n_tokens: usize,
+) {
+    debug_assert_eq!(x.len(), n_tokens * cols);
+    debug_assert_eq!(out.len(), n_tokens * rows);
+    if n_tokens == 0 {
+        return;
+    }
+    if n_tokens == 1 {
+        matmul_affine_i4_f32(weights, scales, biases, rows, cols, group_size, x, out);
+        return;
+    }
+
+    // Prefill has enough tokens per weight load to amortise activation
+    // quantization, which decode's single row does not.
+    #[cfg(target_arch = "aarch64")]
+    if gemm_affine_i4_w4a8(
+        weights, scales, biases, rows, cols, group_size, x, out, n_tokens,
+    ) {
+        return;
+    }
+
+    let groups_per_row = cols.div_ceil(group_size);
+    let packed_per_group = group_size.div_ceil(2);
+    let packed_per_row = groups_per_row * packed_per_group;
+
+    let x_sums: Vec<f32> = (0..n_tokens)
+        .flat_map(|t| {
+            x[t * cols..(t + 1) * cols]
+                .chunks(group_size)
+                .map(|g| g.iter().copied().sum::<f32>())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // out is [n_tokens, rows]; each row index touches a strided set of slots,
+    // so accumulate per row into a scratch column and scatter once.
+    let mut cols_out: Vec<Vec<f32>> = (0..rows).map(|_| vec![0.0f32; n_tokens]).collect();
+
+    cols_out.par_iter_mut().enumerate().for_each(|(row_idx, dst)| {
+        let packed = &weights[row_idx * packed_per_row..(row_idx + 1) * packed_per_row];
+        let params = row_idx * groups_per_row;
+        for group in 0..groups_per_row {
+            let start = group * group_size;
+            let len = (cols - start).min(group_size);
+            let scale = scales[params + group];
+            let bias = biases[params + group];
+            let group_packed = &packed[group * packed_per_group..];
+
+            for (t, slot) in dst.iter_mut().enumerate() {
+                let xt = &x[t * cols..(t + 1) * cols];
+
+                #[cfg(target_arch = "aarch64")]
+                let quantized_dot = unsafe {
+                    affine_i4_group_dot_neon(group_packed.as_ptr(), xt.as_ptr().add(start), len)
+                };
+
+                #[cfg(not(target_arch = "aarch64"))]
+                let quantized_dot = {
+                    let mut sum = 0.0f32;
+                    for col in 0..len {
+                        let byte = group_packed[col / 2];
+                        let q = if col % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+                        sum += q as f32 * xt[start + col];
+                    }
+                    sum
+                };
+
+                *slot += scale * quantized_dot + bias * x_sums[t * groups_per_row + group];
+            }
+        }
+    });
+
+    for (row_idx, dst) in cols_out.iter().enumerate() {
+        for (t, v) in dst.iter().enumerate() {
+            out[t * rows + row_idx] = *v;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1904,6 +2164,187 @@ mod affine_i4_tests {
             assert!(
                 (actual - expected).abs() <= 1e-5,
                 "row {row}: actual={actual} expected={expected}"
+            );
+        }
+    }
+
+    // Group sizes below 32 never enter the wide NEON block, so the sizes here
+    // are chosen to cover it plus every tail length that follows it.
+    #[test]
+    fn affine_i4_matches_scalar_across_wide_and_tail_lengths() {
+        let mut seed = 0x1234_5678u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 16
+        };
+        for &group_size in &[32usize, 64, 96, 128] {
+            for &cols in &[
+                group_size,
+                group_size + 1,
+                group_size + 7,
+                group_size * 2 + 3,
+                group_size * 3 + 17,
+            ] {
+                let rows = 5usize;
+                let groups = cols.div_ceil(group_size);
+                let packed_per_group = group_size.div_ceil(2);
+                let weights: Vec<u8> = (0..rows * groups * packed_per_group)
+                    .map(|_| (next() & 0xff) as u8)
+                    .collect();
+                let scales: Vec<f32> = (0..rows * groups)
+                    .map(|_| (next() as f32 / 65_536.0) - 0.5)
+                    .collect();
+                let biases: Vec<f32> = (0..rows * groups)
+                    .map(|_| (next() as f32 / 65_536.0) - 0.5)
+                    .collect();
+                let x: Vec<f32> = (0..cols).map(|_| (next() as f32 / 65_536.0) - 0.5).collect();
+
+                let expected =
+                    reference(&weights, &scales, &biases, rows, cols, group_size, &x);
+                let mut actual = vec![0.0; rows];
+                matmul_affine_i4_f32(
+                    &weights,
+                    &scales,
+                    &biases,
+                    rows,
+                    cols,
+                    group_size,
+                    &x,
+                    &mut actual,
+                );
+                for (row, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                    assert!(
+                        (actual - expected).abs() <= 1e-3 * expected.abs().max(1.0),
+                        "gs={group_size} cols={cols} row {row}: actual={actual} expected={expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn affine_i4_gemm_is_bit_identical_to_per_token_gemv() {
+        use super::gemm_affine_i4_f32;
+
+        let mut seed = 0x0bad_c0deu32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 16
+        };
+        let rows = 7usize;
+        let cols = 131usize;
+        let group_size = 64usize;
+        let n_tokens = 5usize;
+        let groups = cols.div_ceil(group_size);
+        let packed_per_group = group_size.div_ceil(2);
+
+        let weights: Vec<u8> = (0..rows * groups * packed_per_group)
+            .map(|_| (next() & 0xff) as u8)
+            .collect();
+        let scales: Vec<f32> = (0..rows * groups)
+            .map(|_| (next() as f32 / 65_536.0) - 0.5)
+            .collect();
+        let biases: Vec<f32> = (0..rows * groups)
+            .map(|_| (next() as f32 / 65_536.0) - 0.5)
+            .collect();
+        let x: Vec<f32> = (0..n_tokens * cols)
+            .map(|_| (next() as f32 / 65_536.0) - 0.5)
+            .collect();
+
+        let mut expected = vec![0.0f32; n_tokens * rows];
+        for t in 0..n_tokens {
+            matmul_affine_i4_f32(
+                &weights,
+                &scales,
+                &biases,
+                rows,
+                cols,
+                group_size,
+                &x[t * cols..(t + 1) * cols],
+                &mut expected[t * rows..(t + 1) * rows],
+            );
+        }
+
+        let mut actual = vec![0.0f32; n_tokens * rows];
+        gemm_affine_i4_f32(
+            &weights,
+            &scales,
+            &biases,
+            rows,
+            cols,
+            group_size,
+            &x,
+            &mut actual,
+            n_tokens,
+        );
+
+        assert_eq!(actual, expected, "GEMM must match per-token GEMV exactly");
+    }
+
+    #[test]
+    fn affine_i4_w4a8_gemm_is_close_to_f32_gemv() {
+        use super::gemm_affine_i4_f32;
+
+        // cols % group_size == 0 and group_size % 32 == 0, so this shape takes
+        // the SDOT path rather than the f32 fallback the test above exercises.
+        let rows = 9usize;
+        let cols = 128usize;
+        let group_size = 64usize;
+        let n_tokens = 6usize;
+        let groups = cols / group_size;
+        let packed_per_group = group_size / 2;
+
+        let mut seed = 0x5eed_1234u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 16
+        };
+        let weights: Vec<u8> = (0..rows * groups * packed_per_group)
+            .map(|_| (next() & 0xff) as u8)
+            .collect();
+        let scales: Vec<f32> = (0..rows * groups)
+            .map(|_| ((next() as f32 / 65_536.0) - 0.5) * 0.1)
+            .collect();
+        let biases: Vec<f32> = (0..rows * groups)
+            .map(|_| ((next() as f32 / 65_536.0) - 0.5) * 0.1)
+            .collect();
+        let x: Vec<f32> = (0..n_tokens * cols)
+            .map(|_| (next() as f32 / 65_536.0) - 0.5)
+            .collect();
+
+        let mut expected = vec![0.0f32; n_tokens * rows];
+        for t in 0..n_tokens {
+            matmul_affine_i4_f32(
+                &weights,
+                &scales,
+                &biases,
+                rows,
+                cols,
+                group_size,
+                &x[t * cols..(t + 1) * cols],
+                &mut expected[t * rows..(t + 1) * rows],
+            );
+        }
+
+        let mut actual = vec![0.0f32; n_tokens * rows];
+        gemm_affine_i4_f32(
+            &weights,
+            &scales,
+            &biases,
+            rows,
+            cols,
+            group_size,
+            &x,
+            &mut actual,
+            n_tokens,
+        );
+
+        let scale = expected.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+        for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (a - e).abs() <= 0.02 * scale,
+                "slot {i}: w4a8={a} f32={e} (tolerance {})",
+                0.02 * scale
             );
         }
     }

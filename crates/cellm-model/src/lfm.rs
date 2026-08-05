@@ -1153,8 +1153,7 @@ impl LfmRunner {
     /// than once per token.
     ///
     /// Only the CPU path is batched. Metal already coalesces its work into
-    /// command buffers, and the int4 dtype has no batched kernel, so both fall
-    /// back to [`Self::prefill`].
+    /// command buffers, so it falls back to [`Self::prefill`].
     pub fn prefill_batched(
         &mut self,
         tokens: &[u32],
@@ -1501,13 +1500,16 @@ impl LfmRunner {
                 }
                 _ => return false,
             };
-            if self.tensor_dtype(&name).as_deref() != Some("i8") {
+            // Both dtypes have a batched kernel: i8 via gemm_i8_w8a8, packed
+            // int4 via gemm_affine_i4_f32.
+            let batchable = |d: Option<&str>| matches!(d, Some("i8") | Some("u32"));
+            if !batchable(self.tensor_dtype(&name).as_deref()) {
                 return false;
             }
-            if self.tensor_dtype(&format!("model.layers.{layer}.feed_forward.w1.weight"))
-                .as_deref()
-                != Some("i8")
-            {
+            if !batchable(
+                self.tensor_dtype(&format!("model.layers.{layer}.feed_forward.w1.weight"))
+                    .as_deref(),
+            ) {
                 return false;
             }
         }
@@ -2139,47 +2141,26 @@ impl LfmRunner {
             let biases_name = "model.embed_tokens.biases".to_string();
 
             if dtype == "u32" && self.file.has_tensor(&scales_name) && self.file.has_tensor(&biases_name) {
-                // Quantized embeddings - need to dequantize each row and dot with x_final
+                // Tied int4 embeddings: the largest matmul in the model. The u32 nibble
+                // order matches the kernel's byte-pair order, so the packed bytes feed
+                // straight in with no dequantization.
                 let weight_bytes = self.file.tensor_bytes("model.embed_tokens.weight")?;
-                let scales_bytes = self.file.tensor_bytes(&scales_name)?;
-                let biases_bytes = self.file.tensor_bytes(&biases_name)?;
+                let scales_f32: &[f32] = bytemuck::cast_slice(self.file.tensor_bytes(&scales_name)?);
+                let biases_f32: &[f32] = bytemuck::cast_slice(self.file.tensor_bytes(&biases_name)?);
 
-                let weight_u32: &[u32] = bytemuck::cast_slice(weight_bytes);
-                let scales_f32: &[f32] = bytemuck::cast_slice(scales_bytes);
-                let biases_f32: &[f32] = bytemuck::cast_slice(biases_bytes);
+                let groups_per_row = scales_f32.len() / cfg.vocab_size.max(1);
+                let group_size = hidden.div_ceil(groups_per_row.max(1));
 
-                let group_size = 64usize;
-                let groups_per_row = (hidden + group_size - 1) / group_size;
-                let packed_in = hidden / 8;
-
-                // Compute logits in parallel
-                logits.par_iter_mut().enumerate().for_each(|(vocab_idx, logit)| {
-                    let row_offset = vocab_idx * packed_in;
-                    let mut acc = 0.0f32;
-
-                    for g in 0..groups_per_row {
-                        let g_start = g * group_size;
-                        let g_end = ((g + 1) * group_size).min(hidden);
-                        let scale_idx = vocab_idx * groups_per_row + g;
-                        let scale = scales_f32.get(scale_idx).copied().unwrap_or(1.0);
-                        let bias = biases_f32.get(scale_idx).copied().unwrap_or(0.0);
-
-                        for j in g_start..g_end {
-                            let packed_idx = row_offset + (j / 8);
-                            let nibble_pos = j % 8;
-
-                            if packed_idx < weight_u32.len() {
-                                let packed = weight_u32[packed_idx];
-                                let nibble = ((packed >> (nibble_pos * 4)) & 0xF) as i32;
-                                let q = nibble as f32;
-                                let w = q * scale + bias;
-                                acc += w * x_final[j];
-                            }
-                        }
-                    }
-
-                    *logit = acc;
-                });
+                cellm_kernels::cpu_kernels::matmul_affine_i4_f32(
+                    weight_bytes,
+                    scales_f32,
+                    biases_f32,
+                    cfg.vocab_size,
+                    hidden,
+                    group_size,
+                    &x_final,
+                    &mut logits,
+                );
             } else if dtype == "i4" {
                 // Per-row symmetric int4 tied embeddings. This is the single
                 // largest matmul in the model, so consuming the packed nibbles
@@ -2462,7 +2443,7 @@ impl LfmRunner {
 
         // The GEMM is CPU-only, and the Metal path already batches its own work
         // into command buffers, so leave it alone.
-        let use_gemm = dtype == "i8" && n_tokens > 1 && {
+        let cpu_batched = n_tokens > 1 && {
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             {
                 self.metal_ops.is_none()
@@ -2472,6 +2453,34 @@ impl LfmRunner {
                 true
             }
         };
+        let use_gemm = dtype == "i8" && cpu_batched;
+
+        let base_name = weight_name.trim_end_matches(".weight");
+        let scales_name = format!("{base_name}.scales");
+        let biases_name = format!("{base_name}.biases");
+        if dtype == "u32"
+            && cpu_batched
+            && self.file.has_tensor(&scales_name)
+            && self.file.has_tensor(&biases_name)
+        {
+            let weight_bytes = self.file.tensor_bytes(weight_name)?;
+            let scales: &[f32] = bytemuck::cast_slice(self.file.tensor_bytes(&scales_name)?);
+            let biases: &[f32] = bytemuck::cast_slice(self.file.tensor_bytes(&biases_name)?);
+            let groups_per_row = scales.len() / out_dim.max(1);
+            let group_size = in_dim.div_ceil(groups_per_row.max(1));
+            cellm_kernels::cpu_kernels::gemm_affine_i4_f32(
+                weight_bytes,
+                scales,
+                biases,
+                out_dim,
+                in_dim,
+                group_size,
+                input,
+                out,
+                n_tokens,
+            );
+            return Ok(());
+        }
 
         if use_gemm {
             let w = self.tensor_i8(weight_name)?;

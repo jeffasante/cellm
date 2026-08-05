@@ -528,7 +528,28 @@ Use a native llama/gemma/qwen .cellm/.cellmd model, or set CELLM_ALLOW_LITERT_PR
                 r.step_topk(last_tok, prompt_tokens.len() - 1, &mut page_table, &mut kv_cache, args.top_k)?
             }
             Runner::Granite(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
-            Runner::Lfm(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
+            Runner::Lfm(r) => {
+                // Batched prefill runs the whole prompt through each weight once;
+                // it falls back to per-token internally when it cannot batch.
+                if i > 0 {
+                    all_ids.push(tok);
+                    continue;
+                }
+                r.prefill_batched(
+                    &prompt_tokens[..prompt_tokens.len() - 1],
+                    0,
+                    &mut page_table,
+                    &mut kv_cache,
+                )?;
+                let last_tok = *prompt_tokens.last().unwrap();
+                r.step_topk(
+                    last_tok,
+                    prompt_tokens.len() - 1,
+                    &mut page_table,
+                    &mut kv_cache,
+                    args.top_k,
+                )?
+            }
             Runner::DeepSeekV4(r) => r.step_topk(tok, i, &mut page_table, &mut kv_cache, args.top_k)?,
         };
         all_ids.push(tok);

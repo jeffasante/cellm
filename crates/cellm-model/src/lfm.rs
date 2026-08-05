@@ -35,6 +35,24 @@ use crate::{CellmFile, ModelConfig};
 /// Maximum weight cache entries before LRU eviction (approx 500MB with typical layer sizes)
 const MAX_CACHE_ENTRIES: usize = 128;
 
+/// Byte ceiling for the dequantized weight cache, overridable via `CELLM_WEIGHT_CACHE_MB`.
+///
+/// The entry count alone is not a memory bound: entry size scales with the model, so 128
+/// entries is ~0.6 GiB at 230M but ~9.6 GiB at 2.6B, which exhausts swap and wedges the host.
+const DEFAULT_CACHE_BYTES: usize = 1536 * 1024 * 1024;
+
+/// The Metal FFN path pre-populates w1/w3/w2 and then unwraps all three, so eviction must
+/// never drop an entry the caller is still about to read.
+const MIN_CACHE_ENTRIES: usize = 4;
+
+fn weight_cache_budget_bytes() -> usize {
+    std::env::var("CELLM_WEIGHT_CACHE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(DEFAULT_CACHE_BYTES)
+}
+
 pub struct LfmRunner {
     file: CellmFile,
     cfg: ModelConfig,
@@ -2621,6 +2639,30 @@ impl LfmRunner {
         in_dim: usize,
         out: &mut [f32],
     ) -> Result<(), CoreError> {
+        // The Metal path needs an f32 copy; on CPU dot the packed nibbles directly so the
+        // dequant cache is never populated.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let metal_active = self.metal_ops.is_some();
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let metal_active = false;
+
+        if !metal_active {
+            let base_name = weight_name.trim_end_matches(".weight");
+            let packed = self.file.tensor_bytes(weight_name)?;
+            let scales: &[f32] =
+                bytemuck::cast_slice(self.file.tensor_bytes(&format!("{base_name}.scales"))?);
+            let biases: &[f32] =
+                bytemuck::cast_slice(self.file.tensor_bytes(&format!("{base_name}.biases"))?);
+            let groups_per_row = scales.len() / out_dim.max(1);
+            if groups_per_row > 0 && scales.len() == biases.len() {
+                let group_size = in_dim.div_ceil(groups_per_row);
+                cellm_kernels::cpu_kernels::matmul_affine_i4_f32(
+                    packed, scales, biases, out_dim, in_dim, group_size, input, out,
+                );
+                return Ok(());
+            }
+        }
+
         // Check cache first
         let cache_key = (weight_name.to_string(), out_dim, in_dim);
 
@@ -2656,12 +2698,23 @@ impl LfmRunner {
                 }
             });
 
-            // LRU eviction: if at capacity, remove oldest entry
-            if self.weight_cache.len() >= MAX_CACHE_ENTRIES {
-                if let Some(old_key) = self.lru_order.first().cloned() {
-                    self.weight_cache.remove(&old_key);
-                    self.lru_order.remove(0);
+            // LRU eviction, bounded by both entry count and total bytes.
+            let budget = weight_cache_budget_bytes();
+            let incoming = dequant.len() * std::mem::size_of::<f32>();
+            let mut live: usize = self
+                .weight_cache
+                .values()
+                .map(|v| v.len() * std::mem::size_of::<f32>())
+                .sum();
+
+            while self.lru_order.len() >= MIN_CACHE_ENTRIES
+                && (self.weight_cache.len() >= MAX_CACHE_ENTRIES || live + incoming > budget)
+            {
+                let Some(old_key) = self.lru_order.first().cloned() else { break };
+                if let Some(evicted) = self.weight_cache.remove(&old_key) {
+                    live -= evicted.len() * std::mem::size_of::<f32>();
                 }
+                self.lru_order.remove(0);
             }
 
             self.weight_cache.insert(cache_key.clone(), dequant);

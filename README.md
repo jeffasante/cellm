@@ -333,7 +333,7 @@ CELLM_COMMIT_TOKENIZER=models/to-huggingface/LFM2.5-230M/tokenizer.json \
 | **Bonsai** | 1.7B | High-quality local chat | 1-bit quantized; see `docs/bonsai_1bit_analysis.md` |
 | **Gemma-4** | 2B-4B | Larger mobile workloads | Experimental; see `docs/gemma4_*` |
 | **SmolVLM** | 256M | Vision-language (ONNX) | Native `.cellm` VLM path in progress |
-| **FunctionGemma** | 270M | Mobile actions / tool use | Experimental quality |
+| **FunctionGemma** | 270M | Mobile actions / tool use | Experimental quality; see [docs/function-calling-gemma.md](docs/function-calling-gemma.md) and [HF builds](https://huggingface.co/jeffasante/cellm-models/tree/main/function-calls/functiongemma-270m-cellm) |
 
 Recommended first download: [`SmolLM2-135M`](https://huggingface.co/HuggingFaceTB/SmolLM2-135M/tree/main)
 

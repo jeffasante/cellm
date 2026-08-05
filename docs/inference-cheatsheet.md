@@ -1521,9 +1521,16 @@ Offsets come straight from the tokenizer, so a leading space belongs to the toke
 ### Convert
 
 ```sh
+# 257 MB build: int8 weights, int8 embedding (per-row scale)
 python3 tools/convert_gemma3_hf.py \
   models/hf/functiongemma-270m-it \
-  models/functiongemma-270m-it-int8e.cellm \
+  models/functiongemma-270m-int8e.cellm \
+  --quant int8 --quant-embed int8
+
+# 186 MB build: int8 weights, int4 group-32 embedding
+python3 tools/convert_gemma3_hf.py \
+  models/hf/functiongemma-270m-it \
+  models/functiongemma-270m-int8-e4g32.cellm \
   --quant int8 --quant-embed int4 --group-size 32
 ```
 
@@ -1553,7 +1560,7 @@ python3 tools/convert_gemma3_hf.py \
 
 ### Test samples
 
-All 16 at `--temperature 0 --top-k 1`, int8+int4-embedding build (257 MB), verbatim:
+All 16 at `--temperature 0 --top-k 1`, int8-weights/int8-embedding build (257 MB), verbatim:
 
 ```text
 Turn on wifi
@@ -1622,9 +1629,9 @@ Agreement with a HuggingFace fp32 reference over the same 16 prompts, plus agree
 | Build | Size | vs HF ref | vs cellm f16 | Avg prefill |
 |---|---|---|---|---|
 | f16 | 511 MB | 12/16 | 16/16 | 4.19 s |
-| int8 | 416 MB | 11/16 | 12/16 | 2.95 s |
-| **int8 + int4 embed g32** | **257 MB** | **11/16** | **11/16** | **2.90 s** |
-| int8 + int4 embed g32, int4 weights | 186 MB | 9/16 | 9/16 | 2.94 s |
+| int8 weights, f16 embedding | 416 MB | 11/16 | 12/16 | 2.95 s |
+| **int8 weights, int8 embedding** | **257 MB** | **11/16** | **11/16** | **2.90 s** |
+| int8 weights, int4 g32 embedding | 186 MB | 9/16 | 9/16 | 2.94 s |
 
 int8 is strictly dominated — same 11/16, same speed, 159 MB larger — so only f16, 257 MB, and 186 MB are published. Below int8 there is no further speedup (2.90 vs 2.94 s) because the prefill fix already removed `lm_head` from 399 of 400 positions; what remains is memory-bound attention and MLP.
 
@@ -1634,7 +1641,7 @@ The 186 MB build's two real regressions are both dropped second calls: `Turn on 
 
 - **Prefill was doing 400x more work than it needed to.** `step_topk_from_hidden` computed the full 262144-row `lm_head` projection at *every* prompt position, though only the last one's logits are used. Passing `top_k = 0` for non-final positions and returning early took prefill from 26.51 s to 8.17 s on a 400-token prompt. With a vocab this large, `lm_head` was the majority of prefill cost.
 - **A bug in the error metric hid a real bug.** Grouped-scale models scored excellent per-tensor reconstruction error yet generated garbage. Both `lm_head` branches indexed `scales[vid]` — correct for one scale per row, wrong when there are `scales.len() / vocab` per row. The metric was computed on the dequantizer, not the inference path, so it agreed with itself. Fixed via `let spr = (scales.len() / vocab).max(1);` and new `dot_i4_grouped_row` / `dot_i2_grouped_row` helpers.
-- **The embedding tolerates 4 bits; the linear weights do not.** Isolating each: int4 embedding alone costs nothing measurable, int4 linear weights alone cost 2/16. This asymmetry is why the recommended recipe is int8 weights with an int4 embedding rather than uniform int4.
+- **The embedding tolerates fewer bits than the linear weights.** Isolating each: int4 linear weights alone cost 2/16, while dropping the embedding to int8 costs nothing measurable. Going further to an int4 g32 embedding does cost 2/16 (the 186 MB build), so the recommended recipe is int8 weights with an int8 embedding — uniform int4 is worse on both axes.
 - **Sub-100 MB is not reachable by quantization.** At int2 the embedding is 40 MB but the codebook only has 4 values per group; measured output is incoherent. The floor for usable quality is the 186 MB build.
 - **An earlier 5-prompt benchmark was wrong.** It reported the 186 MB build as identical to f16. The first five prompts are all single-call and easy; extending to 16 showed 9/16. Small eval sets on a tool-calling model will systematically over-report, because single-call prompts are the ones quantization damages last.
 - Three failures are base-model bugs present identically in f16 and in the HF reference: `6:30` becomes `14:30`, `Text Ama` invents `person@example.com`, and `Tell me a joke about cats` calls `play_music{query:"cat"}`.

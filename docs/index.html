@@ -885,7 +885,7 @@
                                 align-items: baseline;
                             "
                         >
-                            <div class="project-title">Phase 2 Foundation</div>
+                            <div class="project-title">Paged KV Cache Foundation</div>
                             <div
                                 style="
                                     font-size: 0.85rem;
@@ -896,8 +896,8 @@
                             </div>
                         </div>
                         <div class="project-meta">
-                            Strategic roadmap and architectural enhancements for
-                            cellm v2.
+                            Block allocator, page table, and the architecture the
+                            scheduler is built on.
                         </div>
                     </a>
                     <a href="scheduler.md" class="project-item">
@@ -935,12 +935,19 @@
                             "
                         >
                             <div class="project-title">
-                                Phase 4: Continuous Batching
-                                                                </div>
-                                                                <div style="font-size: 0.85rem; color: var(--text-secondary);">May 1, 2026</div>
-                                                            </div>
+                                Continuous Batching &amp; Scheduling Policies
+                            </div>
+                            <div
+                                style="
+                                    font-size: 0.85rem;
+                                    color: var(--text-secondary);
+                                "
+                            >
+                                May 1, 2026
+                            </div>
+                        </div>
                         <div class="project-meta">
-                            Continuous batching lite, SchedulingPolicy, Q4_K
+                            Interleaved multi-session decode, SchedulingPolicy, Q4_K
                             dtype, and expanded engine stats.
                         </div>
                     </a>
@@ -971,34 +978,6 @@
                         <div class="project-meta">
                             4.5x faster prompt processing via batched i8 GEMM,
                             with bit-identical output.
-                        </div>
-                    </a>
-                    <a
-                        href="q1_0_g128_cpu_optimization.md"
-                        class="project-item"
-                    >
-                        <div
-                            style="
-                                display: flex;
-                                justify-content: space-between;
-                                align-items: baseline;
-                            "
-                        >
-                            <div class="project-title">
-                                Q1_0 CPU Optimization
-                            </div>
-                            <div
-                                style="
-                                    font-size: 0.85rem;
-                                    color: var(--text-secondary);
-                                "
-                            >
-                                April 26, 2026
-                            </div>
-                        </div>
-                        <div class="project-meta">
-                            Resolving extreme latency on quantized CPU
-                            fallbacks.
                         </div>
                     </a>
                     <a href="inference_optimizations.md" class="project-item">
@@ -1141,79 +1120,6 @@
                         <div class="project-meta">
                             Eliminating redundant logits/topk during VLM prefill
                             on Apple Silicon.
-                        </div>
-                    </a>
-                    <a href="gemma_metal_nan_fix.md" class="project-item">
-                        <div
-                            style="
-                                display: flex;
-                                justify-content: space-between;
-                                align-items: baseline;
-                            "
-                        >
-                            <div class="project-title">
-                                Gemma Metal NaN Fix
-                            </div>
-                            <div
-                                style="
-                                    font-size: 0.85rem;
-                                    color: var(--text-secondary);
-                                "
-                            >
-                                April 30, 2026
-                            </div>
-                        </div>
-                        <div class="project-meta">
-                            Tracing fused graph NaNs to Metal fast-math and
-                            restoring Gemma GPU inference.
-                        </div>
-                    </a>
-                    <a href="gemma4-metal-bug.md" class="project-item">
-                        <div
-                            style="
-                                display: flex;
-                                justify-content: space-between;
-                                align-items: baseline;
-                            "
-                        >
-                            <div class="project-title">
-                                Gemma4 Metal Unused33 Fix
-                            </div>
-                            <div
-                                style="
-                                    font-size: 0.85rem;
-                                    color: var(--text-secondary);
-                                "
-                            >
-                                May 2, 2026
-                            </div>
-                        </div>
-                        <div class="project-meta">
-                            Fixing degenerate logits from an empty persistent
-                            GPU KV cache in the per-layer Metal decode path.
-                        </div>
-                    </a>
-                    <a href="metal_inference_fix.md" class="project-item">
-                        <div
-                            style="
-                                display: flex;
-                                justify-content: space-between;
-                                align-items: baseline;
-                            "
-                        >
-                            <div class="project-title">Metal Backend Fixes</div>
-                            <div
-                                style="
-                                    font-size: 0.85rem;
-                                    color: var(--text-secondary);
-                                "
-                            >
-                                April 16, 2026
-                            </div>
-                        </div>
-                        <div class="project-meta">
-                            Resolving stability issues in the Metal execution
-                            path.
                         </div>
                     </a>
                 </div>
@@ -1363,29 +1269,6 @@
                         <div class="project-meta">
                             The technical challenge of squeezing 10GB models
                             into 3.4GB.
-                        </div>
-                    </a>
-                    <a href="bonsai_1bit_analysis.md" class="project-item">
-                        <div
-                            style="
-                                display: flex;
-                                justify-content: space-between;
-                                align-items: baseline;
-                            "
-                        >
-                            <div class="project-title">Bonsai 1-bit Analysis</div>
-                            <div
-                                style="
-                                    font-size: 0.85rem;
-                                    color: var(--text-secondary);
-                                "
-                            >
-                                April 23, 2026
-                            </div>
-                        </div>
-                        <div class="project-meta">
-                            Investigating incoherence in extreme 1-bit
-                            quantization.
                         </div>
                     </a>
                     <a href="privacy-filter-pii.md" class="project-item">
@@ -1720,7 +1603,7 @@
                         </div>
                     </a>
                     <a
-                        href="vulkan-backend-and-android-aar.md"
+                        href="vulkan-backend-scaffolding.md"
                         class="project-item"
                     >
                         <div
@@ -1731,7 +1614,7 @@
                             "
                         >
                             <div class="project-title">
-                                Vulkan Backend and Android AAR
+                                Vulkan: Backend Scaffolding (Research)
                             </div>
                             <div
                                 style="
@@ -1743,7 +1626,8 @@
                             </div>
                         </div>
                         <div class="project-meta">
-                            Vulkan compute backend, SPIR-V shader pipeline, and Kotlin AAR bindings for Android.
+                            Instance, device, pipeline cache, and buffer management in place.
+                            Compute kernels are not yet implemented &mdash; all ops fall back to CPU.
                         </div>
                     </a>
                     <a href="wasm-backend.md" class="project-item">
@@ -1772,27 +1656,171 @@
                         </div>
                     </a>
                     <a href="building-the-android-aar.md" class="project-item">
-                        <div style="display: flex; justify-content: space-between; align-items: baseline;">
+                        <div
+                            style="
+                                display: flex;
+                                justify-content: space-between;
+                                align-items: baseline;
+                            "
+                        >
+                            <div class="project-title">Building the Android AAR</div>
                             <div
                                 style="
-                                    display: flex;
-                                    justify-content: space-between;
-                                    align-items: baseline;
+                                    font-size: 0.85rem;
+                                    color: var(--text-secondary);
                                 "
                             >
-                                <div class="project-title">Building the Android AAR</div>
-                                <div
-                                    style="
-                                        font-size: 0.85rem;
-                                        color: var(--text-secondary);
-                                    "
-                                >
-                                    May 2, 2026
-                                </div>
+                                May 2, 2026
                             </div>
-                            <div style="font-size: 0.85rem; color: var(--text-secondary);">May 2026</div>
                         </div>
-                        <div class="project-meta">Step-by-step guide for developers to compile the AAR from source.</div>
+                        <div class="project-meta">
+                            Step-by-step guide for compiling the Kotlin AAR and native
+                            library from source. Not yet validated on-device.
+                        </div>
+                    </a>
+                </div>
+            </section>
+
+            <section id="engineering-notes">
+                <h2>Engineering Notes</h2>
+                <p
+                    style="
+                        color: var(--text-secondary);
+                        font-size: 0.9rem;
+                        margin-bottom: 1.5rem;
+                    "
+                >
+                    Debugging write-ups from building the backends &mdash; how specific
+                    numerical and performance bugs were diagnosed and fixed.
+                </p>
+                <div class="project-list">
+                    <a href="metal_inference_fix.md" class="project-item">
+                        <div
+                            style="
+                                display: flex;
+                                justify-content: space-between;
+                                align-items: baseline;
+                            "
+                        >
+                            <div class="project-title">
+                                Qwen 2.5 on Metal: Four Bugs Behind Garbled Output
+                            </div>
+                            <div
+                                style="
+                                    font-size: 0.85rem;
+                                    color: var(--text-secondary);
+                                "
+                            >
+                                April 16, 2026
+                            </div>
+                        </div>
+                        <div class="project-meta">
+                            A stub RMSNorm shader, a clobbered residual stream, and two
+                            more bugs found by diffing GPU against CPU stage by stage.
+                        </div>
+                    </a>
+                    <a
+                        href="q1_0_g128_cpu_optimization.md"
+                        class="project-item"
+                    >
+                        <div
+                            style="
+                                display: flex;
+                                justify-content: space-between;
+                                align-items: baseline;
+                            "
+                        >
+                            <div class="project-title">
+                                1.5-bit CPU Decode Stuck on One Core
+                            </div>
+                            <div
+                                style="
+                                    font-size: 0.85rem;
+                                    color: var(--text-secondary);
+                                "
+                            >
+                                April 26, 2026
+                            </div>
+                        </div>
+                        <div class="project-meta">
+                            CPU pinned at 103% traced to a sequential loop in the
+                            q1_0_g128 path; parallelized across cores with Rayon.
+                        </div>
+                    </a>
+                    <a href="gemma_metal_nan_fix.md" class="project-item">
+                        <div
+                            style="
+                                display: flex;
+                                justify-content: space-between;
+                                align-items: baseline;
+                            "
+                        >
+                            <div class="project-title">
+                                Gemma on Metal: NaNs from Fast-Math
+                            </div>
+                            <div
+                                style="
+                                    font-size: 0.85rem;
+                                    color: var(--text-secondary);
+                                "
+                            >
+                                April 30, 2026
+                            </div>
+                        </div>
+                        <div class="project-meta">
+                            Tracing fused-graph NaN divergence to Metal fast-math and
+                            restoring GPU inference.
+                        </div>
+                    </a>
+                    <a href="gemma4-metal-bug.md" class="project-item">
+                        <div
+                            style="
+                                display: flex;
+                                justify-content: space-between;
+                                align-items: baseline;
+                            "
+                        >
+                            <div class="project-title">
+                                Gemma-4 Metal: Degenerate Logits from an Empty KV Cache
+                            </div>
+                            <div
+                                style="
+                                    font-size: 0.85rem;
+                                    color: var(--text-secondary);
+                                "
+                            >
+                                May 2, 2026
+                            </div>
+                        </div>
+                        <div class="project-meta">
+                            Every generated token came back the same until an empty
+                            persistent GPU KV cache turned out to be the cause.
+                        </div>
+                    </a>
+                    <a href="bonsai_1bit_analysis.md" class="project-item">
+                        <div
+                            style="
+                                display: flex;
+                                justify-content: space-between;
+                                align-items: baseline;
+                            "
+                        >
+                            <div class="project-title">
+                                Where 1-bit Quantization Breaks Down
+                            </div>
+                            <div
+                                style="
+                                    font-size: 0.85rem;
+                                    color: var(--text-secondary);
+                                "
+                            >
+                                April 23, 2026
+                            </div>
+                        </div>
+                        <div class="project-meta">
+                            Measuring output incoherence in Bonsai 1.7B and what the
+                            limits of extreme quantization look like in practice.
+                        </div>
                     </a>
                 </div>
             </section>

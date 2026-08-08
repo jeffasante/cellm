@@ -1,20 +1,40 @@
-# Vulkan Backend and Android Kotlin AAR
+# Vulkan: Backend Scaffolding (Compute Kernels Not Yet Implemented)
 
-This document describes the Vulkan compute backend and Kotlin Android AAR
-bindings added to cellm for cross-platform GPU inference.
+> **Status.** This is research scaffolding, not a working GPU backend. The
+> Vulkan device, queues, pipeline cache, and buffer management all work, but
+> none of the compute kernels are written yet. Every op — matmul, rms_norm,
+> rope, silu, add, mul, softmax, attention — returns an error and callers fall
+> back to CPU. The embedded SPIR-V is a 32-byte placeholder, the same bytes for
+> every kernel name. Enabled behind the optional `vulkan` feature.
+
+This document describes the Vulkan backend scaffolding in cellm: what is in
+place, how it is structured, and what still has to be built before it can run
+inference on a GPU.
+
+For the Kotlin Android AAR bindings, see
+[Building the Android AAR](building-the-android-aar.md).
 
 ---
 
-## What Was Implemented
+## What's In Place
 
-1.  **VulkanBackend** -- A compute backend using Vulkan 1.1 for GPU-accelerated
-    inference on Android devices. Replaces the empty `pub struct VulkanKernels;`
-    with a full instance/device/pipeline/buffer management system implementing the
-    `Backend` trait.
+1.  **VulkanBackend** -- Instance, device, queue, pipeline, and buffer
+    management for Vulkan 1.1, implementing the `Backend` trait. This replaces
+    the empty `pub struct VulkanKernels;`. It sets up everything a compute
+    backend needs, but the compute shaders themselves are stubs.
 
 2.  **Kotlin AAR bindings** -- Android library wrapping the cellm C FFI in
     idiomatic Kotlin. Includes `CellmEngine`, `CellmSession`, and
-    `CellmTokenizer` classes with proper lifecycle management.
+    `CellmTokenizer` classes with lifecycle management. These are independent of
+    Vulkan and run against the CPU backend.
+
+## What's Not
+
+- No compute kernel is implemented. Every entry in the op table below is a stub.
+- No real SPIR-V. `spirv_for_kernel()` ignores its argument and returns the same
+  32-byte placeholder module regardless of which kernel was requested.
+- The build skips SPIR-V compilation entirely if `glslangValidator` is absent.
+- Nothing here has been validated on a physical Android device.
 
 ---
 
@@ -110,7 +130,8 @@ VulkanBackend
 
 ### Backend Trait Implementation
 
-All nine ops from the `Backend` trait are implemented:
+All nine ops from the `Backend` trait are wired up, but none of them compute
+anything on the GPU yet:
 
 | Op | Implementation Status |
 |---|---|
@@ -144,83 +165,8 @@ Push constants (fast, per-dispatch parameters):
   - 32 bytes total, updated per dispatch
 ```
 
----
-
-## Kotlin AAR
-
-### CellmEngine
-
-Main entry point. Wraps the C FFI with Kotlin idioms.
-
-```
-CellmEngine
-  enum Backend { CPU(0), METAL(1) }
-  enum KvEncoding { F16(0), TURBOQUANT(1) }
-  enum SchedulingPolicy { FAIR(0), LATENCY_FIRST(1), THROUGHPUT_FIRST(2) }
-  data class KvStats(usedBlocks: Int, freeBlocks: Int)
-
-  companion object:
-    create(modelPath, tokensPerBlock=16, totalBlocks=256, ...): CellmEngine
-    (all parameters have @JvmOverloads defaults)
-
-  methods:
-    createSession(): CellmSession
-    submitTokens(session, tokens): Int
-    submitTokensCached(session, tokens, cacheHit): Int
-    stepDecode(): Pair<Long, Int>?
-    cancelSession / suspendSession / resumeSession / resetSession
-    setThermalLevel(level): Boolean
-    getKvStats(): KvStats
-    setSchedulingPolicy(policy): Boolean
-    getSchedulingPolicy(): SchedulingPolicy
-    getTotalTokens(): Long
-    getTokPerSec(): Double
-    resetStatsWindow()
-    close()
-```
-
-### CellmSession
-
-```
-CellmSession(handle: Long, engine: CellmEngine)
-  cancel()
-  suspend()
-  resume()
-  reset()
-  submitTokens(tokens: IntArray): Int
-  submitTokensCached(tokens: IntArray): Pair<Int, Boolean>
-```
-
-### CellmTokenizer
-
-```
-CellmTokenizer(handle: Long) : AutoCloseable
-  companion object:
-    load(path: String): CellmTokenizer
-
-  encode(text: String): IntArray
-  encodeInto(text: String, outTokens: IntArray): Int
-  decode(tokens: IntArray): String
-  decodeOne(token: Int): String
-  close()
-```
-
-### Build Configuration
-
-```
-build.gradle:
-  namespace: com.cellm.sdk
-  compileSdk: 34
-  minSdk: 24
-  targetSdk: 34
-  abiFilters: arm64-v8a
-  jniLibs: src/main/jniLibs
-  output: cellm-sdk-{variant}.aar
-
-copyNativeLibs task:
-  from ../../target/aarch64-linux-android/release/libcellm_sdk.so
-  into src/main/jniLibs/arm64-v8a/
-```
+The Kotlin AAR API surface and Gradle configuration moved to
+[Building the Android AAR](building-the-android-aar.md).
 
 ---
 

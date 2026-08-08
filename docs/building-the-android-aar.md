@@ -8,6 +8,11 @@ compiled for arm64-v8a.
 The current AAR is 157KB (Kotlin code and Compose UI only, native .so not
 included since cross-compilation requires the Android NDK).
 
+> **Status.** The AAR and demo app build and package the native library, but
+> nothing here has been validated or tuned on a physical Android device. There
+> are no on-device throughput numbers yet. Inference runs on the CPU backend —
+> the Vulkan backend is [scaffolding only](vulkan-backend-scaffolding.md).
+
 ---
 
 ## Prerequisites
@@ -135,6 +140,84 @@ dependencies {
     implementation 'androidx.compose.material3:material3'
     implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.6.2'
 }
+```
+
+---
+
+## Kotlin API Surface
+
+### CellmEngine
+
+Main entry point. Wraps the C FFI with Kotlin idioms.
+
+```
+CellmEngine
+  enum Backend { CPU(0), METAL(1) }
+  enum KvEncoding { F16(0), TURBOQUANT(1) }
+  enum SchedulingPolicy { FAIR(0), LATENCY_FIRST(1), THROUGHPUT_FIRST(2) }
+  data class KvStats(usedBlocks: Int, freeBlocks: Int)
+
+  companion object:
+    create(modelPath, tokensPerBlock=16, totalBlocks=256, ...): CellmEngine
+    (all parameters have @JvmOverloads defaults)
+
+  methods:
+    createSession(): CellmSession
+    submitTokens(session, tokens): Int
+    submitTokensCached(session, tokens, cacheHit): Int
+    stepDecode(): Pair<Long, Int>?
+    cancelSession / suspendSession / resumeSession / resetSession
+    setThermalLevel(level): Boolean
+    getKvStats(): KvStats
+    setSchedulingPolicy(policy): Boolean
+    getSchedulingPolicy(): SchedulingPolicy
+    getTotalTokens(): Long
+    getTokPerSec(): Double
+    resetStatsWindow()
+    close()
+```
+
+### CellmSession
+
+```
+CellmSession(handle: Long, engine: CellmEngine)
+  cancel()
+  suspend()
+  resume()
+  reset()
+  submitTokens(tokens: IntArray): Int
+  submitTokensCached(tokens: IntArray): Pair<Int, Boolean>
+```
+
+### CellmTokenizer
+
+```
+CellmTokenizer(handle: Long) : AutoCloseable
+  companion object:
+    load(path: String): CellmTokenizer
+
+  encode(text: String): IntArray
+  encodeInto(text: String, outTokens: IntArray): Int
+  decode(tokens: IntArray): String
+  decodeOne(token: Int): String
+  close()
+```
+
+### Build Configuration
+
+```
+build.gradle:
+  namespace: com.cellm.sdk
+  compileSdk: 34
+  minSdk: 24
+  targetSdk: 34
+  abiFilters: arm64-v8a
+  jniLibs: src/main/jniLibs
+  output: cellm-sdk-{variant}.aar
+
+copyNativeLibs task:
+  from ../../target/aarch64-linux-android/release/libcellm_sdk.so
+  into src/main/jniLibs/arm64-v8a/
 ```
 
 ---

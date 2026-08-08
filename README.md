@@ -5,7 +5,14 @@
 Not a wrapper around `llama.cpp`. Not a port of `vLLM`. A new runtime designed for mobile constraints from scratch.
 
 > [!NOTE]
-> This is just a research project—don't get mad at me lol!
+> **Status.** The CPU and Metal backends, the iOS bindings, and the text models
+> listed under [Supported Models](#supported-models) are stable and in active
+> use. Metal coverage varies by model; CPU runs everything. The Android AAR and
+> Compose demo build and package the native library, but haven't been validated
+> or tuned on-device. Vulkan sets up the device and pipelines but still runs
+> every op on CPU. The native `.cellm` VLM path and the Docker image are
+> experimental or not yet wired up; vision via ONNX is stable. See
+> [Feature Status](#feature-status).
 
 ![Inference Demo](docs/assets/inference_hq.gif)
 
@@ -18,13 +25,13 @@ Not a wrapper around `llama.cpp`. Not a port of `vLLM`. A new runtime designed f
 | **Paged KV Cache Deep Dive** | [`docs/paged-kv-cache-foundation.md`](docs/paged-kv-cache-foundation.md) |
 | **Benchmarks** | [`docs/benchmarks/README.md`](docs/benchmarks/README.md) |
 | **Model Conversion** | [`docs/convert-quantized-models.md`](docs/convert-quantized-models.md) |
-| **VLM (Vision) Guide** | [`docs/vlm-smolvlm-onnx.md`](docs/vlm-smolvlm-onnx.md) |
+| **VLM (Vision) Guide** | [`docs/vlm-smolvlm-onnx.md`](docs/vlm-smolvlm-onnx.md) (ONNX path; native `.cellm` is experimental) |
 | **iOS Demo App** | [`bindings/ios/CellmDemo`](bindings/ios/CellmDemo) |
-| **Android Bindings** | [`bindings/kotlin`](bindings/kotlin) |
+| **Android Bindings** | [`bindings/kotlin`](bindings/kotlin) (builds; not yet device-validated) |
 | **WASM & WebGPU** | [`docs/wasm-backend.md`](docs/wasm-backend.md) |
 | **Live WASM Demo** | [cellm-wasm (](https://jeffasante.github.io/cellm/wasm/index.html) (Research Preview) |
 | **Git Commit Messages** | [Local LLM commit messages](#commit-messages) below |
-| **Docker (CPU tooling)** | [Docker](#docker) below |
+| **Docker (CPU tooling)** | [Docker](#docker) below (planned, not yet wired up) |
 
 ## Quick Start
 
@@ -250,7 +257,7 @@ cellm's whole point is *phone* deployment (iOS/Android via Metal/Vulkan), so Doc
 | `cellm:vulkan` | Vulkan compute | Research | Once the Vulkan backend stabilizes (see Feature Status) |
 | `cellm:metal` | Metal | **Not possible** | No Metal GPU passthrough on Linux containers — Metal only runs on real macOS/iOS hardware |
 
-Unlike `llama.cpp`'s Docker matrix (CUDA/ROCm/Vulkan/SYCL variants for `full`/`light`/`server`), cellm doesn't need a wide backend matrix — this is a mobile-focused research project, not a server deployment target. A single CPU image covers the actual need for reproducible tooling.
+Unlike `llama.cpp`'s Docker matrix (CUDA/ROCm/Vulkan/SYCL variants for `full`/`light`/`server`), cellm doesn't need a wide backend matrix — this is a mobile-first inference engine, not a server deployment target. A single CPU image covers the actual need for reproducible tooling.
 
 Example `Dockerfile` shape:
 ```dockerfile
@@ -349,13 +356,14 @@ Sample checkpoints bundled in this repo (via Git LFS):
 - [x] **Paged KV Cache** - Fixed-size block allocation with `BlockAllocator` & `PageTable`
 - [x] **Multi-session Scheduler** - Round-robin interleaved decoding
 - [x] **4-bit Affine Dequantization** - Native MLX/HF packed weight support
-- [x] **Multimodal Vision** - Native ViT/SigLIP encoder + linear projector
+- [x] **Multimodal Vision (ONNX)** - SmolVLM via ONNX runtime; stable, see [`docs/vlm-smolvlm-onnx.md`](docs/vlm-smolvlm-onnx.md)
+- [ ] **Native `.cellm` VLM path** - ViT/SigLIP encoder + linear projector (experimental, see [`docs/vlm-smolvlm-onnx.md`](docs/vlm-smolvlm-onnx.md))
 - [x] **Accelerated Math** - Metal + WASM SIMD + WebGPU compute kernels
 - [x] **WebAssembly Support** - Run LLMs in the browser with `wasm-bindgen`
 - [x] **High-Performance CLI** - Conversion, benchmarking, debug inference
 - [x] **Git Commit Messages** - Generate commit messages from local LLM via `tools/git-cellm-commit.sh`
-- [ ] **Vulkan Support** - Cross-platform compute kernels (research)
-- [ ] **Android Integration** - Kotlin/JNI bindings & tuning (coming soon)
+- [ ] **Vulkan Support** - Device/pipeline/buffer management is in place, but every compute op still falls back to CPU (research)
+- [ ] **Android Integration** - Kotlin/JNI bindings, AAR, and Compose demo app build against a cross-compiled `.so`; on-device validation and tuning still open
 - [ ] **Qwen iOS Porting** - Optimize Qwen inference for native iOS
 - [ ] **Docker (CPU tooling image)** - Reproducible CI/benchmarking image for `infer`/`convert`/`bench` (see [Docker](#docker))
 
